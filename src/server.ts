@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { BASE_URL, HF_HOME, HOST, PORT, VENV_PYTHON } from "./config.js";
+import { probePort, waitForPortFree } from "./port.js";
 
 export type ServerEvent =
   | { type: "launched" }
@@ -28,6 +29,8 @@ export interface ServerHost {
   spawn(model: string, address: ServerAddress): ServerProcess;
   fetch: typeof fetch;
   sleep(ms: number): Promise<void>;
+  /** True when something already holds host:port (a connect or an exclusive bind says so). */
+  portInUse(host: string, port: number): Promise<boolean>;
 }
 
 export interface MlxServer {
@@ -70,6 +73,7 @@ export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
       }),
     fetch: (input, init) => fetch(input, init),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    portInUse: probePort,
   };
 }
 
@@ -85,6 +89,9 @@ export function createMlxServer(
     healthPollMs?: number;
     warmupPollMs?: number;
     killWaitMs?: number;
+    /** How long stop() waits for the port to refuse connections once the child has exited. */
+    portReleaseTimeoutMs?: number;
+    portPollMs?: number;
   } = {},
 ): MlxServer {
   const host = options.host ?? systemHost;
@@ -95,6 +102,8 @@ export function createMlxServer(
   const healthPollMs = options.healthPollMs ?? 1200;
   const warmupPollMs = options.warmupPollMs ?? 1500;
   const killWaitMs = options.killWaitMs ?? 5000;
+  const portReleaseTimeoutMs = options.portReleaseTimeoutMs ?? 10_000;
+  const portPollMs = options.portPollMs ?? 200;
 
   type Current = { proc: ServerProcess; exited: boolean; exitCode: number | null; stderrTail: string; onExit: Promise<void> };
   let current: Current | null = null;
@@ -166,15 +175,33 @@ export function createMlxServer(
     throw new Error("Model did not become inference-ready in time");
   }
 
-  /** SIGTERM, then SIGKILL after `killWaitMs`, each followed by a bounded wait for the exit event. Never rejects. */
+  /**
+   * SIGTERM, then SIGKILL after `killWaitMs`, each followed by a bounded wait for the exit
+   * event; once the child is gone, a bounded wait for the port to refuse connections. Never rejects.
+   */
   const terminate = async (c: Current): Promise<void> => {
-    if (c.exited) return;
-    c.proc.kill("SIGTERM");
-    await Promise.race([c.onExit, host.sleep(killWaitMs)]);
-    if (c.exited) return;
-    c.proc.kill("SIGKILL");
-    await Promise.race([c.onExit, host.sleep(killWaitMs)]);
+    if (!c.exited) {
+      c.proc.kill("SIGTERM");
+      await Promise.race([c.onExit, host.sleep(killWaitMs)]);
+      if (!c.exited) {
+        c.proc.kill("SIGKILL");
+        await Promise.race([c.onExit, host.sleep(killWaitMs)]);
+      }
+    }
+    // A child that survived SIGKILL still holds the port; there is nothing more to wait for.
+    if (!c.exited) return;
+    await waitForPortFree({
+      host: address.host,
+      port: address.port,
+      probe: host.portInUse,
+      sleep: host.sleep,
+      timeoutMs: portReleaseTimeoutMs,
+      pollMs: portPollMs,
+    });
   };
+
+  /** Bumped by every stop(), so a start still waiting on a probe can tell it was cancelled. */
+  let generation = 0;
 
   /** The in-flight stop, so a start (or a second stop) issued mid-stop waits for the same process to be gone. */
   let pendingStop: Promise<void> | null = null;
@@ -183,6 +210,7 @@ export function createMlxServer(
     const c = current;
     // Clear synchronously: a start that is still waiting on `c` must see "cancelled" right away.
     current = null;
+    generation += 1;
     if (!c) return pendingStop ?? Promise.resolve();
     const stopping: Promise<void> = terminate(c).finally(() => {
       if (pendingStop === stopping) pendingStop = null;
@@ -200,7 +228,21 @@ export function createMlxServer(
       const emit = onEvent ?? (() => {});
 
       // Never spawn while the old process might still hold the port (D-05).
-      if (current || pendingStop) await stop();
+      const hadPrevious = current !== null || pendingStop !== null;
+      const stopped = stop();
+      if (hadPrevious) await stopped;
+      const myGeneration = generation;
+
+      // Ownership check (D-04): refuse an occupied port before anything is spawned.
+      const inUse = await host.portInUse(address.host, address.port);
+      if (generation !== myGeneration) throw new Error("MLX server start was cancelled");
+      if (inUse) {
+        throw new Error(
+          hadPrevious
+            ? `Port ${address.port} is still in use after stopping the previous MLX server. Retry in a moment, or set PI_MLX_MODELS_PORT to use a different port.`
+            : `Port ${address.port} on ${address.host} is already in use by another process. Set PI_MLX_MODELS_PORT to a free port, or find what holds it with: lsof -nP -iTCP:${address.port} -sTCP:LISTEN`,
+        );
+      }
 
       const proc = host.spawn(model, address);
       let resolveExit!: () => void;
