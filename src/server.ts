@@ -73,6 +73,8 @@ export interface SystemHostOptions {
   buildArgs?: (model: string, address: ServerAddress, extraArgs: readonly string[]) => string[];
   /** Extra environment, merged last so it wins over the defaults. */
   env?: NodeJS.ProcessEnv;
+  /** Working directory of the child. Defaults to pi's own, i.e. unchanged. */
+  cwd?: string;
 }
 
 /**
@@ -90,8 +92,11 @@ export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
   return {
     spawn: (model, address, extraArgs = []) =>
       spawn(command, buildArgs(model, address, extraArgs), {
-        env: { ...process.env, HF_HOME, TRANSFORMERS_CACHE: HF_HOME, HF_HUB_DISABLE_TELEMETRY: "1", ...options.env },
+        // PYTHONSAFEPATH keeps the working directory off sys.path, so a cloned project directory cannot
+        // shadow mlx_lm with its own module (Python before 3.11 ignores the variable).
+        env: { ...process.env, HF_HOME, TRANSFORMERS_CACHE: HF_HOME, HF_HUB_DISABLE_TELEMETRY: "1", PYTHONSAFEPATH: "1", ...options.env },
         stdio: ["ignore", "pipe", "pipe"],
+        ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
       }),
     fetch: (input, init) => fetch(input, init),
     // Unref'd so a losing kill-wait race cannot hold pi open for the rest of its window.
