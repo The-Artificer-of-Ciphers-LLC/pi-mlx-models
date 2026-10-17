@@ -48,6 +48,10 @@ function probePython(candidate: string): Probe {
   }
 }
 
+export function pythonCandidates(_env: NodeJS.ProcessEnv = process.env, fixed: string[] = PYTHON_CANDIDATES): string[] {
+  return [...fixed];
+}
+
 export function findPython(options: { candidates?: string[]; env?: NodeJS.ProcessEnv } = {}): string | null {
   for (const c of options.candidates ?? PYTHON_CANDIDATES) {
     if (probePython(c).ok) return c;
