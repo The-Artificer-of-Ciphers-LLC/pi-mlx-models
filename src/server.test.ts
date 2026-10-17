@@ -7,7 +7,8 @@ class FakeProc extends EventEmitter implements ServerProcess {
   stderr = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
   stdout = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
   killed: string | undefined;
-  pid?: number;
+  /** A fake that spawned has a pid; tests for a failed launch clear it. */
+  pid?: number = 4242;
   /** Shared with makeHost so tests can assert the order of kills, exits, probes and spawns. */
   log?: string[];
   kill(signal?: NodeJS.Signals) {
@@ -132,8 +133,15 @@ test("a spawn error rejects the start with a launch message instead of polling f
   // A start that ignored the error would poll forever; fail the poll loop after a few rounds instead.
   let errored = false;
   let pollsAfterError = 0;
-  const { host, procs } = makeHost({
+  const procs: FakeProc[] = [];
+  const { host } = makeHost({
     fetch: async () => new Response("{}", { status: 503 }),
+    spawn: () => {
+      const p = new FakeProc();
+      p.pid = undefined; // a launch failure leaves no pid
+      procs.push(p);
+      return p;
+    },
     sleep: () => {
       if (errored && (pollsAfterError += 1) > 20) return Promise.reject(new Error("kept polling after the spawn error"));
       return new Promise((r) => setImmediate(r));

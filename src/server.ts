@@ -368,7 +368,9 @@ export function createMlxServer(
         resolveClose();
       });
 
-      emit({ type: "launched" });
+      // A process that could not be spawned has no pid: its failure arrives through `error` and the wait
+      // below reports it against the launch step, so it must not first be announced as started.
+      if (proc.pid !== undefined) emit({ type: "launched" });
       try {
         await waitForServer(c);
         emit({ type: "loading" });
