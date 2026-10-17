@@ -178,3 +178,51 @@ test("a squatter answering /v1/models cannot make a stub that failed to bind loo
   assert.notEqual(exit, null, "the stub that failed to bind must be terminated within 5 seconds");
   assert.equal(server.running, false);
 });
+
+// The stub writes megabytes to stdout before it listens (the real server logs heavily at startup).
+// A launcher that never reads stdout blocks it once the pipe fills, so reaching ready proves the
+// drain. If the drain is removed this test fails by its own timeout rather than passing.
+test("a server that floods stdout still reaches ready", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const { host, children } = stubHost({ STUB_MODE: "flood" });
+  t.after(() => killAll(children));
+
+  const server = createMlxServer({
+    host,
+    address: { host: "127.0.0.1", port },
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    healthPollMs: 25,
+    warmupPollMs: 25,
+    killWaitMs: 1000,
+  });
+
+  await server.start("stub/model");
+  assert.equal(server.running, true);
+
+  await server.stop();
+});
+
+test("an early exit reports the stderr tail and the stdout tail", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const { host, children } = stubHost({ STUB_MODE: "exit-early" });
+  t.after(() => killAll(children));
+
+  const server = createMlxServer({
+    host,
+    address: { host: "127.0.0.1", port },
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    healthPollMs: 25,
+    warmupPollMs: 25,
+    killWaitMs: 1000,
+  });
+
+  await assert.rejects(server.start("stub/model"), (err: Error) => {
+    assert.match(err.message, /exited \(code 3\).*ModuleNotFoundError.*stub: starting up/s);
+    assert.ok(
+      err.message.indexOf("ModuleNotFoundError") < err.message.indexOf("stub: starting up"),
+      `the stderr part must come before the stdout part: ${err.message}`,
+    );
+    return true;
+  });
+  assert.equal(server.running, false);
+});

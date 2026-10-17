@@ -5,6 +5,7 @@ import { createMlxServer, type ServerEvent, type ServerHost, type ServerProcess 
 
 class FakeProc extends EventEmitter implements ServerProcess {
   stderr = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
+  stdout = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
   killed: string | undefined;
   /** Shared with makeHost so tests can assert the order of kills, exits, probes and spawns. */
   log?: string[];
@@ -344,4 +345,62 @@ test("stop during the pre-spawn port probe cancels the pending start without spa
 
   await assert.rejects(started, /cancelled/);
   assert.equal(procs.length, 0);
+});
+
+test("stdout output is tailed into the death message after the stderr tail", async () => {
+  const { host, procs } = makeHost({
+    fetch: async () => {
+      throw new Error("refused");
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const started = server.start("m");
+  await tick();
+  procs[0].stdout.emit("data", Buffer.from("loading weights...\n"));
+  procs[0].stderr.emit("data", "ModuleNotFoundError: mlx");
+  procs[0].die(2);
+
+  await assert.rejects(started, /exited \(code 2\): ModuleNotFoundError: mlx \| stdout: loading weights\.\.\./);
+});
+
+test("the stdout tail in a death message is bounded to its last 200 characters", async () => {
+  const { host, procs } = makeHost({
+    fetch: async () => {
+      throw new Error("refused");
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const started = server.start("m");
+  await tick();
+  procs[0].stdout.emit("data", `${"a".repeat(1000)}END`);
+  procs[0].die(1);
+
+  await assert.rejects(started, (err: Error) => {
+    const tail = err.message.split(" | stdout: ")[1];
+    assert.ok(tail, `message should carry a stdout tail: ${err.message}`);
+    assert.equal(tail.length, 200);
+    assert.ok(tail.endsWith("END"));
+    return true;
+  });
+});
+
+test("diagnostic text has control characters removed", async () => {
+  const { host, procs } = makeHost({
+    fetch: async () => {
+      throw new Error("refused");
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const started = server.start("m");
+  await tick();
+  procs[0].stderr.emit("data", "\u001b[31mred\u001b[0m\tTab\nnext\u007fline\u0000");
+  procs[0].stdout.emit("data", "out\u001b]0;title\u0007put");
+  procs[0].die(1);
+
+  await assert.rejects(started, (err: Error) => {
+    assert.doesNotMatch(err.message, /[\u0000-\u0008\u000b-\u001f\u007f]/, "no C0 control character or DEL may reach the message");
+    assert.match(err.message, /red/);
+    assert.ok(err.message.includes("\t") && err.message.includes("\n"), "newline and tab survive");
+    return true;
+  });
 });
