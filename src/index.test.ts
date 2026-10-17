@@ -129,7 +129,14 @@ const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 /** An extension over a fresh fake pi, with a counting installer that succeeds unless told otherwise. */
 async function setup(
-  options: { server?: FakeServerOptions; ensureInstalled?: (opts?: any) => Promise<void>; discovered?: string[]; select?: (options: string[]) => string | undefined } = {},
+  options: {
+    server?: FakeServerOptions;
+    ensureInstalled?: (opts?: any) => Promise<void>;
+    discovered?: string[];
+    select?: (options: string[]) => string | undefined;
+    configWarnings?: readonly string[];
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
 ) {
   const server = makeFakeServer(options.server);
   const installCalls: any[] = [];
@@ -143,7 +150,8 @@ async function setup(
     }) as any,
     discoverModelIds: async () => options.discovered ?? [],
     baseUrl: "http://127.0.0.1:1/v1",
-    configWarnings: [],
+    configWarnings: options.configWarnings ?? [],
+    ...(options.sleep ? { sleep: options.sleep } : {}),
   });
   await extension(fakePi.pi);
   return { server, installCalls, ...fakePi, ...fakeCtx };
@@ -311,4 +319,149 @@ test("mlx-init failure is reported as mlx-init failed", async () => {
 
   assert.deepEqual(errors(notes), ["mlx-init failed: pip exploded"]);
   assert.ok(!notes.some((n) => n.message === "MLX runtime installed."));
+});
+
+/** A promise that never settles: a stop or start that hangs. */
+const never = () => new Promise<never>(() => {});
+
+test("session_shutdown awaits server.stop() before it finishes", async () => {
+  const gate = deferred();
+  const order: string[] = [];
+  const { handlers } = await setup({
+    server: {
+      stop: async () => {
+        order.push("stop started");
+        await gate.promise;
+        order.push("stop finished");
+      },
+    },
+    sleep: never,
+  });
+
+  const finished = Promise.resolve(handlers.get("session_shutdown")!()).then(() => {
+    order.push("handler finished");
+  });
+  await flush();
+  assert.deepEqual(order, ["stop started"]);
+
+  gate.resolve();
+  await finished;
+
+  assert.deepEqual(order, ["stop started", "stop finished", "handler finished"]);
+});
+
+test("session_shutdown still finishes once the wait elapses when stop never resolves", async () => {
+  const wait = deferred();
+  const sleepMs: number[] = [];
+  const { handlers, providerCalls } = await setup({
+    server: { stop: never },
+    sleep: (ms) => {
+      sleepMs.push(ms);
+      return wait.promise;
+    },
+  });
+  const providerCallsBefore = providerCalls.length;
+
+  let finished = false;
+  const done = Promise.resolve(handlers.get("session_shutdown")!()).then(() => {
+    finished = true;
+  });
+  await flush();
+  assert.equal(finished, false, "handler finished before the wait elapsed");
+  assert.equal(sleepMs.length, 1);
+  assert.ok(sleepMs[0] > 0, "the wait must be a positive bound");
+
+  wait.resolve();
+  await done;
+
+  assert.equal(providerCalls.length, providerCallsBefore + 1);
+});
+
+test("session_shutdown during an in-flight mlx-start completes and stops the progress spinner", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const { server, commands, handlers, ctx, statuses } = await setup({
+    server: {
+      start: (_model, onEvent) => {
+        onEvent?.({ type: "launched" });
+        return never();
+      },
+    },
+    sleep: never,
+  });
+
+  void commands.get("mlx-start")!("qwen3_4b", ctx);
+  await flush();
+  assert.equal(server.startCalls.length, 1);
+
+  const beforeTick = statuses.length;
+  t.mock.timers.tick(1000);
+  assert.ok(statuses.length > beforeTick, "premise: the spinner should be animating while start is pending");
+
+  await handlers.get("session_shutdown")!();
+
+  const afterShutdown = statuses.length;
+  t.mock.timers.tick(1000);
+  assert.equal(statuses.length, afterShutdown, "the spinner kept running after shutdown");
+});
+
+test("session_shutdown re-registers the provider from discovery, empty when nothing is found", async () => {
+  const { handlers, providerCalls } = await setup({ discovered: [], sleep: never });
+  const providerCallsBefore = providerCalls.length;
+
+  await handlers.get("session_shutdown")!();
+
+  assert.equal(providerCalls.length, providerCallsBefore + 1);
+  assert.deepEqual(modelIdsOf(providerCalls.at(-1)), []);
+});
+
+test("a stop that rejects does not prevent the provider re-registration at shutdown", async () => {
+  const { handlers, providerCalls } = await setup({
+    server: {
+      stop: async () => {
+        throw new Error("stop failed");
+      },
+    },
+    sleep: never,
+  });
+  const providerCallsBefore = providerCalls.length;
+
+  await handlers.get("session_shutdown")!();
+
+  assert.equal(providerCalls.length, providerCallsBefore + 1);
+});
+
+test("config warnings are shown once, in order, on the first mlx-start only", async () => {
+  const { commands, ctx, notes } = await setup({ configWarnings: ["w1", "w2"] });
+  const warnings = () => notes.filter((n) => n.type === "warning");
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(warnings(), [
+    { message: "w1", type: "warning" },
+    { message: "w2", type: "warning" },
+  ]);
+  assert.deepEqual(notes.slice(0, 2).map((n) => n.type), ["warning", "warning"]);
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.equal(warnings().length, 2);
+});
+
+test("without config warnings no warning notification is shown", async () => {
+  const { commands, ctx, notes } = await setup({ configWarnings: [] });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(notes.filter((n) => n.type === "warning"), []);
+});
+
+test("a rejected first mlx-start still surfaces the config warnings once", async () => {
+  const { commands, ctx, notes } = await setup({ configWarnings: ["w1"] });
+  const warnings = () => notes.filter((n) => n.type === "warning");
+
+  await commands.get("mlx-start")!("9", ctx);
+  assert.deepEqual(warnings(), [{ message: "w1", type: "warning" }]);
+
+  await commands.get("mlx-start")!("9", ctx);
+  assert.equal(warnings().length, 1);
 });
