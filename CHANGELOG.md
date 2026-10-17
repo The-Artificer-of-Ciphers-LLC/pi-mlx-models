@@ -8,6 +8,12 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 - The extension now names pi's current package, `@earendil-works/pi-coding-agent`, as its peer dependency and in its imports. It named `@mariozechner/pi-coding-agent`, which npm has deprecated in favour of the new name and which has had no release since May 2026.
 
+### Fixed
+
+- A project file (`.pi/pi-mlx-models.json`) can no longer set `server.allowedOrigins`: like a non-loopback host, it is refused with a warning, and the same setting in the global file still works.
+- A project file's `model.chatTemplate` must now point inside the project directory, so a cloned repository cannot make the extension read another file on your machine into the server's command line. The global file, `models` entries there and `/mlx-start --chat-template` can still point anywhere.
+- A bracketed IPv6 host such as `[::1]` is now passed to the server as `::1`, which Python can bind. It was passed with the brackets and the server failed to start.
+
 ### Project
 
 - A release is now one manual run of the Release workflow: it bumps the version, updates this changelog, builds and tests, stages the release on npm and tags it. Pushing a tag no longer publishes anything.

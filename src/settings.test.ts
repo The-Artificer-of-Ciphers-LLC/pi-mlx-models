@@ -1225,13 +1225,36 @@ test("a project file host is a violation unless it is one of the loopback spelli
   for (const host of ["0.0.0.0", "::", "[::]", "::0", "example.test", "192.168.1.5", "127.0.0.2", "::ffff:127.0.0.1"]) {
     assert.deepEqual(
       violationsOf(ok({ server: { host } })),
-      [{ path: "server.host", shown: host, reason: "listens on a non-loopback address" }],
+      // A bracketed host is stored, and so shown, without its brackets.
+      [{ path: "server.host", shown: host.replace(/^\[(.*)\]$/, "$1"), reason: "listens on a non-loopback address" }],
       host,
     );
   }
   for (const host of ["127.0.0.1", "localhost", "LocalHost", "::1", "[::1]"]) {
     assert.deepEqual(violationsOf(ok({ server: { host } })), [], host);
   }
+});
+
+test("a bracketed IPv6 host is stored without its brackets so the server can bind it, and unbracketed forms are unchanged", () => {
+  assert.equal(resolved({ global: ok({ server: { host: "[::1]" } }) }).prepared.address.host, "::1");
+  assert.equal(resolved({ args: { "server.host": "[::1]" } }).prepared.address.host, "::1");
+  assert.equal(resolved({ global: ok({ server: { host: "::1" } }) }).prepared.address.host, "::1");
+  assert.equal(resolved({ global: ok({ server: { host: "localhost" } }) }).prepared.address.host, "localhost");
+  assert.equal(resolved({ global: ok({ server: { host: "[::1]" } }) }).prepared.baseUrl, "http://[::1]:8080/v1");
+  for (const host of ["[]", "[localhost]", "[::1", "::1]", "[[::1]]", "a[b]"]) {
+    assert.equal(resolve({ global: ok({ server: { host } }) }).ok, false, host);
+  }
+});
+
+test("a project file with allowed origins is a violation, whatever the origins are", () => {
+  for (const allowedOrigins of [["*"], ["http://localhost:3000"], ["http://a.test", "http://b.test"]]) {
+    const [violation, ...rest] = violationsOf(ok({ server: { allowedOrigins } }));
+    assert.equal(rest.length, 0);
+    assert.equal(violation.path, "server.allowedOrigins");
+    assert.equal(violation.reason, "lets web pages call the local server");
+  }
+  // The same setting in the global file is the user's own choice and is not a violation.
+  assert.deepEqual(resolved({ global: ok({ server: { allowedOrigins: ["*"] } }) }).prepared.projectViolations, []);
 });
 
 test("a project file baseUrl is a violation unless its host is loopback", () => {
@@ -1932,9 +1955,47 @@ test("a template error is labelled with the layer that supplied the path", (t) =
   const dir = tempDir(t);
   const missing = join(dir, "missing.jinja");
   const line = (label: string) => `model.chatTemplate (${label}): cannot read ${missing}: cannot be read (ENOENT)`;
-  assert.deepEqual(launchErrors({ project: ok({ model: { chatTemplate: missing } }) }), [line(PROJECT)]);
+  assert.deepEqual(launchErrors({ project: ok({ model: { chatTemplate: missing } }) }, QWEN, { home: "/nowhere", cwd: dir }), [line(PROJECT)]);
   assert.deepEqual(launchErrors({ global: ok({ models: { qwen3_4b: { chatTemplate: missing } } }) }), [line(GLOBAL)]);
   assert.deepEqual(launchErrors({ args: { "model.chatTemplate": missing } }), [line("/mlx-start --chat-template")]);
+});
+
+test("a project file's chatTemplate must stay inside the project directory; the other layers may point anywhere", (t) => {
+  const project = writeTemplate(t, "{{ project }}");
+  const elsewhere = writeTemplate(t, "{{ elsewhere }}");
+  const context = { home: "/nowhere", cwd: project.dir };
+  const outside = (path: string) => [`model.chatTemplate (${PROJECT}): ${path} is outside the project directory`];
+  const projectModel = (chatTemplate: string) => ({ project: ok({ model: { chatTemplate } }) });
+  // Inside: relative and absolute spellings are both fine.
+  assert.deepEqual(extraOf(projectModel("template.jinja"), QWEN, context), ["--chat-template={{ project }}"]);
+  assert.deepEqual(extraOf(projectModel(project.path), QWEN, context), ["--chat-template={{ project }}"]);
+  // Outside: an absolute path, a ".." escape and the home directory are refused, and the file is never read.
+  assert.deepEqual(launchErrors(projectModel(elsewhere.path), QWEN, context), outside(elsewhere.path));
+  const escape = launchErrors(projectModel("../x.jinja"), QWEN, context);
+  assert.equal(escape.length, 1);
+  assert.ok(escape[0].startsWith(`model.chatTemplate (${PROJECT}): `) && escape[0].endsWith("x.jinja is outside the project directory"), escape[0]);
+  assert.equal(launchErrors({ project: ok({ model: { chatTemplate: "~/x.jinja" } }) }, QWEN, { home: elsewhere.dir, cwd: project.dir }).length, 1);
+  // An entry in the project file is judged the same way.
+  assert.deepEqual(
+    launchErrors({ project: ok({ models: { qwen3_4b: { chatTemplate: elsewhere.path } } }) }, QWEN, context),
+    outside(elsewhere.path),
+  );
+  // The global file, the command line and a project path that loses to a higher layer are not restricted.
+  assert.deepEqual(extraOf({ global: ok({ model: { chatTemplate: elsewhere.path } }) }, QWEN, context), ["--chat-template={{ elsewhere }}"]);
+  assert.deepEqual(extraOf({ args: { "model.chatTemplate": elsewhere.path } }, QWEN, context), ["--chat-template={{ elsewhere }}"]);
+  assert.deepEqual(
+    extraOf({ global: ok({ model: { chatTemplate: elsewhere.path } }), args: { "model.chatTemplate": elsewhere.path }, ...projectModel(elsewhere.path) }, QWEN, context),
+    ["--chat-template={{ elsewhere }}"],
+  );
+});
+
+test("a symlink in the project directory that points outside it is refused for a project file", (t) => {
+  const project = tempDir(t);
+  const elsewhere = writeTemplate(t, "{{ secret }}");
+  symlinkSync(elsewhere.path, join(project, "link.jinja"));
+  const errors = launchErrors({ project: ok({ model: { chatTemplate: "link.jinja" } }) }, QWEN, { home: "/nowhere", cwd: project });
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0].endsWith("is outside the project directory"), errors[0]);
 });
 
 test("a broken template path in an entry for another model does not fail this launch, and does fail that model's", (t) => {
@@ -1949,7 +2010,7 @@ test("only the winning template path is read: a broken path in a lower layer is 
   const { path } = writeTemplate(t, "{{ ok }}");
   const input = {
     global: ok({ model: { chatTemplate: "/definitely/missing.jinja" } }),
-    project: ok({ model: { chatTemplate: path } }),
+    args: { "model.chatTemplate": path },
   };
   assert.deepEqual(extraOf(input), ["--chat-template={{ ok }}"]);
 });
@@ -2064,12 +2125,12 @@ test("describeFlags shows model options with their layer; the template is shown 
   const line = describeFlags(
     launchOf({
       global: ok({ model: { numDraftTokens: 4, useDefaultChatTemplate: true, chatTemplateArgs: { a: 1 } } }),
-      project: ok({ model: { chatTemplate: path } }),
+      args: { "model.chatTemplate": path },
     }),
   );
   assert.equal(
     line,
-    `flags: --num-draft-tokens 4 (global file), --chat-template ${path} (project file), --use-default-chat-template (global file), --chat-template-args {"a":1} (global file)`,
+    `flags: --num-draft-tokens 4 (global file), --chat-template ${path} (/mlx-start), --use-default-chat-template (global file), --chat-template-args {"a":1} (global file)`,
   );
   assert.ok(!line.includes("SECRET"));
 });
