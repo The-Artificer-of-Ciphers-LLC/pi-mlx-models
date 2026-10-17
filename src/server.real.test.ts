@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createConnection, createServer, type Server } from "node:net";
+import { createServer, type Server } from "node:net";
 import { createServer as createHttpServer } from "node:http";
+import { execFileSync, type ChildProcess } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChildProcess } from "node:child_process";
 import { createMlxServer, createSystemHost, type ServerHost } from "./server.js";
-import { freePort, stubArgs, waitForExit } from "./testkit.js";
+import { connectRefused, freePort, stubArgs, waitForExit } from "./testkit.js";
 
 /**
  * Real-process lifecycle tests: a real child (the stub from test/fixtures),
@@ -33,18 +34,6 @@ function killAll(children: ChildProcess[]) {
   for (const child of children) {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }
-}
-
-/** True when a TCP connect to the loopback port is refused. */
-function connectRefused(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = createConnection({ host: "127.0.0.1", port });
-    socket.once("connect", () => {
-      socket.destroy();
-      resolve(false);
-    });
-    socket.once("error", () => resolve(true));
-  });
 }
 
 test("start reaches ready against the stub process and stop resolves only after the child has exited", { timeout: 30_000 }, async (t) => {
@@ -346,4 +335,64 @@ test("a listener that never answers is cut off by the per-request health timeout
   const failure = await startOutcome;
   assert.match(String(failure?.message), /cancelled/);
   assert.ok(requests >= 1);
+});
+
+/** Everything a spawned process writes, and how it ended. */
+async function runToEnd(child: ChildProcess) {
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk) => (stdout += chunk.toString()));
+  child.stderr?.on("data", (chunk) => (stderr += chunk.toString()));
+  const { code } = await waitForExit(child);
+  // `exit` can precede the last chunks; give the pipes a turn to drain.
+  await new Promise((resolve) => setImmediate(resolve));
+  return { stdout, stderr, code };
+}
+
+const printSafePath = () => ["-e", "process.stdout.write(process.env.PYTHONSAFEPATH ?? 'unset')"];
+
+test("a spawned process runs with PYTHONSAFEPATH=1 unless the options say otherwise", { timeout: 30_000 }, async () => {
+  const defaults = createSystemHost({ command: process.execPath, buildArgs: printSafePath });
+  const seen = await runToEnd(defaults.spawn("m", { host: "127.0.0.1", port: 1 }) as ChildProcess);
+  assert.equal(seen.stdout, "1");
+
+  const overridden = createSystemHost({ command: process.execPath, buildArgs: printSafePath, env: { PYTHONSAFEPATH: "0" } });
+  const wins = await runToEnd(overridden.spawn("m", { host: "127.0.0.1", port: 1 }) as ChildProcess);
+  assert.equal(wins.stdout, "0");
+});
+
+/** Python 3.11 or newer is needed for PYTHONSAFEPATH; returns why it is unavailable, or undefined. */
+function pythonUnavailable(): string | undefined {
+  try {
+    const out = execFileSync("python3", ["-c", "import sys; print(int(sys.version_info >= (3, 11)))"], { encoding: "utf8" });
+    return out.trim() === "1" ? undefined : "python3 is older than 3.11, which ignores PYTHONSAFEPATH";
+  } catch {
+    return "python3 is not available on PATH";
+  }
+}
+
+// T-02-02: a cloned project directory must not be able to shadow mlx_lm on sys.path.
+test("a module in the child's cwd is not imported by the safe spawn, but is when PYTHONSAFEPATH is cleared", { timeout: 30_000 }, async (t) => {
+  const unavailable = pythonUnavailable();
+  if (unavailable) {
+    t.skip(unavailable);
+    return;
+  }
+  const dir = mkdtempSync(join(tmpdir(), "pi-mlx-shadow-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  mkdirSync(join(dir, "pi_mlx_shadow_probe"));
+  writeFileSync(join(dir, "pi_mlx_shadow_probe", "__init__.py"), 'print("SHADOW-RAN")\n');
+  const moduleArgs = () => ["-m", "pi_mlx_shadow_probe"];
+  const address = { host: "127.0.0.1", port: 1 };
+
+  const safe = createSystemHost({ command: "python3", buildArgs: moduleArgs, cwd: dir });
+  const guarded = await runToEnd(safe.spawn("m", address) as ChildProcess);
+  assert.ok(!guarded.stdout.includes("SHADOW-RAN"), "the cwd module must not be imported");
+  assert.match(guarded.stderr, /No module named/);
+  assert.notEqual(guarded.code, 0);
+
+  // Control: with the protection cleared the same module does run, so the attack is real.
+  const unsafe = createSystemHost({ command: "python3", buildArgs: moduleArgs, cwd: dir, env: { PYTHONSAFEPATH: "" } });
+  const control = await runToEnd(unsafe.spawn("m", address) as ChildProcess);
+  assert.ok(control.stdout.includes("SHADOW-RAN"), "premise: a cwd module shadows imports without the protection");
 });

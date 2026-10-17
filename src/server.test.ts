@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { createMlxServer, createSystemHost, type ServerEvent, type ServerHost, type ServerProcess } from "./server.js";
+import { buildServerArgs, createMlxServer, createSystemHost, type ServerEvent, type ServerHost, type ServerProcess } from "./server.js";
 
 class FakeProc extends EventEmitter implements ServerProcess {
   stderr = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
@@ -832,4 +832,24 @@ test("health and warm-up poll responses have their bodies released", async () =>
 
   assert.equal(responses, 4, "three health polls and one warm-up");
   assert.equal(released, responses, "every poll response body must be cancelled or read");
+});
+
+// Golden: a launch that sets nothing has the Phase 1 argv, byte for byte.
+test("buildServerArgs without extras is the Phase 1 argv", () => {
+  assert.deepEqual(buildServerArgs("m", { host: "127.0.0.1", port: 8080 }), [
+    "-m",
+    "mlx_lm.server",
+    "--model",
+    "m",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8080",
+  ]);
+});
+
+test("buildServerArgs appends extras last and changes nothing before them", () => {
+  const plain = buildServerArgs("m", { host: "127.0.0.1", port: 8080 });
+  const extended = buildServerArgs("m", { host: "127.0.0.1", port: 8080 }, ["--log-level=DEBUG"]);
+  assert.deepEqual(extended, [...plain, "--log-level=DEBUG"]);
 });
