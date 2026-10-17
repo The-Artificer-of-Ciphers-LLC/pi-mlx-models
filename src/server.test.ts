@@ -796,7 +796,8 @@ test("the system host's sleep timer does not keep the process alive", async () =
     const sleeping = createSystemHost().sleep(1);
     assert.ok(seen, "premise: sleep scheduled a timer");
     assert.equal(seen.hasRef(), false);
-    await sleeping;
+    // Not awaited: the timer is unref'd by design, so on Node 22 the event loop may drain before it fires.
+    void sleeping;
   } finally {
     globalThis.setTimeout = realSetTimeout;
   }
