@@ -1,30 +1,38 @@
-# pi-mlx-models
+# @taoc/pi-mlx-models
 
-Local MLX model launcher for [Pi](https://pi.dev) on Apple Silicon.
+Local MLX model launcher for [pi](https://pi.dev) on Apple Silicon.
 
 <p align="center">
   <img src="./assets/preset-selector.png" alt="Preset selector" width="780" />
 </p>
 
-`pi-mlx-models` adds a local OpenAI-compatible provider to Pi, with a guided startup flow for MLX models.
+`@taoc/pi-mlx-models` adds a local OpenAI-compatible provider to pi, with a guided startup flow for MLX models.
 
 ## What you get
 
 - Interactive preset selector via `/mlx-start`
-- Local runtime bootstrap via `/mlx-init` (venv + `mlx-lm`)
-- Startup progress with stage/status updates and warm-up timer
-- Provider models only appear when the server is actually ready
-- Stop/cleanup command via `/mlx-stop`
+- Local runtime bootstrap via `/mlx-init` (virtual environment and `mlx-lm`)
+- Layered configuration: a global file, a project file, environment variables and flags
+- Server and model options: allowed origins, log level, draft model, adapter, chat template
+- A permission check for settings that run code or open the network
+- Startup progress with stage and status updates and a warm-up timer
+- Provider models appear only when the server is actually ready
+- Stop and cleanup via `/mlx-stop`
+
+## Requirements
+
+- macOS on Apple Silicon
+- Python 3.11 or newer
 
 ## Install
 
-### From npm
+From npm:
 
 ```bash
 pi install npm:@taoc/pi-mlx-models
 ```
 
-### From GitHub
+From GitHub:
 
 ```bash
 pi install git:github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models
@@ -32,72 +40,60 @@ pi install git:github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models
 
 ## Quick start
 
-```bash
+In pi:
+
+```
 /mlx-init
 /mlx-start
 ```
 
-When `/mlx-start` is used with no args, a selector opens and you can pick a preset with arrow keys + Enter.
+`/mlx-init` builds the runtime the first time. `/mlx-start` with no arguments opens a selector: pick a preset with the arrow keys and Enter.
 
-You can also start directly with a full model id:
+To start a model directly, give a preset number or key, or any Hugging Face model id:
 
-```bash
+```
+/mlx-start qwen3_4b
 /mlx-start mlx-community/Qwen3-4B-Instruct-2507-4bit
 ```
 
-## Commands
+When the server is ready, pi says so. Use `/model` and pick `pi-mlx-models/...`. Stop it with `/mlx-stop`.
 
-- `/mlx-init` — initialize local MLX runtime
-- `/mlx-start [preset-number|preset-key|hf-model-id]` — open selector (no args), or start a preset by its number (1-5) or key, or any full model id
-- `/mlx-stop` — stop server and clear active provider models
+## Configure it
 
-## Included presets
+Create `~/.pi/agent/pi-mlx-models/config.json` to set a port, allowed origins or a log level for every launch, or `.pi/pi-mlx-models.json` in a project to override them there. The next `/mlx-start` picks the change up.
 
-- `deepseek_r1_1_5b` — reasoning, math
-- `gemma4_e2b` — writing, summarization
-- `llama3_2_3b` — chat, rewriting
-- `qwen3_4b` — coding, reasoning
-- `smollm3_3b` — fast chat, quick drafts
+```json
+{ "server": { "port": 8090, "logLevel": "INFO" } }
+```
 
-> [!TIP]
-> Want to try other models? Browse MLX Community collections on Hugging Face:  
-> https://huggingface.co/mlx-community/collections
+## Documentation
 
-## Requirements
+**Guides**
 
-- macOS on Apple Silicon
-- Python 3.11 or newer
+- [How to configure the MLX server](./docs/how-to/configure-the-server.md)
+- [How to set model options](./docs/how-to/set-model-options.md) (draft model, adapter, chat template)
+- [How to allow remote code or network access](./docs/how-to/allow-remote-code-or-network-access.md)
 
-## Configuration
+**Reference**
 
-Environment variables supported by the extension:
+- [Commands](./docs/reference/commands.md), including the presets
+- [Configuration](./docs/reference/configuration.md): files, settings, flags, environment variables and precedence
 
-- `PI_MLX_MODELS_PORT` (default: `8080`)
-- `PI_MLX_MODELS_HOST` (default: `127.0.0.1`)
-- `PI_MLX_MODELS_BASE_URL` (default: `http://<host>:<port>/v1`)
-- `PI_MLX_MODELS_DEFAULT_MODEL` (default: `mlx-community/Qwen3-4B-Instruct-2507-4bit`)
+**Background**
 
-The default port changed in 0.2.0 from the previous Ollama default (`11434`); set `PI_MLX_MODELS_PORT` to keep any other port. An empty or invalid port value falls back to `8080` with a warning.
+- [About layered configuration and trust](./docs/explanation/layered-configuration-and-trust.md)
 
-## Local data paths
-
-The data directory follows pi's agent directory: `PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. Runtime artifacts are stored under `pi-mlx-models` in it:
-
-- `<agent dir>/pi-mlx-models/venv`
-- `<agent dir>/pi-mlx-models/models`
-
-With `PI_CODING_AGENT_DIR` unset these are `~/.pi/agent/pi-mlx-models/venv` and `~/.pi/agent/pi-mlx-models/models`.
+See the [changelog](./CHANGELOG.md) for what changed in each release.
 
 ## Development
 
 ```bash
 npm install
 npm run build
+npm test
 ```
 
-Pi package manifest is in `package.json`:
-
-- `pi.extensions: ["dist/index.js"]`
+The pi package manifest is in `package.json`: `pi.extensions` is `["dist/index.js"]`.
 
 ## Screenshots
 
@@ -112,3 +108,7 @@ Pi package manifest is in `package.json`:
 ### Model selection
 
 ![Model selection](./assets/model-selection.png)
+
+## License
+
+[MIT](./LICENSE). This project is a fork of [vmarinogg/pi-mlx-models](https://github.com/vmarinogg/pi-mlx-models); the original copyright notice is kept alongside The Artificer of Ciphers LLC's.
