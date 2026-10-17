@@ -76,8 +76,8 @@ function normalizeHost(host: string): string {
  * (case-insensitive, brackets stripped). Everything else is non-loopback, including the wildcards 0.0.0.0 and ::,
  * other 127.x addresses and IPv4-mapped IPv6: the rule is deliberately conservative (D-17).
  */
-export function isLoopbackHost(_host: string): boolean {
-  return false;
+export function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(normalizeHost(host));
 }
 
 function hostsMatch(urlHost: string, launchHost: string): boolean {

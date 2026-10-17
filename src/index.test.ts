@@ -974,7 +974,7 @@ test("mlx-start with an unknown flag is refused, with the valid flags listed, an
 
   await h.commands.get("mlx-start")!("--bogus 1", h.ctx);
 
-  assert.deepEqual(errors(h.notes), ["mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level)"]);
+  assert.deepEqual(errors(h.notes), ["mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code)"]);
   assert.equal(h.notes.length, 1);
   assertNothingHappened(h);
 });

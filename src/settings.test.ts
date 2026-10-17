@@ -843,12 +843,13 @@ test("a single problem over the cap is described in the singular", () => {
 
 // ---- command-line flags and pi flags (plan 02-04) ----
 
-test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order, each with a value", () => {
+test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order; only --trust-remote-code takes no value", () => {
   assert.deepEqual(cliFlagSpecs(), [
     { flag: "--host", path: "server.host", takesValue: true },
     { flag: "--port", path: "server.port", takesValue: true },
     { flag: "--allowed-origins", path: "server.allowedOrigins", takesValue: true },
     { flag: "--log-level", path: "server.logLevel", takesValue: true },
+    { flag: "--trust-remote-code", path: "server.trustRemoteCode", takesValue: false },
   ]);
 });
 

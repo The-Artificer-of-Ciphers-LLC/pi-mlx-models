@@ -1,5 +1,5 @@
 import { readFileSync, statSync } from "node:fs";
-import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText } from "./config.js";
+import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
 import type { CliFlagSpec } from "./startargs.js";
@@ -88,7 +88,7 @@ type CheckResult = { ok: true; value: SettingValue } | { ok: false };
 export interface SettingDef {
   /** Dotted key in the config file: "server.port" is the `port` key of the `server` block; a top-level key has no dot (D-01). */
   path: string;
-  kind: "string" | "integer" | "enum" | "list";
+  kind: "string" | "integer" | "enum" | "list" | "bool";
   /** The allowed values in words, used in every error and warning about this row. */
   expected: string;
   /** Strict check of a value read from a JSON file: no coercion (D-07). */
@@ -107,6 +107,8 @@ export interface SettingDef {
   piFlag?: string;
   /** The mlx_lm.server flag this row becomes. */
   mlxFlag?: string;
+  /** The `/mlx-start` flag takes no value: writing it turns the setting on. */
+  bare?: boolean;
   /** Host and port become the address and are never optional argv. */
   core?: boolean;
   /** The argv elements for a value; a valued flag is a single `--flag=value` element. */
@@ -169,6 +171,10 @@ function checkOrigins(value: unknown): CheckResult {
 function parseOrigins(raw: string): CheckResult {
   const entries = raw.trim().split(",");
   return entries.every(isOrigin) ? ok(entries.join(",")) : bad;
+}
+
+function checkBoolean(value: unknown): CheckResult {
+  return typeof value === "boolean" ? ok(value) : bad;
 }
 
 const valued = (flag: string) => (value: SettingValue) => [`${flag}=${value}`];
@@ -249,6 +255,21 @@ export const SETTINGS: readonly SettingDef[] = [
     emit: valued("--log-level"),
   },
   {
+    // Runs Python code from the model repository, so no environment variable or pi flag can set it and a
+    // project file may never turn it on (D-08, D-16).
+    path: "server.trustRemoteCode",
+    kind: "bool",
+    expected: "true or false",
+    check: checkBoolean,
+    problem: PHRASES.boolean,
+    parseText: (raw) => (raw.trim() === "true" ? ok(true) : bad),
+    cli: "--trust-remote-code",
+    bare: true,
+    mlxFlag: "--trust-remote-code",
+    emit: (value) => (value === true ? ["--trust-remote-code"] : []),
+    default: false,
+  },
+  {
     path: "baseUrl",
     kind: "string",
     expected: "an http or https URL",
@@ -288,9 +309,9 @@ export const PI_FLAGS: readonly PiFlagDef[] = [
   { name: "mlx-log-level", description: "MLX server log level: DEBUG, INFO, WARNING, ERROR or CRITICAL", path: "server.logLevel" },
 ];
 
-/** The flags `/mlx-start` accepts, derived from the rows that declare one; every one takes a value. */
+/** The flags `/mlx-start` accepts, derived from the rows that declare one; all take a value except the bare ones. */
 export function cliFlagSpecs(): CliFlagSpec[] {
-  return SETTINGS.flatMap((row) => (row.cli === undefined ? [] : [{ flag: row.cli, path: row.path, takesValue: true }]));
+  return SETTINGS.flatMap((row) => (row.cli === undefined ? [] : [{ flag: row.cli, path: row.path, takesValue: row.bare !== true }]));
 }
 
 const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
@@ -431,6 +452,8 @@ export interface Prepared {
   defaultModel: string;
   /** Every row with an mlx flag that some layer set to a value other than its default, in schema order. */
   flags: LaunchFlag[];
+  /** Where each setting that some layer set came from, by dotted path. Settings left at their default are absent. */
+  sources: ReadonlyMap<string, { layer: LayerName; label: string }>;
   /** What the project file asked for that it may never ask for; decided on its own content before any merge (D-16). */
   projectViolations: ProjectViolation[];
 }
@@ -490,6 +513,35 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
   return values;
 }
 
+const isLoopbackUrl = (baseUrl: string): boolean => {
+  try {
+    return isLoopbackHost(new URL(baseUrl).hostname);
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * What the project file asks for that a cloned repository must never be able to ask for: running the model
+ * repository's code, listening beyond this machine, or sending prompts elsewhere (D-16). It looks at the file's own
+ * valid values, before any merge, so a higher layer that happens to override the value does not hide it.
+ */
+function projectViolationsOf(project: ReadonlyMap<string, SettingValue>): ProjectViolation[] {
+  const violations: ProjectViolation[] = [];
+  if (project.get("server.trustRemoteCode") === true) {
+    violations.push({ path: "server.trustRemoteCode", shown: "", reason: "lets the model repository run Python code" });
+  }
+  const host = project.get("server.host");
+  if (typeof host === "string" && !isLoopbackHost(host)) {
+    violations.push({ path: "server.host", shown: show(host), reason: "listens on a non-loopback address" });
+  }
+  const baseUrl = project.get("baseUrl");
+  if (typeof baseUrl === "string" && !isLoopbackUrl(baseUrl)) {
+    violations.push({ path: "baseUrl", shown: show(baseUrl), reason: "sends prompts to a non-loopback address" });
+  }
+  return violations;
+}
+
 /**
  * Merge the layers into one launch preparation. Precedence is fixed (D-12): `/mlx-start` flags, pi flags,
  * environment, project file, global file, built-in default. A file that is unusable, has an unknown key or
@@ -532,6 +584,8 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
         // The label already shows the flag, so the " (flag --x)" suffix of a file line is left off.
         const where = `${row.path} (${problemLabel(layer, row)})`;
         if (raw === true) {
+          // A bare flag is its own value; any other flag written without one is an error.
+          if (row.bare === true) return true;
           problems[layer].push(`${where}: needs a value (${row.expected})`);
           return undefined;
         }
@@ -589,9 +643,22 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
     });
   }
 
+  const sources = new Map<string, { layer: LayerName; label: string }>();
+  for (const row of SETTINGS) {
+    const hit = resolved.get(row.path);
+    if (hit !== undefined) sources.set(row.path, { layer: hit.layer, label: displayLabel(hit.layer, row) });
+  }
+
   return {
     ok: true,
-    prepared: { address, baseUrl, defaultModel: String(value("defaultModel") ?? DEFAULT_MODEL_ID), flags, projectViolations: [] },
+    prepared: {
+      address,
+      baseUrl,
+      defaultModel: String(value("defaultModel") ?? DEFAULT_MODEL_ID),
+      flags,
+      sources,
+      projectViolations: projectViolationsOf(fileValues.project),
+    },
     warnings,
   };
 }
@@ -649,12 +716,63 @@ export interface TrustRisk {
   message: string;
 }
 
-/** The risks in the effective values that come from any layer except the project file. */
-export function trustRisks(_prepared: Prepared): TrustRisk[] {
-  return [];
+/** Text for a confirmation dialog: cleaned, and long enough that clipping cannot hide where a URL really points. */
+const showInDialog = (text: string): string => clipDiagnostic(cleanLabel(text), 300, "start");
+
+/**
+ * The risks in the effective merged values whose layer is not the project file (that one is refused by
+ * `projectViolations` before this is asked), in the order trustRemoteCode, host, baseUrl. An empty list means
+ * the launch needs no confirmation (D-13, D-14, D-17).
+ */
+export function trustRisks(prepared: Prepared): TrustRisk[] {
+  const risks: TrustRisk[] = [];
+  const outsideProject = (path: string) => {
+    const source = prepared.sources.get(path);
+    return source !== undefined && source.layer !== "project" ? source : undefined;
+  };
+
+  const trust = outsideProject("server.trustRemoteCode");
+  if (trust !== undefined && prepared.flags.some((flag) => flag.path === "server.trustRemoteCode")) {
+    risks.push({
+      kind: "trustRemoteCode",
+      phrase: "--trust-remote-code",
+      title: "Allow remote code from the model repository?",
+      message: `--trust-remote-code (from ${trust.label}) lets the model repository run Python code on this machine. Only continue for repositories you trust.`,
+    });
+  }
+
+  const host = outsideProject("server.host");
+  if (host !== undefined && !isLoopbackHost(prepared.address.host)) {
+    const shown = showInDialog(prepared.address.host);
+    const listen = shown.includes(":") && !shown.startsWith("[") ? `[${shown}]` : shown;
+    risks.push({
+      kind: "host",
+      phrase: `listening on ${shown}`,
+      title: "Listen on a non-loopback address?",
+      message: `The MLX server will listen on ${listen}:${prepared.address.port} (from ${host.label}), reachable from your network. mlx_lm.server has no authentication.`,
+    });
+  }
+
+  const baseUrl = outsideProject("baseUrl");
+  if (baseUrl !== undefined && !isLoopbackUrl(prepared.baseUrl)) {
+    const shown = showInDialog(prepared.baseUrl);
+    risks.push({
+      kind: "baseUrl",
+      phrase: `sending prompts to ${shown}`,
+      title: "Send prompts to a non-loopback address?",
+      message: `pi will send your conversation to ${shown} (from ${baseUrl.label}), which is not on this machine.`,
+    });
+  }
+  return risks;
 }
 
 /** The text that refuses a project file asking for a risky setting, without the "mlx-start failed: " prefix. */
-export function formatProjectRefusal(_violations: readonly ProjectViolation[], _globalConfigPath: string): string {
-  return "";
+export function formatProjectRefusal(violations: readonly ProjectViolation[], globalConfigPath: string): string {
+  return [
+    ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+    ...violations.map(
+      (violation) => `  ${show(violation.path)}${violation.shown === "" ? "" : ` (${show(violation.shown)})`}: ${show(violation.reason)}`,
+    ),
+    `Move them to ${cleanLabel(globalConfigPath)}; starting then asks for confirmation.`,
+  ].join("\n");
 }
