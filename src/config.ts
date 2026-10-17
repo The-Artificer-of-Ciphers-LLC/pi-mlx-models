@@ -100,13 +100,15 @@ export function envText(raw: string | undefined): string | undefined {
 const portResult = parsePort(process.env.PI_MLX_MODELS_PORT);
 
 export const PORT = portResult.port;
-export const HOST = process.env.PI_MLX_MODELS_HOST ?? "127.0.0.1";
+export const HOST = envText(process.env.PI_MLX_MODELS_HOST) ?? "127.0.0.1";
 const URL_HOST = HOST.includes(":") && !HOST.startsWith("[") ? `[${HOST}]` : HOST;
-export const BASE_URL = process.env.PI_MLX_MODELS_BASE_URL ?? `http://${URL_HOST}:${PORT}/v1`;
+const explicitBaseUrl = envText(process.env.PI_MLX_MODELS_BASE_URL);
+// Callers append "/models" and "/chat/completions", so a trailing slash would yield "//models".
+export const BASE_URL = explicitBaseUrl?.replace(/\/+$/, "") || `http://${URL_HOST}:${PORT}/v1`;
 export const DEFAULT_MODEL = envText(process.env.PI_MLX_MODELS_DEFAULT_MODEL) ?? "mlx-community/Qwen3-4B-Instruct-2507-4bit";
 
 /** Warnings found while reading configuration; index.ts surfaces each once. config.ts never prints. */
-const baseUrlMismatch = baseUrlWarning({ baseUrl: process.env.PI_MLX_MODELS_BASE_URL, host: HOST, port: PORT });
+const baseUrlMismatch = baseUrlWarning({ baseUrl: explicitBaseUrl, host: HOST, port: PORT });
 export const CONFIG_WARNINGS: readonly string[] = [
   ...(portResult.warning ? [portResult.warning] : []),
   ...(baseUrlMismatch ? [baseUrlMismatch] : []),
