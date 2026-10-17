@@ -308,12 +308,17 @@ test("a listener that never answers is cut off by the per-request health timeout
     killWaitMs: 1000,
   });
 
-  const started = server.start("stub/model");
+  // Observe the outcome from the start so the later cancellation is never an unhandled rejection.
+  const startOutcome = server.start("stub/model").then(
+    () => undefined,
+    (err: Error) => err,
+  );
   const outcome = await aborted;
   assert.equal(outcome.name, "TimeoutError");
   assert.ok(outcome.ms >= 9000 && outcome.ms < 15000, `the request should be aborted by its own signal after about 10 s, took ${outcome.ms} ms`);
 
   await server.stop();
-  await assert.rejects(started, /cancelled/);
+  const failure = await startOutcome;
+  assert.match(String(failure?.message), /cancelled/);
   assert.ok(requests >= 1);
 });

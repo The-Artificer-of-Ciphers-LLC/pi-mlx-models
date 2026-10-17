@@ -97,6 +97,10 @@ export function createMlxServer(
     baseUrl?: string;
     healthTimeoutMs?: number;
     warmupTimeoutMs?: number;
+    /** Per-request bound for each /models poll, so a listener that never answers cannot stall the loop. */
+    healthRequestTimeoutMs?: number;
+    /** Per-request bound for the warm-up completion request (covers its body read). */
+    warmupRequestTimeoutMs?: number;
     healthPollMs?: number;
     warmupPollMs?: number;
     killWaitMs?: number;
@@ -110,6 +114,8 @@ export function createMlxServer(
   const baseUrl = options.baseUrl ?? BASE_URL;
   const healthTimeoutMs = options.healthTimeoutMs ?? 600_000;
   const warmupTimeoutMs = options.warmupTimeoutMs ?? 1_800_000;
+  const healthRequestTimeoutMs = options.healthRequestTimeoutMs ?? 10_000;
+  const warmupRequestTimeoutMs = options.warmupRequestTimeoutMs ?? 120_000;
   const healthPollMs = options.healthPollMs ?? 1200;
   const warmupPollMs = options.warmupPollMs ?? 1500;
   const killWaitMs = options.killWaitMs ?? 5000;
@@ -166,7 +172,7 @@ export function createMlxServer(
       assertAlive(c);
       let ok = false;
       try {
-        const res = await host.fetch(`${baseUrl}/models`);
+        const res = await host.fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(healthRequestTimeoutMs) });
         ok = res.ok;
       } catch {
         // retry
@@ -185,30 +191,31 @@ export function createMlxServer(
     const start = Date.now();
     while (Date.now() - start < warmupTimeoutMs) {
       assertAlive(c);
-      let ok = false;
+      let res: Response | undefined;
       try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 120_000);
-        const res = await host
-          .fetch(`${baseUrl}/chat/completions`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              model,
-              messages: [{ role: "user", content: "Reply with: ok" }],
-              max_tokens: 2,
-              stream: false,
-              temperature: 0,
-            }),
-            signal: controller.signal,
-          })
-          .finally(() => clearTimeout(timer));
-        ok = res.ok;
+        res = await host.fetch(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: "Reply with: ok" }],
+            max_tokens: 2,
+            stream: false,
+            temperature: 0,
+          }),
+          signal: AbortSignal.timeout(warmupRequestTimeoutMs),
+        });
       } catch {
-        // still loading/downloading
+        // Network error, refused connection or timeout: still loading/downloading, poll again.
       }
       assertAlive(c); // same rule as the health check: never ready on a dead process's say-so
-      if (ok) return;
+      if (res) {
+        if (res.ok) return;
+        // Any HTTP error is the server's final answer about this request (D-11): show it, do not retry.
+        const body = await res.text().catch(() => "");
+        const detail = clipDiagnostic(body, 400, "start");
+        throw new Error(`Warm-up request failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+      }
       await host.sleep(warmupPollMs);
     }
     assertAlive(c);
