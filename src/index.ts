@@ -1,6 +1,15 @@
 import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, GLOBAL_CONFIG_PATH, PROVIDER_ID, deriveBaseUrl } from "./config.js";
+import {
+  DEFAULT_HOST,
+  DEFAULT_MODEL_ID,
+  DEFAULT_PORT,
+  GLOBAL_CONFIG_PATH,
+  PROJECT_CONFIG_RELPATH,
+  PROVIDER_ID,
+  deriveBaseUrl,
+} from "./config.js";
 import { cleanLabel } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
@@ -13,9 +22,11 @@ import {
   cliFlagSpecs,
   describeFlags,
   formatConfigErrors,
+  formatProjectRefusal,
   prepareSettings,
   readLayerFile,
   toLaunchSpec,
+  trustRisks,
   type Prepared,
   type ResolvedLaunch,
   type SettingsSource,
@@ -52,6 +63,10 @@ export interface ExtensionDeps {
 }
 
 const errorMessage = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** "a", "a and b", "a, b and c". */
+const joinPhrases = (phrases: readonly string[]): string =>
+  phrases.length > 1 ? `${phrases.slice(0, -1).join(", ")} and ${phrases[phrases.length - 1]}` : (phrases[0] ?? "");
 
 async function pickPreset(ctx: any): Promise<ModelPreset | undefined> {
   const options = MODEL_PRESETS.map((p, i) => `${i + 1}. ${p.key} — ${p.tags.slice(0, 2).join(", ")}`);
@@ -191,6 +206,41 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     ctx.ui.setStatus(PROVIDER_ID, "mlx: stopped");
   }
 
+  /**
+   * Ask the user about every setting that runs code or opens the network, one dialog each, on every start (D-13).
+   * Returns true when the start may go on. Nothing is remembered, no UI means no launch (D-15), a dialog that fails
+   * or is dismissed counts as declined, and a stop or newer start that happens while a dialog is open abandons this
+   * start without a word. The start epoch is not touched here, so a refused or declined start cannot cancel one that
+   * is already running (T-02-18).
+   */
+  async function confirmTrustRisks(ctx: any, prepared: Prepared): Promise<boolean> {
+    const risks = trustRisks(prepared);
+    if (risks.length === 0) return true;
+    const phrases = joinPhrases(risks.map((risk) => risk.phrase));
+    if (!ctx.hasUI) {
+      ctx.ui.notify(
+        `mlx-start failed: ${phrases} ${risks.length > 1 ? "need" : "needs"} interactive confirmation; run /mlx-start in an interactive pi session`,
+        "error",
+      );
+      return false;
+    }
+    const seen = startEpoch;
+    for (const risk of risks) {
+      let confirmed = false;
+      try {
+        confirmed = (await ctx.ui.confirm(risk.title, risk.message)) === true;
+      } catch {
+        confirmed = false;
+      }
+      if (startEpoch !== seen) return false;
+      if (!confirmed) {
+        ctx.ui.notify(`mlx-start cancelled: ${risk.phrase} was not confirmed.`, "info");
+        return false;
+      }
+    }
+    return true;
+  }
+
   async function startModelFromInput(pi: PiHost, ctx: any, args: string | undefined, prepared: Prepared) {
     const selected = resolveModel(args, prepared.defaultModel);
     // Bad input is reported before anything runs: no provider refresh, no install, no spawn.
@@ -203,6 +253,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       ctx.ui.notify(`mlx-start failed: ${formatConfigErrors(built.errors)}`, "error");
       return;
     }
+    if (!(await confirmTrustRisks(ctx, prepared))) return;
     const mine = (startEpoch += 1);
     initEpoch += 1;
     startInFlight = mine;
@@ -387,9 +438,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         const typed: Record<string, string | true> = {};
         for (const flag of parsed.flags) typed[flag.path] = flag.raw;
 
-        // The global file is read on every start, so an edit needs no reload (D-05).
+        // The global file and the project file (the working directory's own, never a parent's) are read on every
+        // start, so an edit needs no reload (D-04, D-05).
         const result = prepareSettings({
           global: readLayerFile(deps.settings.globalConfigPath),
+          project: readLayerFile(join(typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd(), PROJECT_CONFIG_RELPATH)),
           env: deps.settings.env,
           piFlags,
           args: typed,
@@ -405,6 +458,12 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           return;
         }
         const { prepared } = result;
+        // A cloned repository's file may tune the server but never run code or open the network; no dialog can
+        // override that, and nothing has been touched yet (D-16).
+        if (prepared.projectViolations.length > 0) {
+          ctx.ui.notify(`mlx-start failed: ${formatProjectRefusal(prepared.projectViolations, deps.settings.globalConfigPath)}`, "error");
+          return;
+        }
 
         // A model typed on the command line beats --mlx-model; with neither, the picker opens even when a default
         // model is configured (the default only fills in for a start that names no model at all).
