@@ -12,6 +12,7 @@ export type RuntimeEvent = {
 /** The machine-facing seam: real in production, scripted in tests. */
 export interface RuntimeHost {
   findPython(): string | null;
+  searched?(): string[];
   exists(path: string): boolean;
   run(cmd: string, args: string[], onLine?: (line: string) => void): Promise<void>;
 }
@@ -28,7 +29,7 @@ const PYTHON_CANDIDATES = [
   "/usr/bin/python3",
 ];
 
-function findPython(): string | null {
+export function findPython(_options: { candidates?: string[]; env?: NodeJS.ProcessEnv } = {}): string | null {
   for (const c of PYTHON_CANDIDATES) {
     try {
       const s = spawnSync(c, ["--version"], { stdio: ["ignore", "pipe", "pipe"], timeout: 3000 });
