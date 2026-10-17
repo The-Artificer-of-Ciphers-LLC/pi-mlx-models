@@ -76,7 +76,11 @@ export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
         stdio: ["ignore", "pipe", "pipe"],
       }),
     fetch: (input, init) => fetch(input, init),
-    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    // Unref'd so a losing kill-wait race cannot hold pi open for the rest of its window.
+    sleep: (ms) =>
+      new Promise((r) => {
+        setTimeout(r, ms).unref?.();
+      }),
     portInUse: probePort,
   };
 }
