@@ -1,6 +1,10 @@
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
-import { createServer } from "node:net";
+import { mkdtempSync } from "node:fs";
+import { createConnection, createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { PiHost } from "./index.js";
 
 /**
  * Shared helpers for tests that need a real child process standing in for
@@ -38,9 +42,87 @@ export function freePort(): Promise<number> {
   });
 }
 
-/** argv for the stub, mirroring the real server's --model/--host/--port flags. */
-export function stubArgs(model: string, address: StubAddress): string[] {
-  return [STUB_SERVER_PATH, "--model", model, "--host", address.host, "--port", String(address.port)];
+/** True when a TCP connect to the loopback port is refused. */
+export function connectRefused(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.once("error", () => resolve(true));
+  });
+}
+
+/** argv for the stub, mirroring the real server's --model/--host/--port flags; `extraArgs` are appended last. */
+export function stubArgs(model: string, address: StubAddress, extraArgs: readonly string[] = []): string[] {
+  return [STUB_SERVER_PATH, "--model", model, "--host", address.host, "--port", String(address.port), ...extraArgs];
+}
+
+type Handler = (args: string, ctx: any) => Promise<void>;
+export type ProviderCall = { name: string; config: any };
+export type Note = { message: string; type: string };
+
+/** A fake pi that records what the extension registers, so tests can drive the handlers directly. */
+export function makeFakePi() {
+  const commands = new Map<string, Handler>();
+  const handlers = new Map<string, () => Promise<void> | void>();
+  const providerCalls: ProviderCall[] = [];
+  const pi: PiHost = {
+    registerCommand(name, options) {
+      commands.set(name, options.handler);
+    },
+    registerProvider(name, config) {
+      providerCalls.push({ name, config });
+    },
+    on(event, handler) {
+      handlers.set(event, handler);
+    },
+  };
+  return { pi, commands, handlers, providerCalls };
+}
+
+export interface CtxOptions {
+  /** The command's working directory; default is a fresh temporary directory. */
+  cwd?: string;
+  /** Whether an interactive UI is attached; default true. */
+  hasUI?: boolean;
+  /** The answer ui.confirm gives; default true. */
+  confirm?: boolean;
+}
+
+/** A fake ctx.ui; `select` decides what the picker returns (default: the first option). */
+export function makeCtx(
+  select: (options: string[]) => string | undefined = (options) => options[0],
+  options: CtxOptions = {},
+) {
+  const notes: Note[] = [];
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const widgets: Array<{ id: string; lines: string[] | undefined }> = [];
+  const confirms: Array<{ title: string; message: string }> = [];
+  const ctx = {
+    cwd: options.cwd ?? mkdtempSync(join(tmpdir(), "pi-mlx-ctx-")),
+    hasUI: options.hasUI ?? true,
+    ui: {
+      notify(message: string, type: string) {
+        notes.push({ message, type });
+      },
+      async select(_title: string, choices: string[]) {
+        return select(choices);
+      },
+      async confirm(title: string, message: string) {
+        confirms.push({ title, message });
+        return options.confirm ?? true;
+      },
+      setStatus(key: string, text: string | undefined) {
+        statuses.push({ key, text });
+      },
+      setWidget(id: string, lines: string[] | undefined) {
+        widgets.push({ id, lines });
+      },
+    },
+  };
+  return { ctx, notes, statuses, widgets, confirms };
 }
 
 export interface SpawnStubOptions {

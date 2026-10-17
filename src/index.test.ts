@@ -1,56 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
-import { createExtension, type PiHost } from "./index.js";
+import { createExtension } from "./index.js";
 import { MODEL_PRESETS } from "./presets.js";
 import type { MlxServer, ServerEvent } from "./server.js";
+import { makeCtx, makeFakePi } from "./testkit.js";
 
-type Handler = (args: string, ctx: any) => Promise<void>;
 type ProviderCall = { name: string; config: any };
 type Note = { message: string; type: string };
-
-/** A fake pi that records what the extension registers, so tests can drive the handlers directly. */
-function makeFakePi() {
-  const commands = new Map<string, Handler>();
-  const handlers = new Map<string, () => Promise<void> | void>();
-  const providerCalls: ProviderCall[] = [];
-  const pi: PiHost = {
-    registerCommand(name, options) {
-      commands.set(name, options.handler);
-    },
-    registerProvider(name, config) {
-      providerCalls.push({ name, config });
-    },
-    on(event, handler) {
-      handlers.set(event, handler);
-    },
-  };
-  return { pi, commands, handlers, providerCalls };
-}
-
-/** A fake ctx.ui; `select` decides what the picker returns (default: the first option). */
-function makeCtx(select: (options: string[]) => string | undefined = (options) => options[0]) {
-  const notes: Note[] = [];
-  const statuses: Array<{ key: string; text: string | undefined }> = [];
-  const widgets: Array<{ id: string; lines: string[] | undefined }> = [];
-  const ctx = {
-    ui: {
-      notify(message: string, type: string) {
-        notes.push({ message, type });
-      },
-      async select(_title: string, options: string[]) {
-        return select(options);
-      },
-      setStatus(key: string, text: string | undefined) {
-        statuses.push({ key, text });
-      },
-      setWidget(id: string, lines: string[] | undefined) {
-        widgets.push({ id, lines });
-      },
-    },
-  };
-  return { ctx, notes, statuses, widgets };
-}
 
 interface FakeServerOptions {
   /** Replaces the default start (which emits launched, loading, warming, ready and resolves). */
@@ -96,8 +56,7 @@ test("mlx-start with a preset key starts that preset's model and reports ready",
     server,
     ensureInstalled: async () => {},
     discoverModelIds: async () => [preset.modelId],
-    baseUrl: "http://127.0.0.1:1/v1",
-    configWarnings: [],
+    settings: freshSettings({}),
   });
   await extension(pi);
 
@@ -127,6 +86,12 @@ function deferred<T = void>() {
 /** Lets already-queued promise continuations run, without any timer. */
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+/** Settings that read no real file: the global config path points into an empty temporary directory. */
+function freshSettings(env: Record<string, string | undefined>) {
+  const dir = mkdtempSync(join(tmpdir(), "pi-mlx-settings-"));
+  return { env, globalConfigPath: join(dir, "config.json"), home: dir };
+}
+
 /** An extension over a fresh fake pi, with a counting installer that succeeds unless told otherwise. */
 async function setup(
   options: {
@@ -134,7 +99,7 @@ async function setup(
     ensureInstalled?: (opts?: any) => Promise<void>;
     discovered?: string[];
     select?: (options: string[]) => string | undefined;
-    configWarnings?: readonly string[];
+    env?: Record<string, string | undefined>;
     sleep?: (ms: number) => Promise<void>;
   } = {},
 ) {
@@ -149,8 +114,7 @@ async function setup(
       await options.ensureInstalled?.(opts);
     }) as any,
     discoverModelIds: async () => options.discovered ?? [],
-    baseUrl: "http://127.0.0.1:1/v1",
-    configWarnings: options.configWarnings ?? [],
+    settings: freshSettings(options.env ?? {}),
     ...(options.sleep ? { sleep: options.sleep } : {}),
   });
   await extension(fakePi.pi);
@@ -166,7 +130,7 @@ test("the extension registers mlx-init, mlx-start and mlx-stop, a session_shutdo
   assert.ok(handlers.has("session_shutdown"));
   assert.equal(providerCalls.length, 1);
   assert.equal(providerCalls[0].name, PROVIDER_ID);
-  assert.equal(providerCalls[0].config.baseUrl, "http://127.0.0.1:1/v1");
+  assert.equal(providerCalls[0].config.baseUrl, "http://127.0.0.1:8080/v1");
   assert.deepEqual(providerCalls[0].config.models, []);
 });
 
@@ -430,37 +394,36 @@ test("a stop that rejects does not prevent the provider re-registration at shutd
   assert.equal(providerCalls.length, providerCallsBefore + 1);
 });
 
-test("config warnings are shown once, in order, on the first mlx-start only", async () => {
-  const { commands, ctx, notes } = await setup({ configWarnings: ["w1", "w2"] });
+test("an invalid PI_MLX_MODELS_PORT is warned about once, on the first mlx-start only", async () => {
+  const { commands, ctx, notes } = await setup({ env: { PI_MLX_MODELS_PORT: "abc" } });
   const warnings = () => notes.filter((n) => n.type === "warning");
 
   await commands.get("mlx-start")!("qwen3_4b", ctx);
 
-  assert.deepEqual(warnings(), [
-    { message: "w1", type: "warning" },
-    { message: "w2", type: "warning" },
-  ]);
-  assert.deepEqual(notes.slice(0, 2).map((n) => n.type), ["warning", "warning"]);
+  assert.equal(warnings().length, 1);
+  assert.match(warnings()[0].message, /PI_MLX_MODELS_PORT/);
+  assert.equal(notes[0].type, "warning");
 
   await commands.get("mlx-start")!("qwen3_4b", ctx);
 
-  assert.equal(warnings().length, 2);
+  assert.equal(warnings().length, 1);
 });
 
-test("without config warnings no warning notification is shown", async () => {
-  const { commands, ctx, notes } = await setup({ configWarnings: [] });
+test("without config problems no warning notification is shown", async () => {
+  const { commands, ctx, notes } = await setup({ env: {} });
 
   await commands.get("mlx-start")!("qwen3_4b", ctx);
 
   assert.deepEqual(notes.filter((n) => n.type === "warning"), []);
 });
 
-test("a rejected first mlx-start still surfaces the config warnings once", async () => {
-  const { commands, ctx, notes } = await setup({ configWarnings: ["w1"] });
+test("a rejected first mlx-start still surfaces the config warning once", async () => {
+  const { commands, ctx, notes } = await setup({ env: { PI_MLX_MODELS_PORT: "abc" } });
   const warnings = () => notes.filter((n) => n.type === "warning");
 
   await commands.get("mlx-start")!("9", ctx);
-  assert.deepEqual(warnings(), [{ message: "w1", type: "warning" }]);
+  assert.equal(warnings().length, 1);
+  assert.match(warnings()[0].message, /PI_MLX_MODELS_PORT/);
 
   await commands.get("mlx-start")!("9", ctx);
   assert.equal(warnings().length, 1);

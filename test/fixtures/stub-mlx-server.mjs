@@ -2,7 +2,7 @@
 //
 // Accepts the same argv as the real server (--model, --host, --port) and
 // selects a behaviour through the STUB_MODE environment variable.
-import { writeSync } from "node:fs";
+import { writeFileSync, writeSync } from "node:fs";
 import http from "node:http";
 
 function parseArgs(argv) {
@@ -22,6 +22,11 @@ function parseArgs(argv) {
     }
   }
   return args;
+}
+
+// Optionally record the exact argv so a test can prove which flags reached the process.
+if (process.env.STUB_ARGV_FILE) {
+  writeFileSync(process.env.STUB_ARGV_FILE, JSON.stringify(process.argv.slice(2)));
 }
 
 const { model, host, port } = parseArgs(process.argv.slice(2));
