@@ -734,7 +734,6 @@ const SUGGESTIONS: ReadonlyArray<[string, Record<string, unknown>, string, strin
   ["a typo of a block name", { sever: {} }, "sever", "server"],
   ["a top-level key in another case", { baseurl: "http://x" }, "baseurl", "baseUrl"],
   ["a top-level key that is a typo of a server key", { hots: "x" }, "hots", "server.host"],
-  ["a top-level row written inside server", { server: { baseUrl: "http://x" } }, "server.baseUrl", "baseUrl"],
   ["nothing close", { server: { zzzzzzzz: 1 } }, "server.zzzzzzzz", undefined],
   ["nothing close at the top level", { zzzzzzzz: 1 }, "zzzzzzzz", undefined],
   ["an editor schema key", { $schema: "https://example.test/schema.json" }, "$schema", undefined],
@@ -747,6 +746,42 @@ for (const [label, data, key, suggestion] of SUGGESTIONS) {
     assert.equal(unknownLine(data), `${key} (${GLOBAL}): unknown key${hint}`);
   });
 }
+
+// A key written in a block it does not belong to says where it lives (GAP-01): a hint that repeats the
+// name the user typed reads as "you typed it right" and never says the key leaves the block.
+const WRONG_PLACE: ReadonlyArray<[string, Record<string, unknown>, string, string]> = [
+  // [label, file, key as shown, text after "unknown key"]
+  ["baseUrl inside server", { server: { baseUrl: "http://x" } }, "server.baseUrl", ' (baseUrl is a top-level key, not part of "server")'],
+  ["defaultModel inside server", { server: { defaultModel: "org/m" } }, "server.defaultModel", ' (defaultModel is a top-level key, not part of "server")'],
+  ["baseUrl in another case inside server", { server: { baseurl: "http://x" } }, "server.baseurl", ' (baseUrl is a top-level key, not part of "server")'],
+  ["baseUrl in snake_case inside server", { server: { base_url: "http://x" } }, "server.base_url", ' (baseUrl is a top-level key, not part of "server")'],
+  ["defaultModel in another case inside server", { server: { defaultmodel: "org/m" } }, "server.defaultmodel", ' (defaultModel is a top-level key, not part of "server")'],
+  ["a typo of baseUrl inside server", { server: { baseUri: "http://x" } }, "server.baseUri", ' (did you mean baseUrl? It is a top-level key, not part of "server")'],
+  ["a block name inside server", { server: { model: {} } }, "server.model", ' (model is a top-level key, not part of "server")'],
+  ["a server key inside model", { model: { host: "x" } }, "model.host", ' (host is a "server" key, not part of "model")'],
+  ["a model key inside server", { server: { adapterPath: "/tmp/a" } }, "server.adapterPath", ' (adapterPath is a "model" key, not part of "server")'],
+  ["a typo of a model key inside server", { server: { drafmodel: "x" } }, "server.drafmodel", ' (did you mean model.draftModel? It is a "model" key, not part of "server")'],
+  ["a server key inside a models entry: host", { models: { qwen3_4b: { host: "0.0.0.0" } } }, 'models["qwen3_4b"].host', ' (host is a "server" key, not part of a "models" entry)'],
+  [
+    "a server key inside a models entry: trustRemoteCode",
+    { models: { qwen3_4b: { trustRemoteCode: true } } },
+    'models["qwen3_4b"].trustRemoteCode',
+    ' (trustRemoteCode is a "server" key, not part of a "models" entry)',
+  ],
+  ["a top-level key inside a models entry", { models: { qwen3_4b: { baseUrl: "http://x" } } }, 'models["qwen3_4b"].baseUrl', ' (baseUrl is a top-level key, not part of a "models" entry)'],
+];
+
+for (const [label, data, key, hint] of WRONG_PLACE) {
+  test(`unknown key in the wrong place, ${label}: the hint says where it lives`, () => {
+    assert.equal(unknownLine(data), `${key} (${GLOBAL}): unknown key${hint}`);
+  });
+}
+
+test("a key written in the wrong place says where it lives in the project layer too", () => {
+  assert.deepEqual(refused({ project: ok({ server: { baseUrl: "http://example.com:8080/v1" } }) }), [
+    `server.baseUrl (${PROJECT}): unknown key (baseUrl is a top-level key, not part of "server")`,
+  ]);
+});
 
 test("an unknown key carries the layer that set it", () => {
   assert.deepEqual(refused({ project: ok({ server: { hots: 1 } }) }), [`server.hots (${PROJECT}): unknown key (did you mean server.host?)`]);
@@ -1637,12 +1672,12 @@ test("an unknown key in an entry names the entry and suggests among the model ke
   ]);
 });
 
-test("server keys inside an entry are unknown keys with a hint to the server block", () => {
+test("server keys inside an entry are unknown keys that say they belong to the server block", () => {
   assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { trustRemoteCode: true } } }) }), [
-    `models["qwen3_4b"].trustRemoteCode (${GLOBAL}): unknown key (did you mean server.trustRemoteCode?)`,
+    `models["qwen3_4b"].trustRemoteCode (${GLOBAL}): unknown key (trustRemoteCode is a "server" key, not part of a "models" entry)`,
   ]);
   assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { host: "0.0.0.0" } } }) }), [
-    `models["qwen3_4b"].host (${GLOBAL}): unknown key (did you mean server.host?)`,
+    `models["qwen3_4b"].host (${GLOBAL}): unknown key (host is a "server" key, not part of a "models" entry)`,
   ]);
 });
 
@@ -1656,7 +1691,9 @@ test("an unknown key in the model block suggests a model key", () => {
   assert.deepEqual(refused({ global: ok({ model: { draftmodel: "x" } }) }), [
     `model.draftmodel (${GLOBAL}): unknown key (did you mean model.draftModel?)`,
   ]);
-  assert.deepEqual(refused({ global: ok({ model: { host: "x" } }) }), [`model.host (${GLOBAL}): unknown key (did you mean server.host?)`]);
+  assert.deepEqual(refused({ global: ok({ model: { host: "x" } }) }), [
+    `model.host (${GLOBAL}): unknown key (host is a "server" key, not part of "model")`,
+  ]);
 });
 
 test("top-level typos of the new blocks are suggested", () => {

@@ -1133,6 +1133,8 @@ function scriptConfirms(h: Harness, answers: Array<boolean | Promise<boolean>>) 
 const TRUST_TITLE = "Allow remote code from the model repository?";
 const HOST_TITLE = "Listen on a non-loopback address?";
 const URL_TITLE = "Send prompts to a non-loopback address?";
+/** Spelled out here, not imported, so changing the production sentence is a deliberate edit of two places. */
+const SAFE_CHOICE_NOTE = "Yes allows this. No or Esc cancels. Check which option is highlighted before pressing Enter.";
 const refusalText = (settings: ReturnType<typeof freshSettings>, lines: string[]) =>
   [
     "mlx-start failed: .pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
@@ -1267,6 +1269,43 @@ for (const [name, project, lines] of REFUSED_PROJECTS) {
   });
 }
 
+// GAP-01 (manual UAT): a top-level key written inside server was reported with a did-you-mean that repeated
+// the name the user typed. Expected strings are written out here, not built from settings.ts.
+const MISPLACED_PROJECTS: ReadonlyArray<[string, unknown, string[]]> = [
+  [
+    "baseUrl inside server (the UAT file)",
+    { server: { baseUrl: "http://example.com:8080/v1" } },
+    ['server.baseUrl (project .pi/pi-mlx-models.json): unknown key (baseUrl is a top-level key, not part of "server")'],
+  ],
+  [
+    "defaultModel inside server",
+    { server: { defaultModel: "org/m" } },
+    ['server.defaultModel (project .pi/pi-mlx-models.json): unknown key (defaultModel is a top-level key, not part of "server")'],
+  ],
+  [
+    "baseUrl and defaultModel both inside server",
+    { server: { baseUrl: "http://example.com:8080/v1", defaultModel: "org/m" } },
+    [
+      'server.baseUrl (project .pi/pi-mlx-models.json): unknown key (baseUrl is a top-level key, not part of "server")',
+      'server.defaultModel (project .pi/pi-mlx-models.json): unknown key (defaultModel is a top-level key, not part of "server")',
+    ],
+  ],
+];
+
+for (const [name, project, lines] of MISPLACED_PROJECTS) {
+  test(`a project file with ${name} is refused as one error that says where the key lives, and nothing runs`, async () => {
+    const cwd = newCwd();
+    writeProject(cwd, project);
+    const h = await setup({ ctx: { cwd } });
+
+    await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+    assert.deepEqual(errors(h.notes), [["mlx-start failed: invalid configuration", ...lines.map((line) => `  ${line}`)].join("\n")]);
+    assert.equal(h.confirms.length, 0, "no dialog is asked for an invalid file");
+    assertNothingHappened(h);
+  });
+}
+
 test("a project file asking for something risky is refused even for a start that names a model, a picker choice or flags", async () => {
   const cwd = newCwd();
   writeProject(cwd, { server: { trustRemoteCode: true } });
@@ -1337,7 +1376,8 @@ test("trustRemoteCode in the global file asks once per start, names its source, 
     {
       title: TRUST_TITLE,
       message:
-        "--trust-remote-code (from global file) lets the model repository run Python code on this machine. Only continue for repositories you trust.",
+        "--trust-remote-code (from global file) lets the model repository run Python code on this machine. Only continue for repositories you trust." +
+        `\n\n${SAFE_CHOICE_NOTE}`,
     },
   ]);
   assert.deepEqual(h.server.launches[0]?.extraArgs, ["--trust-remote-code"]);
@@ -1455,6 +1495,7 @@ for (const [name, source, title, label, extra] of SOURCES) {
     assert.equal(h.confirms.length, 1);
     assert.equal(h.confirms[0].title, title);
     assert.ok(h.confirms[0].message.includes(label), h.confirms[0].message);
+    assert.ok(h.confirms[0].message.endsWith(`\n\n${SAFE_CHOICE_NOTE}`), h.confirms[0].message);
     assert.equal(h.server.startCalls.length, 1, "confirmed, so it launched");
     assert.deepEqual(h.server.launches[0]?.extraArgs, extra);
   });
@@ -1479,9 +1520,43 @@ test("the host dialog shows an IPv6 address bracketed in front of the port, and 
   assert.deepEqual(h.confirms, [
     {
       title: HOST_TITLE,
-      message: "The MLX server will listen on [::]:9000 (from env PI_MLX_MODELS_HOST), reachable from your network. mlx_lm.server has no authentication.",
+      message: "The MLX server will listen on [::]:9000 (from env PI_MLX_MODELS_HOST), reachable from your network. mlx_lm.server has no authentication." +
+        `\n\n${SAFE_CHOICE_NOTE}`,
     },
   ]);
+});
+
+test("every trust dialog ends with the safe-choice sentence, exactly once", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_HOST: "0.0.0.0" });
+  writeGlobal(settings, { baseUrl: "http://example.test:8080/v1", server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(
+    h.confirms.map((c) => c.title),
+    [TRUST_TITLE, HOST_TITLE, URL_TITLE],
+  );
+  for (const { message } of h.confirms) {
+    assert.ok(message.endsWith(`\n\n${SAFE_CHOICE_NOTE}`), message);
+    assert.equal(message.split(SAFE_CHOICE_NOTE).length - 1, 1, message);
+  }
+});
+
+test("a trust dialog is asked with exactly a title and a message: no options, timeout or signal", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+  const argCounts: number[] = [];
+  h.ctx.ui.confirm = async (...args: unknown[]) => {
+    argCounts.push(args.length);
+    return true;
+  };
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(argCounts, [2]);
+  assert.equal(h.server.startCalls.length, 1, "confirmed, so it launched");
 });
 
 test("--trust-remote-code takes no value on /mlx-start", async () => {
@@ -1808,7 +1883,7 @@ test("a trustRemoteCode key inside a models entry is reported as an unknown key 
   await startMlx(h, "qwen3_4b");
 
   assert.deepEqual(errors(h.notes), [
-    'mlx-start failed: invalid configuration\n  models["qwen3_4b"].trustRemoteCode (global config.json): unknown key (did you mean server.trustRemoteCode?)',
+    'mlx-start failed: invalid configuration\n  models["qwen3_4b"].trustRemoteCode (global config.json): unknown key (trustRemoteCode is a "server" key, not part of a "models" entry)',
   ]);
   assert.equal(h.confirms.length, 0);
   assertNothingHappened(h);
