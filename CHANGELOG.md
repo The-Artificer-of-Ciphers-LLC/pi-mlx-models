@@ -2,7 +2,7 @@
 
 All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.2.0 were published as `pi-mlx-models`; see the [tags](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/tags) for their code.
 
-## 0.2.0 (unreleased)
+## 0.2.0 - 2026-10-17
 
 ### Added
 
