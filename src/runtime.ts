@@ -102,7 +102,8 @@ export function run(cmd: string, args: string[], onLine?: (line: string) => void
       err += d.toString();
       handle(d);
     });
-    p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-800) || `${cmd} failed with exit ${code}`))));
+    // `close`, not `exit`: exit can fire before the last stderr chunk has been read.
+    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-800) || `${cmd} failed with exit ${code}`))));
     p.on("error", reject);
   });
 }
