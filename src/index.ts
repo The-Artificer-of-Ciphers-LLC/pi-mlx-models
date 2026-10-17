@@ -83,6 +83,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   const { server } = deps;
   let currentModel = deps.defaultModel;
   let activeProgress: Progress | null = null;
+  let configWarningsShown = false;
 
   async function registerProvider(pi: PiHost, options?: { includeFallback?: boolean }) {
     const discovered = await deps.discoverModelIds();
@@ -246,6 +247,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     pi.registerCommand("mlx-start", {
       description: "Start local MLX server. Usage: /mlx-start [preset-number|preset-key|hf-model-id]",
       handler: async (args, ctx) => {
+        if (!configWarningsShown) {
+          configWarningsShown = true;
+          for (const warning of deps.configWarnings) ctx.ui.notify(warning, "warning");
+        }
+
         const normalizedArgs = (args || "").trim();
         if (!normalizedArgs) {
           const preset = await pickPreset(ctx);
@@ -273,7 +279,9 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
     pi.on("session_shutdown", async () => {
       activeProgress?.stop();
-      await server.stop();
+      // Wait for the child to exit so a quitting pi does not leave it holding the port, but never
+      // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.
+      await Promise.race([server.stop().catch(() => {}), deps.sleep(deps.shutdownWaitMs)]);
       await registerProvider(pi, { includeFallback: false });
     });
   };
