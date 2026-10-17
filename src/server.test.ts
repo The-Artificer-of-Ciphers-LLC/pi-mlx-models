@@ -637,3 +637,49 @@ test("stop during the previous server's teardown cancels the pending restart wit
   assert.equal(spawns, 1, "the cancelled restart must not spawn a second process");
   assert.equal(server.running, false);
 });
+
+// WR-03: `exit` can fire before the child's stdio is fully read, so the death message waits for `close`.
+test("a death message includes stderr that arrives after the exit event but before close", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const { host, procs } = makeHost({
+    fetch: async () => {
+      await gate;
+      throw new Error("refused");
+    },
+    // The bounded drain wait never elapses, so only `close` can end it.
+    sleep: () => new Promise<void>(() => {}),
+  });
+  const server = createMlxServer({ ...opts, host });
+  const started = server.start("m");
+  await tick();
+
+  procs[0].emit("exit", 1);
+  release();
+  await tick();
+  procs[0].stderr.emit("data", "ModuleNotFoundError: mlx");
+  procs[0].emit("close", 1);
+
+  await assert.rejects(started, /exited \(code 1\).*ModuleNotFoundError/s);
+  assert.equal(server.running, false);
+});
+
+test("a death message does not wait forever when close never arrives", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const { host, procs } = makeHost({
+    fetch: async () => {
+      await gate;
+      throw new Error("refused");
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const started = server.start("m");
+  await tick();
+
+  procs[0].stderr.emit("data", "ModuleNotFoundError: mlx");
+  procs[0].emit("exit", 1);
+  release();
+
+  await assert.rejects(started, /exited \(code 1\).*ModuleNotFoundError/s);
+});
