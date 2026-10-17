@@ -55,15 +55,57 @@ export function resolveAgentDir({ getAgentDir, env, home }: AgentDirDeps): strin
   return join(home, ".pi", "agent");
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const WILDCARD_HOSTS = new Set(["0.0.0.0", "::"]);
+
+function normalizeHost(host: string): string {
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  return bare.toLowerCase();
+}
+
+function hostsMatch(urlHost: string, launchHost: string): boolean {
+  if (urlHost === launchHost) return true;
+  if (LOOPBACK_HOSTS.has(urlHost) && LOOPBACK_HOSTS.has(launchHost)) return true;
+  return WILDCARD_HOSTS.has(launchHost) && LOOPBACK_HOSTS.has(urlHost);
+}
+
+/**
+ * Compare an explicit PI_MLX_MODELS_BASE_URL with the launch host/port. Returns a
+ * warning when they disagree (the extension would poll and register one address while
+ * the server listens on another), or null when there is nothing to report.
+ */
+export function baseUrlWarning({ baseUrl, host, port }: { baseUrl: string | undefined; host: string; port: number }): string | null {
+  if (baseUrl === undefined) return null;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return `PI_MLX_MODELS_BASE_URL=${JSON.stringify(baseUrl)} is not a valid URL.`;
+  }
+  const urlHost = normalizeHost(url.hostname);
+  const urlPort = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  const launchHost = normalizeHost(host);
+  if (hostsMatch(urlHost, launchHost) && urlPort === port) return null;
+  return (
+    `PI_MLX_MODELS_BASE_URL points at ${urlHost}:${urlPort} but the server launches on ${launchHost}:${port}; ` +
+    `polling and registration would use the URL while the server launches on the launch address.`
+  );
+}
+
 const portResult = parsePort(process.env.PI_MLX_MODELS_PORT);
 
 export const PORT = portResult.port;
 export const HOST = process.env.PI_MLX_MODELS_HOST ?? "127.0.0.1";
-export const BASE_URL = process.env.PI_MLX_MODELS_BASE_URL ?? `http://${HOST}:${PORT}/v1`;
+const URL_HOST = HOST.includes(":") && !HOST.startsWith("[") ? `[${HOST}]` : HOST;
+export const BASE_URL = process.env.PI_MLX_MODELS_BASE_URL ?? `http://${URL_HOST}:${PORT}/v1`;
 export const DEFAULT_MODEL = process.env.PI_MLX_MODELS_DEFAULT_MODEL ?? "mlx-community/Qwen3-4B-Instruct-2507-4bit";
 
 /** Warnings found while reading configuration; index.ts surfaces each once. config.ts never prints. */
-export const CONFIG_WARNINGS: readonly string[] = [...(portResult.warning ? [portResult.warning] : [])];
+const baseUrlMismatch = baseUrlWarning({ baseUrl: process.env.PI_MLX_MODELS_BASE_URL, host: HOST, port: PORT });
+export const CONFIG_WARNINGS: readonly string[] = [
+  ...(portResult.warning ? [portResult.warning] : []),
+  ...(baseUrlMismatch ? [baseUrlMismatch] : []),
+];
 
 export const PROVIDER_ID = "pi-mlx-models";
 export const DATA_DIR = join(

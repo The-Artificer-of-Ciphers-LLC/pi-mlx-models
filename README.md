@@ -66,23 +66,27 @@ You can also start directly with a full model id:
 ## Requirements
 
 - macOS on Apple Silicon
-- Python 3.10–3.13
+- Python 3.11 or newer
 
 ## Configuration
 
 Environment variables supported by the extension:
 
-- `PI_MLX_MODELS_PORT` (default: `11434`)
+- `PI_MLX_MODELS_PORT` (default: `8080`)
 - `PI_MLX_MODELS_HOST` (default: `127.0.0.1`)
 - `PI_MLX_MODELS_BASE_URL` (default: `http://<host>:<port>/v1`)
 - `PI_MLX_MODELS_DEFAULT_MODEL` (default: `mlx-community/Qwen3-4B-Instruct-2507-4bit`)
 
+The default port changed in 0.2.0 from the previous Ollama default (`11434`); set `PI_MLX_MODELS_PORT` to keep any other port. An empty or invalid port value falls back to `8080` with a warning.
+
 ## Local data paths
 
-Runtime artifacts are stored under:
+The data directory follows pi's agent directory: `PI_CODING_AGENT_DIR` when set, otherwise `~/.pi/agent`. Runtime artifacts are stored under `pi-mlx-models` in it:
 
-- `~/.pi/agent/pi-mlx-models/venv`
-- `~/.pi/agent/pi-mlx-models/models`
+- `<agent dir>/pi-mlx-models/venv`
+- `<agent dir>/pi-mlx-models/models`
+
+With `PI_CODING_AGENT_DIR` unset these are `~/.pi/agent/pi-mlx-models/venv` and `~/.pi/agent/pi-mlx-models/models`.
 
 ## Development
 
