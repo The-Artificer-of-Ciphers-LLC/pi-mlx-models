@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
 import { createExtension } from "./index.js";
+import type { ProbeResult } from "./flagprobe.js";
 import { MODEL_PRESETS } from "./presets.js";
+import { SETTINGS } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
 import { makeCtx, makeFakePi, type CtxOptions } from "./testkit.js";
 
@@ -96,6 +98,13 @@ function freshSettings(env: Record<string, string | undefined>) {
   return { env, globalConfigPath: join(dir, "config.json"), home: dir };
 }
 
+/** A probe result for an install that lists every flag the schema can pass. */
+const ALL_SUPPORTED: ProbeResult = {
+  ok: true,
+  version: "0.32.2",
+  flags: new Set(SETTINGS.flatMap((row) => (row.mlxFlag === undefined ? [] : [row.mlxFlag]))),
+};
+
 /** An extension over a fresh fake pi, with a counting installer that succeeds unless told otherwise. */
 async function setup(
   options: {
@@ -109,10 +118,14 @@ async function setup(
     sleep?: (ms: number) => Promise<void>;
     /** Options of the fake ctx: the working directory, whether a UI is attached, the answer dialogs give. */
     ctx?: CtxOptions;
+    /** What the flag probe answers; default: an install that lists every flag of the schema. */
+    probe?: () => Promise<ProbeResult>;
   } = {},
 ) {
   const server = makeFakeServer(options.server);
   const installCalls: any[] = [];
+  /** How many times the extension asked which flags the install supports. */
+  let probeCalls = 0;
   const fakePi = makeFakePi();
   const fakeCtx = makeCtx(options.select, options.ctx);
   const extension = createExtension({
@@ -123,10 +136,22 @@ async function setup(
     }) as any,
     discoverModelIds: async () => options.discovered ?? [],
     settings: options.settings ?? freshSettings(options.env ?? {}),
+    probeFlags: async () => {
+      probeCalls += 1;
+      return options.probe ? options.probe() : ALL_SUPPORTED;
+    },
     ...(options.sleep ? { sleep: options.sleep } : {}),
   });
   await extension(fakePi.pi);
-  return { server, installCalls, ...fakePi, ...fakeCtx };
+  return {
+    server,
+    installCalls,
+    ...fakePi,
+    ...fakeCtx,
+    get probeCalls() {
+      return probeCalls;
+    },
+  };
 }
 
 const errors = (notes: Note[]) => notes.filter((n) => n.type === "error").map((n) => n.message);
@@ -1811,4 +1836,148 @@ test("merged chat template args across the global file, a models entry and the c
   await startMlx(h, `qwen3_4b --chat-template-args '{"z":4}'`);
 
   assert.deepEqual(h.server.launches[0]?.extraArgs, ['--chat-template-args={"enable_thinking":false,"x":2,"y":3,"z":4}']);
+});
+
+// ---- the flag probe: older mlx-lm degrades instead of crashing (plan 02-07: SRV-06, D-18, D-19, D-20) ----
+
+const flagSet = (...flags: string[]): ProbeResult => ({ ok: true, version: "0.24.0", flags: new Set(flags) });
+/** An mlx-lm 0.24.0 install: no --allowed-origins, no --num-draft-tokens. */
+const OLD_INSTALL = flagSet("--help", "--model", "--host", "--port", "--log-level", "--draft-model");
+const warningTexts = (notes: Note[]) => notes.filter((n) => n.type === "warning").map((n) => n.message);
+const PROBE_DETAIL = "Checking which server flags mlx-lm supports";
+
+test("a launch with only host and port never probes and shows no probe progress", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { host: "localhost", port: 9123 } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(h.server.startCalls.length, 1);
+  assert.equal(h.probeCalls, 0);
+  assert.ok(!h.widgets.some((w) => w.lines?.some((line) => line.includes(PROBE_DETAIL))));
+  assert.deepEqual(warningTexts(h.notes), []);
+});
+
+test("a default launch never probes", async () => {
+  const h = await setup();
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(h.server.startCalls.length, 1);
+  assert.equal(h.probeCalls, 0);
+});
+
+test("a launch with an optional flag probes exactly once, after the install and before the server starts", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { logLevel: "DEBUG" } });
+  const events: string[] = [];
+  const h = await setup({
+    settings,
+    ensureInstalled: async () => {
+      events.push("install");
+    },
+    probe: async () => {
+      events.push("probe");
+      return ALL_SUPPORTED;
+    },
+    server: {
+      start: async (_model, onEvent) => {
+        events.push("start");
+        for (const type of ["launched", "loading", "warming", "ready"] as const) onEvent?.({ type });
+      },
+    },
+  });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(h.probeCalls, 1);
+  assert.deepEqual(events, ["install", "probe", "start"]);
+  assert.ok(h.widgets.some((w) => w.lines?.some((line) => line.includes(PROBE_DETAIL))), "the pause is explained in the progress widget");
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--log-level=DEBUG"]);
+  assert.deepEqual(warningTexts(h.notes), []);
+});
+
+test("a flag the install does not list is skipped with one warning, the server still starts, and the flags line marks it", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"], logLevel: "DEBUG" } });
+  const h = await setup({ settings, probe: async () => OLD_INSTALL });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), ["Skipped --allowed-origins: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)"]);
+  assert.deepEqual(h.server.startCalls.length, 1);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--log-level=DEBUG"]);
+  assert.equal(
+    startingNotes(h.notes)[0].split("\n")[1],
+    "flags: --allowed-origins http://a.test (global file, skipped), --log-level DEBUG (global file)",
+  );
+  assert.ok(infos(h.notes).includes("MLX server is ready for prompts. Use /model and pick pi-mlx-models/..."));
+});
+
+test("two skipped flags make one warning naming both in row order, and a second start warns again", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"] }, model: { numDraftTokens: 4 } });
+  const h = await setup({ settings, probe: async () => OLD_INSTALL });
+
+  await startMlx(h, "qwen3_4b");
+  await startMlx(h, "qwen3_4b");
+
+  const expected = "Skipped --allowed-origins, --num-draft-tokens: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)";
+  assert.deepEqual(warningTexts(h.notes), [expected, expected], "skip notices are shown on every launch, not once");
+  assert.deepEqual(h.server.launches.map((l) => l?.extraArgs), [[], []]);
+});
+
+test("an install that lists every flag adds no warning and passes everything", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"], logLevel: "DEBUG" }, model: { numDraftTokens: 4 } });
+  const h = await setup({ settings, probe: async () => ALL_SUPPORTED });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, [
+    "--allowed-origins=http://a.test",
+    "--log-level=DEBUG",
+    "--num-draft-tokens=4",
+  ]);
+});
+
+test("a failed probe warns, passes every configured flag, and the start goes on", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"], logLevel: "DEBUG" } });
+  const h = await setup({ settings, probe: async () => ({ ok: false, reason: "boom" }) });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), ["Could not check which flags mlx-lm supports (boom); passing every configured flag."]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--allowed-origins=http://a.test", "--log-level=DEBUG"]);
+  assert.equal(h.server.startCalls.length, 1);
+  assert.equal(
+    startingNotes(h.notes)[0].split("\n")[1],
+    "flags: --allowed-origins http://a.test (global file), --log-level DEBUG (global file)",
+  );
+});
+
+test("a /mlx-stop while the probe is pending abandons the start: no server, no later UI writes", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"] } });
+  const gate = deferred<ProbeResult>();
+  const h = await setup({ settings, probe: () => gate.promise });
+
+  const starting = startMlx(h, "qwen3_4b");
+  for (let i = 0; i < 5; i += 1) await flush();
+  assert.equal(h.probeCalls, 1, "the start is waiting on the probe");
+
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  const before = { notes: h.notes.length, statuses: h.statuses.length, widgets: h.widgets.length };
+  gate.resolve(OLD_INSTALL);
+  await starting;
+
+  assert.deepEqual(h.server.startCalls, []);
+  assert.deepEqual(
+    { notes: h.notes.length, statuses: h.statuses.length, widgets: h.widgets.length },
+    before,
+    "nothing is written after the stop, not even the skip warning",
+  );
 });

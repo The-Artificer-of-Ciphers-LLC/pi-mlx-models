@@ -4,9 +4,11 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { ProbeResult } from "./flagprobe.js";
 import { createExtension } from "./index.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { createMlxServer, createSystemHost, type ServerHost } from "./server.js";
+import { SETTINGS } from "./settings.js";
 import { connectRefused, freePort, makeCtx, makeFakePi, stubArgs, type CtxOptions } from "./testkit.js";
 
 /**
@@ -19,7 +21,14 @@ const QWEN = MODEL_PRESETS[3];
 
 type Settings = Record<string, string | undefined>;
 
-async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOptions = {}) {
+/** What the flag probe answers unless a test says otherwise: an install that lists every flag of the schema. */
+const ALL_SUPPORTED: ProbeResult = {
+  ok: true,
+  version: "0.32.2",
+  flags: new Set(SETTINGS.flatMap((row) => (row.mlxFlag === undefined ? [] : [row.mlxFlag]))),
+};
+
+async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOptions = {}, probe: ProbeResult = ALL_SUPPORTED) {
   const dir = mkdtempSync(join(tmpdir(), "pi-mlx-e2e-"));
   const globalConfigPath = join(dir, "data", "config.json");
   const argvFile = join(dir, "argv.json");
@@ -54,6 +63,7 @@ async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOption
     },
     discoverModelIds: async () => [],
     settings: { env, globalConfigPath, home: dir },
+    probeFlags: async () => probe,
     shutdownWaitMs: 1000,
   });
   const fakePi = makeFakePi();
@@ -443,4 +453,32 @@ test("a missing chat template file spawns nothing and installs nothing", { timeo
   assert.equal(h.installCalls, 0);
   assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
   assert.equal(h.providerCalls.length, 1, "only the initial provider registration");
+});
+
+test("an older mlx-lm skips the flags it cannot do, says so once, and the stub still reaches ready", { timeout: 30_000 }, async (t) => {
+  const old: ProbeResult = { ok: true, version: "0.24.0", flags: new Set(["--help", "--model", "--host", "--port", "--log-level"]) };
+  const port = await freePort();
+  const h = await harness(t, {}, {}, old);
+  h.writeConfig({ server: { port, allowedOrigins: ["http://a.test"], logLevel: "DEBUG" } });
+
+  await h.start();
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--log-level=DEBUG"]);
+  assert.ok(!h.argv().some((arg) => arg.startsWith("--allowed-origins")), "the skipped flag never reaches the process");
+  assert.deepEqual(
+    h.notes.filter((n) => n.type === "warning").map((n) => n.message),
+    ["Skipped --allowed-origins: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)"],
+  );
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  assert.equal(
+    startNotes(h.notes)[0].message,
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --port ${port} (global file), --allowed-origins http://a.test (global file, skipped), --log-level DEBUG (global file)`,
+  );
+  assert.ok(
+    h.notes.some((n) => n.type === "info" && n.message.startsWith("MLX server is ready for prompts")),
+    "the stub reached ready",
+  );
+
+  await h.stop();
+  assert.equal(await connectRefused(port), true);
 });

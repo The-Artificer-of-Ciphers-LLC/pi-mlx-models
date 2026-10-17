@@ -12,6 +12,7 @@ import {
 } from "./config.js";
 import { cleanLabel } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
+import type { ProbeResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
 import { createProgress, type Progress } from "./progress.js";
 import { ensureInstalled, type RuntimeEvent } from "./runtime.js";
@@ -57,6 +58,8 @@ export interface ExtensionDeps {
   discoverModelIds: (baseUrl: string) => Promise<string[]>;
   /** Where layered settings are read from; the global file is read again on every /mlx-start. */
   settings: SettingsSource;
+  /** Asks the installed mlx-lm which server flags it supports (the venv must exist). */
+  probeFlags: () => Promise<ProbeResult>;
   /** How long session_shutdown waits for the server to stop before letting pi exit. */
   shutdownWaitMs: number;
   sleep: (ms: number) => Promise<void>;
@@ -107,6 +110,7 @@ function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
     ensureInstalled: overrides.ensureInstalled ?? ensureInstalled,
     discoverModelIds: overrides.discoverModelIds ?? ((baseUrl) => discoverModelIds({ baseUrl })),
     settings: overrides.settings ?? { env: process.env, globalConfigPath: GLOBAL_CONFIG_PATH, home: homedir() },
+    probeFlags: overrides.probeFlags ?? (async () => ({ ok: false, reason: "not implemented" })),
     shutdownWaitMs: overrides.shutdownWaitMs ?? 5000,
     sleep: overrides.sleep ?? unrefSleep,
   };

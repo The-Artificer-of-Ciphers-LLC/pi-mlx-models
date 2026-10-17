@@ -1060,7 +1060,7 @@ export function buildLaunch(prepared: Prepared, model: { modelId: string; preset
 }
 
 /** What the server host needs: the address, the URL, and the optional flags in schema order. */
-export function toLaunchSpec(launch: ResolvedLaunch): LaunchSpec {
+export function toLaunchSpec(launch: ResolvedLaunch, _skipped?: ReadonlySet<string>): LaunchSpec {
   return {
     address: launch.address,
     baseUrl: launch.baseUrl,
@@ -1069,7 +1069,7 @@ export function toLaunchSpec(launch: ResolvedLaunch): LaunchSpec {
 }
 
 /** The "flags: ..." line of the start message, or "" when no flag differs from its default (D-11). */
-export function describeFlags(launch: ResolvedLaunch): string {
+export function describeFlags(launch: ResolvedLaunch, _skipped?: ReadonlySet<string>): string {
   if (launch.flags.length === 0) return "";
   const parts = launch.flags.map((flag) => `${flag.flag}${flag.display ? ` ${flag.display}` : ""} (${flag.label})`);
   return `flags: ${parts.join(", ")}`;

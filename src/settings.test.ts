@@ -2090,3 +2090,42 @@ test("every connection and model key in the global file produces exactly those f
     '--chat-template-args={"enable_thinking":false}',
   ]);
 });
+
+// ---- skipped flags (plan 02-07: SRV-06, D-19) ----
+
+const ORIGINS_AND_LEVEL = { server: { allowedOrigins: ["http://a.test"], logLevel: "DEBUG" } };
+
+test("describeFlags marks a skipped flag and leaves the rest alone", () => {
+  const launch = launchOf({ global: ok(ORIGINS_AND_LEVEL) });
+  assert.equal(
+    describeFlags(launch, new Set(["--allowed-origins"])),
+    "flags: --allowed-origins http://a.test (global file, skipped), --log-level DEBUG (global file)",
+  );
+});
+
+test("toLaunchSpec leaves skipped flags out of extraArgs, keeping the order of the others", () => {
+  const launch = launchOf({ global: ok(ORIGINS_AND_LEVEL) });
+  assert.deepEqual(toLaunchSpec(launch, new Set(["--allowed-origins"])).extraArgs, ["--log-level=DEBUG"]);
+  assert.deepEqual(toLaunchSpec(launch, new Set(["--log-level"])).extraArgs, ["--allowed-origins=http://a.test"]);
+  assert.deepEqual(toLaunchSpec(launch, new Set(["--allowed-origins", "--log-level"])).extraArgs, []);
+});
+
+test("an empty or absent skipped set changes nothing", () => {
+  const launch = launchOf({ global: ok(ORIGINS_AND_LEVEL) });
+  for (const skipped of [undefined, new Set<string>()]) {
+    assert.deepEqual(toLaunchSpec(launch, skipped), toLaunchSpec(launch));
+    assert.equal(describeFlags(launch, skipped), describeFlags(launch));
+  }
+});
+
+test("a skipped bare flag is marked too, and a name that is not in the launch changes nothing", () => {
+  const launch = launchOf({ global: ok({ server: { trustRemoteCode: true } }) });
+  assert.equal(describeFlags(launch, new Set(["--trust-remote-code"])), "flags: --trust-remote-code (global file, skipped)");
+  assert.deepEqual(toLaunchSpec(launch, new Set(["--no-such-flag"])).extraArgs, ["--trust-remote-code"]);
+});
+
+test("a model flag can be skipped as well", () => {
+  const launch = launchOf({ global: ok({ model: { numDraftTokens: 4 } }) });
+  assert.equal(describeFlags(launch, new Set(["--num-draft-tokens"])), "flags: --num-draft-tokens 4 (global file, skipped)");
+  assert.deepEqual(toLaunchSpec(launch, new Set(["--num-draft-tokens"])).extraArgs, []);
+});
