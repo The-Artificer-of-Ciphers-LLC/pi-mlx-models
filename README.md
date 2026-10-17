@@ -3,6 +3,14 @@
 Local MLX model launcher for [pi](https://pi.dev) on Apple Silicon.
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/@taoc/pi-mlx-models"><img alt="npm version" src="https://img.shields.io/npm/v/@taoc/pi-mlx-models?style=for-the-badge&logo=npm&label=npm" /></a>
+  <a href="https://www.npmjs.com/package/@taoc/pi-mlx-models"><img alt="npm downloads per month" src="https://img.shields.io/npm/dm/@taoc/pi-mlx-models?style=for-the-badge&logo=npm&label=downloads" /></a>
+  <a href="https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/actions/workflows/ci.yml"><img alt="tests" src="https://img.shields.io/github/actions/workflow/status/The-Artificer-of-Ciphers-LLC/pi-mlx-models/ci.yml?branch=main&style=for-the-badge&logo=github&label=tests" /></a>
+  <a href="https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/The-Artificer-of-Ciphers-LLC/pi-mlx-models?style=for-the-badge&logo=github&label=stars" /></a>
+  <a href="./LICENSE"><img alt="license" src="https://img.shields.io/github/license/The-Artificer-of-Ciphers-LLC/pi-mlx-models?style=for-the-badge&label=license" /></a>
+</p>
+
+<p align="center">
   <img src="./assets/preset-selector.png" alt="Preset selector" width="780" />
 </p>
 
