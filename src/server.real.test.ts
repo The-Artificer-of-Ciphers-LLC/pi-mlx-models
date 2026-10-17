@@ -55,6 +55,8 @@ test("start reaches ready against the stub process and stop resolves only after 
     baseUrl: `http://127.0.0.1:${port}/v1`,
     healthPollMs: 25,
     warmupPollMs: 25,
+    // The kill-wait timer outlives stop() by its full length, so keep it short in tests.
+    killWaitMs: 1000,
   });
 
   await server.start("stub/model");

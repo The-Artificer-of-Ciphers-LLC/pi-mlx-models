@@ -17,9 +17,15 @@ export interface ServerProcess {
   kill(signal?: NodeJS.Signals): unknown;
 }
 
+/** Where the server listens. Single-sourced from createMlxServer so the spawn and the probes agree. */
+export interface ServerAddress {
+  host: string;
+  port: number;
+}
+
 /** The machine-facing seam: real child/fetch/timers in production, fakes in tests. */
 export interface ServerHost {
-  spawn(model: string): ServerProcess;
+  spawn(model: string, address: ServerAddress): ServerProcess;
   fetch: typeof fetch;
   sleep(ms: number): Promise<void>;
 }
@@ -28,22 +34,51 @@ export interface MlxServer {
   readonly running: boolean;
   /** Start (or restart) the server on `model` and resolve once it answers a completion. Rejects if the process dies first. */
   start(model: string, onEvent?: (event: ServerEvent) => void): Promise<void>;
-  stop(): void;
+  /** Stop the server. Resolves (never rejects) once the child has exited; SIGKILL follows SIGTERM after `killWaitMs`. */
+  stop(): Promise<void>;
 }
 
-const systemHost: ServerHost = {
-  spawn: (model) =>
-    spawn(VENV_PYTHON, ["-m", "mlx_lm.server", "--model", model, "--host", HOST, "--port", String(PORT)], {
-      env: { ...process.env, HF_HOME, TRANSFORMERS_CACHE: HF_HOME, HF_HUB_DISABLE_TELEMETRY: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
-    }),
-  fetch: (input, init) => fetch(input, init),
-  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-};
+export interface SystemHostOptions {
+  /** Executable to spawn. Defaults to the venv python. */
+  command?: string;
+  /** argv for the command. Defaults to the module-form `python -m mlx_lm.server` launch. */
+  buildArgs?: (model: string, address: ServerAddress) => string[];
+  /** Extra environment, merged last so it wins over the defaults. */
+  env?: NodeJS.ProcessEnv;
+}
+
+const moduleArgs = (model: string, address: ServerAddress) => [
+  "-m",
+  "mlx_lm.server",
+  "--model",
+  model,
+  "--host",
+  address.host,
+  "--port",
+  String(address.port),
+];
+
+/** The real child/fetch/timer host. Tests point `command`/`buildArgs` at a stub process. */
+export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
+  const command = options.command ?? VENV_PYTHON;
+  const buildArgs = options.buildArgs ?? moduleArgs;
+  return {
+    spawn: (model, address) =>
+      spawn(command, buildArgs(model, address), {
+        env: { ...process.env, HF_HOME, TRANSFORMERS_CACHE: HF_HOME, HF_HUB_DISABLE_TELEMETRY: "1", ...options.env },
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    fetch: (input, init) => fetch(input, init),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  };
+}
+
+const systemHost = createSystemHost();
 
 export function createMlxServer(
   options: {
     host?: ServerHost;
+    address?: ServerAddress;
     baseUrl?: string;
     healthTimeoutMs?: number;
     warmupTimeoutMs?: number;
@@ -53,6 +88,7 @@ export function createMlxServer(
   } = {},
 ): MlxServer {
   const host = options.host ?? systemHost;
+  const address = options.address ?? { host: HOST, port: PORT };
   const baseUrl = options.baseUrl ?? BASE_URL;
   const healthTimeoutMs = options.healthTimeoutMs ?? 600_000;
   const warmupTimeoutMs = options.warmupTimeoutMs ?? 1_800_000;
@@ -130,10 +166,29 @@ export function createMlxServer(
     throw new Error("Model did not become inference-ready in time");
   }
 
-  const stop = () => {
+  /** SIGTERM, then SIGKILL after `killWaitMs`, each followed by a bounded wait for the exit event. Never rejects. */
+  const terminate = async (c: Current): Promise<void> => {
+    if (c.exited) return;
+    c.proc.kill("SIGTERM");
+    await Promise.race([c.onExit, host.sleep(killWaitMs)]);
+    if (c.exited) return;
+    c.proc.kill("SIGKILL");
+    await Promise.race([c.onExit, host.sleep(killWaitMs)]);
+  };
+
+  /** The in-flight stop, so a start (or a second stop) issued mid-stop waits for the same process to be gone. */
+  let pendingStop: Promise<void> | null = null;
+
+  const stop = (): Promise<void> => {
     const c = current;
+    // Clear synchronously: a start that is still waiting on `c` must see "cancelled" right away.
     current = null;
-    if (c && !c.exited) c.proc.kill("SIGTERM");
+    if (!c) return pendingStop ?? Promise.resolve();
+    const stopping: Promise<void> = terminate(c).finally(() => {
+      if (pendingStop === stopping) pendingStop = null;
+    });
+    pendingStop = stopping;
+    return stopping;
   };
 
   return {
@@ -144,13 +199,10 @@ export function createMlxServer(
     async start(model, onEvent) {
       const emit = onEvent ?? (() => {});
 
-      const previous = current;
-      if (previous) {
-        stop();
-        await Promise.race([previous.onExit, host.sleep(killWaitMs)]);
-      }
+      // Never spawn while the old process might still hold the port (D-05).
+      if (current || pendingStop) await stop();
 
-      const proc = host.spawn(model);
+      const proc = host.spawn(model, address);
       let resolveExit!: () => void;
       const c: Current = {
         proc,
