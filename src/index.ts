@@ -28,6 +28,10 @@ export interface PiHost {
     options: { description: string; handler: (args: string, ctx: any) => Promise<void> },
   ): void;
   registerProvider(name: string, config: any): void;
+  /** Register a pi command-line flag. The extension registers string flags and never passes a default. */
+  registerFlag(name: string, options: { description?: string; type: "boolean" | "string"; default?: boolean | string }): void;
+  /** The value of a registered flag; read it inside handlers, not while the factory runs. */
+  getFlag(name: string): boolean | string | undefined;
   on(event: "session_shutdown", handler: () => Promise<void> | void): void;
 }
 

@@ -277,6 +277,7 @@ test("start refuses an occupied port when there was no previous server, naming t
   await assert.rejects(server.start("m"), (err: Error) => {
     assert.match(err.message, /54321/);
     assert.match(err.message, /PI_MLX_MODELS_PORT/);
+    assert.match(err.message, /--port on \/mlx-start/, "the per-launch option is offered first");
     assert.match(err.message, /lsof -nP -iTCP:54321 -sTCP:LISTEN/);
     assert.doesNotMatch(err.message, /still in use/);
     return true;
@@ -312,6 +313,7 @@ test("start on a running server whose port stays busy rejects with 'still in use
   await assert.rejects(server.start("b"), (err: Error) => {
     assert.match(err.message, /still in use/);
     assert.match(err.message, /PI_MLX_MODELS_PORT/);
+    assert.match(err.message, /--port on \/mlx-start/, "the per-launch option is offered first");
     return true;
   });
 
@@ -390,6 +392,7 @@ async function startWithBindFailure(chunks: string[]) {
 function assertBindFailureMessage(err: Error) {
   assert.match(err.message, /54321/);
   assert.match(err.message, /PI_MLX_MODELS_PORT/);
+  assert.match(err.message, /--port on \/mlx-start/, "the per-launch option is offered first");
   assert.doesNotMatch(err.message, /Errno|Address already in use/, "the message must not embed raw stderr text");
   return true;
 }

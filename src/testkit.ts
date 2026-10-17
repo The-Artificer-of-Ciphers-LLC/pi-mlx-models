@@ -62,12 +62,21 @@ export function stubArgs(model: string, address: StubAddress, extraArgs: readonl
 type Handler = (args: string, ctx: any) => Promise<void>;
 export type ProviderCall = { name: string; config: any };
 export type Note = { message: string; type: string };
+export type FlagRegistration = { name: string; options: { description?: string; type: "boolean" | "string"; default?: boolean | string } };
 
-/** A fake pi that records what the extension registers, so tests can drive the handlers directly. */
+/**
+ * A fake pi that records what the extension registers, so tests can drive the handlers directly.
+ * Flags are recorded as registered (`flags`), set from the test with `setFlag` (undefined clears one) and
+ * counted when read (`getFlagCalls`). Like pi, a registered default is written into the flag values at
+ * registration, which is why the extension must never pass one.
+ */
 export function makeFakePi() {
   const commands = new Map<string, Handler>();
   const handlers = new Map<string, () => Promise<void> | void>();
   const providerCalls: ProviderCall[] = [];
+  const flags: FlagRegistration[] = [];
+  const flagValues = new Map<string, boolean | string>();
+  let getFlagCalls = 0;
   const pi: PiHost = {
     registerCommand(name, options) {
       commands.set(name, options.handler);
@@ -75,11 +84,30 @@ export function makeFakePi() {
     registerProvider(name, config) {
       providerCalls.push({ name, config });
     },
+    registerFlag(name, options) {
+      flags.push({ name, options });
+      if (options.default !== undefined) flagValues.set(name, options.default);
+    },
+    getFlag(name) {
+      getFlagCalls += 1;
+      return flagValues.get(name);
+    },
     on(event, handler) {
       handlers.set(event, handler);
     },
   };
-  return { pi, commands, handlers, providerCalls };
+  return {
+    pi,
+    commands,
+    handlers,
+    providerCalls,
+    flags,
+    setFlag(name: string, value: boolean | string | undefined) {
+      if (value === undefined) flagValues.delete(name);
+      else flagValues.set(name, value);
+    },
+    getFlagCalls: () => getFlagCalls,
+  };
 }
 
 export interface CtxOptions {

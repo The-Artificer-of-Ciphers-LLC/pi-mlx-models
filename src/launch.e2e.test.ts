@@ -164,3 +164,66 @@ test("a missing global file is simply absent and is never created", { timeout: 3
   assert.equal(existsSync(h.globalConfigPath), false);
   assert.equal(existsSync(dirname(h.globalConfigPath)), false);
 });
+
+test("flags typed on /mlx-start reach the process, and the next start without them is back to the file and defaults", { timeout: 30_000 }, async (t) => {
+  const typed = await freePort();
+  let fromFile = await freePort();
+  while (fromFile === typed) fromFile = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port: fromFile } });
+
+  await h.start(`qwen3_4b --port ${typed} --log-level DEBUG --allowed-origins http://a.test,http://b.test`);
+
+  assert.deepEqual(h.argv(), [
+    "--model",
+    QWEN.modelId,
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(typed),
+    "--allowed-origins=http://a.test,http://b.test",
+    "--log-level=DEBUG",
+  ]);
+  assert.equal(lastBaseUrl(h.providerCalls), `http://127.0.0.1:${typed}/v1`);
+  assert.equal(
+    startNotes(h.notes)[0].message,
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --port ${typed} (/mlx-start), --allowed-origins http://a.test,http://b.test (/mlx-start), --log-level DEBUG (/mlx-start)`,
+  );
+
+  await h.start();
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(fromFile)]);
+  assert.equal(lastBaseUrl(h.providerCalls), `http://127.0.0.1:${fromFile}/v1`);
+  assert.equal(await connectRefused(typed), true, "the first server was replaced");
+});
+
+test("a pi flag reaches the process, and a command-line flag beats it", { timeout: 30_000 }, async (t) => {
+  const fromPi = await freePort();
+  let typed = await freePort();
+  while (typed === fromPi) typed = await freePort();
+  const h = await harness(t);
+  h.setFlag("mlx-port", String(fromPi));
+  h.setFlag("mlx-log-level", "DEBUG");
+
+  await h.start();
+  assert.deepEqual(h.argv().slice(-3), ["--port", String(fromPi), "--log-level=DEBUG"]);
+  assert.match(startNotes(h.notes)[0].message, /\nflags: --port \d+ \(pi flag --mlx-port\), --log-level DEBUG \(pi flag --mlx-log-level\)$/);
+
+  await h.start(`qwen3_4b --port ${typed}`);
+  assert.deepEqual(h.argv().slice(-3), ["--port", String(typed), "--log-level=DEBUG"]);
+  assert.equal(lastBaseUrl(h.providerCalls), `http://127.0.0.1:${typed}/v1`);
+});
+
+test("a refused command line spawns nothing", { timeout: 30_000 }, async (t) => {
+  const h = await harness(t);
+
+  await h.start("qwen3_4b --port abc");
+  await h.start("--bogus");
+
+  const errors = h.notes.filter((n) => n.type === "error");
+  assert.equal(errors.length, 2);
+  assert.ok(errors[0].message.startsWith("mlx-start failed: invalid configuration"), errors[0].message);
+  assert.ok(errors[1].message.startsWith("mlx-start failed: unknown flag --bogus"), errors[1].message);
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+});
