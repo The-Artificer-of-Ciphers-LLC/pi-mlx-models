@@ -15,6 +15,7 @@ interface LoadedConfig {
   VENV_PYTHON: string;
   HF_HOME: string;
   CONFIG_WARNINGS: string[];
+  DEFAULT_MODEL: string;
 }
 
 // Load the compiled config.js in a child Node process with a fully controlled
@@ -191,4 +192,13 @@ test("an IPv6 launch host is bracketed in the derived BASE_URL", () => {
   const cfg = loadConfig({ PI_MLX_MODELS_HOST: "::1" });
   assert.equal(cfg.BASE_URL, "http://[::1]:8080/v1");
   assert.deepEqual(cfg.CONFIG_WARNINGS, []);
+});
+
+// WR-04: an empty or blank default model is treated as unset, like the port.
+test("an empty or blank PI_MLX_MODELS_DEFAULT_MODEL falls back to the built-in default", () => {
+  const builtIn = loadConfig().DEFAULT_MODEL;
+  assert.ok(builtIn.length > 0);
+  assert.equal(loadConfig({ PI_MLX_MODELS_DEFAULT_MODEL: "" }).DEFAULT_MODEL, builtIn);
+  assert.equal(loadConfig({ PI_MLX_MODELS_DEFAULT_MODEL: "   " }).DEFAULT_MODEL, builtIn);
+  assert.equal(loadConfig({ PI_MLX_MODELS_DEFAULT_MODEL: " org/model " }).DEFAULT_MODEL, "org/model");
 });

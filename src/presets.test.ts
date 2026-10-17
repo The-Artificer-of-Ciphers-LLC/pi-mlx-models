@@ -57,3 +57,22 @@ test("a preset key or full id that is valid is never reported as an error", () =
     assert.equal(errorOf(resolveModel(preset.modelId, DEFAULT)), undefined);
   }
 });
+
+// WR-04: the default model is user-supplied (PI_MLX_MODELS_DEFAULT_MODEL) and gets the same checks as typed input.
+test("a default model that starts with a dash is an error so it cannot be read as a server flag", () => {
+  for (const input of [undefined, "", "  "]) {
+    const result = resolveModel(input, "--foo");
+    assert.match(errorOf(result) ?? "", /must not start with "-"/);
+    assert.equal(result.modelId, undefined);
+  }
+});
+
+test("an empty default model is an error rather than an empty --model argument", () => {
+  const result = resolveModel("", "");
+  assert.ok(errorOf(result), "an empty default has no model to start");
+  assert.equal(result.modelId, undefined);
+});
+
+test("an explicit model id still wins over an unusable default", () => {
+  assert.equal(resolveModel("org/model", "--foo").modelId, "org/model");
+});
