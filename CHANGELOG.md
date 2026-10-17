@@ -4,6 +4,8 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 ## Unreleased
 
+## 0.2.3 - 2026-10-17
+
 ### Changed
 
 - The extension now names pi's current package, `@earendil-works/pi-coding-agent`, as its peer dependency and in its imports. It named `@mariozechner/pi-coding-agent`, which npm has deprecated in favour of the new name and which has had no release since May 2026.

@@ -1,6 +1,6 @@
 {
   "name": "@taoc/pi-mlx-models",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Local MLX model launcher extension for Pi",
   "type": "module",
   "engines": {
