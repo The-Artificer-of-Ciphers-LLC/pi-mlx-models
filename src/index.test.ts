@@ -1808,7 +1808,7 @@ test("a trustRemoteCode key inside a models entry is reported as an unknown key 
   await startMlx(h, "qwen3_4b");
 
   assert.deepEqual(errors(h.notes), [
-    'mlx-start failed: invalid configuration\n  models["qwen3_4b"].trustRemoteCode (global config.json): unknown key (did you mean server.trustRemoteCode?)',
+    'mlx-start failed: invalid configuration\n  models["qwen3_4b"].trustRemoteCode (global config.json): unknown key (trustRemoteCode is a "server" key, not part of a "models" entry)',
   ]);
   assert.equal(h.confirms.length, 0);
   assertNothingHappened(h);
