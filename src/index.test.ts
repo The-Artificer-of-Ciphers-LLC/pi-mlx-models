@@ -1267,6 +1267,43 @@ for (const [name, project, lines] of REFUSED_PROJECTS) {
   });
 }
 
+// GAP-01 (manual UAT): a top-level key written inside server was reported with a did-you-mean that repeated
+// the name the user typed. Expected strings are written out here, not built from settings.ts.
+const MISPLACED_PROJECTS: ReadonlyArray<[string, unknown, string[]]> = [
+  [
+    "baseUrl inside server (the UAT file)",
+    { server: { baseUrl: "http://example.com:8080/v1" } },
+    ['server.baseUrl (project .pi/pi-mlx-models.json): unknown key (baseUrl is a top-level key, not part of "server")'],
+  ],
+  [
+    "defaultModel inside server",
+    { server: { defaultModel: "org/m" } },
+    ['server.defaultModel (project .pi/pi-mlx-models.json): unknown key (defaultModel is a top-level key, not part of "server")'],
+  ],
+  [
+    "baseUrl and defaultModel both inside server",
+    { server: { baseUrl: "http://example.com:8080/v1", defaultModel: "org/m" } },
+    [
+      'server.baseUrl (project .pi/pi-mlx-models.json): unknown key (baseUrl is a top-level key, not part of "server")',
+      'server.defaultModel (project .pi/pi-mlx-models.json): unknown key (defaultModel is a top-level key, not part of "server")',
+    ],
+  ],
+];
+
+for (const [name, project, lines] of MISPLACED_PROJECTS) {
+  test(`a project file with ${name} is refused as one error that says where the key lives, and nothing runs`, async () => {
+    const cwd = newCwd();
+    writeProject(cwd, project);
+    const h = await setup({ ctx: { cwd } });
+
+    await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+    assert.deepEqual(errors(h.notes), [["mlx-start failed: invalid configuration", ...lines.map((line) => `  ${line}`)].join("\n")]);
+    assert.equal(h.confirms.length, 0, "no dialog is asked for an invalid file");
+    assertNothingHappened(h);
+  });
+}
+
 test("a project file asking for something risky is refused even for a start that names a model, a picker choice or flags", async () => {
   const cwd = newCwd();
   writeProject(cwd, { server: { trustRemoteCode: true } });
