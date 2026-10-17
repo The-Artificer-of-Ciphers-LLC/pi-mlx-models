@@ -527,3 +527,78 @@ test("every request carries its own AbortSignal, distinct for health and warm-up
   assert.equal(health.aborted, false);
   assert.equal(warmup.aborted, false);
 });
+
+// CR-01: a start that fails after spawning must not leave its own child behind.
+for (const status of [400, 500]) {
+  test(`a warm-up answered with HTTP ${status} stops the child it spawned and leaves the server not running`, async () => {
+    const { host, procs } = scriptedWarmup([new Response("{}", { status })]);
+    const server = createMlxServer({ ...opts, host });
+    const events: string[] = [];
+
+    await assert.rejects(server.start("m", (e) => events.push(e.type)), /Warm-up request failed/);
+
+    assert.equal(procs.length, 1);
+    assert.equal(procs[0].killed, "SIGTERM", "the failed start must terminate its own child");
+    assert.equal(server.running, false);
+    assert.ok(!events.includes("ready"));
+  });
+}
+
+test("a health timeout stops the child it spawned and leaves the server not running", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  const { host, procs } = makeHost({
+    fetch: async () => {
+      throw new Error("refused");
+    },
+    // Each poll wait advances the mocked clock, so the health window elapses without real waiting.
+    sleep: async () => t.mock.timers.tick(60_000),
+  });
+  const server = createMlxServer({ ...opts, host });
+
+  await assert.rejects(server.start("m"), /did not become healthy in time/);
+
+  assert.equal(procs[0].killed, "SIGTERM");
+  assert.equal(server.running, false);
+});
+
+test("a warm-up timeout stops the child it spawned and leaves the server not running", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  const { host, procs } = makeHost({
+    fetch: async (url) => {
+      if (String(url).endsWith("/models")) return new Response("{}", { status: 200 });
+      throw new Error("still loading");
+    },
+    sleep: async () => t.mock.timers.tick(60_000),
+  });
+  const server = createMlxServer({ ...opts, host });
+
+  await assert.rejects(server.start("m"), /did not become inference-ready in time/);
+
+  assert.equal(procs[0].killed, "SIGTERM");
+  assert.equal(server.running, false);
+});
+
+test("a start cancelled by a newer start does not stop the newer start's child", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const { host, procs } = makeHost({
+    fetch: async (url) => {
+      if (String(url).endsWith("/models") && procs.length === 1) await gate;
+      return new Response("{}", { status: 200 });
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+
+  const first = server.start("a");
+  await tick();
+  const second = server.start("b");
+  await tick();
+  release();
+
+  await assert.rejects(first);
+  await second;
+
+  assert.equal(procs.length, 2);
+  assert.equal(procs[1].killed, undefined, "the newer start's child must stay alive");
+  assert.equal(server.running, true);
+});
