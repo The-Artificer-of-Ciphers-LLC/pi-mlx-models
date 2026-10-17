@@ -87,10 +87,21 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   let configWarningsShown = false;
 
   /**
-   * Bumped by every /mlx-start, /mlx-init, /mlx-stop and session_shutdown. A flow compares its own value
-   * after each await: if it moved, the flow was stopped or superseded and must not touch the server or UI.
+   * Bumped by every /mlx-start, /mlx-stop and session_shutdown. A start compares its own value after each
+   * await (and on every server event): if it moved, the start was stopped or superseded and must not touch
+   * the server or UI. /mlx-init never bumps it, so an init cannot abandon a start or mute a later crash.
    */
-  let epoch = 0;
+  let startEpoch = 0;
+  /** Bumped by everything that bumps `startEpoch` and by /mlx-init: a newer flow owns the progress widget. */
+  let initEpoch = 0;
+  /** The `startEpoch` of the start that is still running and has not been stopped, or null when none is. */
+  let startInFlight: number | null = null;
+
+  const cancelStarts = () => {
+    startEpoch += 1;
+    initEpoch += 1;
+    startInFlight = null;
+  };
 
   /** The one runtime install that may touch the venv at a time. */
   let installing: { promise: Promise<void>; upgrade: boolean; listeners: Set<(event: RuntimeEvent) => void> } | null = null;
@@ -141,7 +152,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   }
 
   async function stopServer(ctx: any) {
-    epoch += 1; // cancels an in-flight start or init, including one still waiting on the installer
+    cancelStarts(); // cancels an in-flight start or init, including one still waiting on the installer
     activeProgress?.clear();
     activeProgress = null;
     await server.stop();
@@ -155,9 +166,18 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       ctx.ui.notify(`mlx-start failed: ${selected.error}`, "error");
       return;
     }
-    const model = selected.modelId;
-    const mine = (epoch += 1);
-    const isStale = () => epoch !== mine;
+    const mine = (startEpoch += 1);
+    initEpoch += 1;
+    startInFlight = mine;
+    try {
+      await runStart(pi, ctx, selected.modelId, selected.preset?.key, mine);
+    } finally {
+      if (startInFlight === mine) startInFlight = null;
+    }
+  }
+
+  async function runStart(pi: PiHost, ctx: any, model: string, presetKey: string | undefined, mine: number) {
+    const isStale = () => startEpoch !== mine;
     currentModel = model;
     await registerProvider(pi, { includeFallback: false });
     if (isStale()) return;
@@ -190,7 +210,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       progress.done(0, "Runtime ready");
 
       ctx.ui.notify(
-        `Starting MLX server with ${model}${selected.preset ? ` (preset: ${selected.preset.key})` : ""}...`,
+        `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...`,
         "info",
       );
       progress.status(`Start MLX server process (${model})`);
@@ -263,8 +283,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     pi.registerCommand("mlx-init", {
       description: "Initialize local MLX runtime (python venv + mlx-lm)",
       handler: async (_args, ctx) => {
-        const mine = (epoch += 1);
-        const isStale = () => epoch !== mine;
+        // A start in flight owns the venv and the progress widget; replacing it would abandon the start.
+        if (startInFlight !== null) {
+          ctx.ui.notify("mlx-init failed: MLX server is starting; run /mlx-stop first", "error");
+          return;
+        }
+        const mine = (initEpoch += 1);
+        const isStale = () => initEpoch !== mine;
         const progress = newProgress(ctx, "MLX init progress", [
           "Find compatible Python",
           "Create virtual environment",
@@ -328,7 +353,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     });
 
     pi.on("session_shutdown", async () => {
-      epoch += 1; // a start still waiting on the installer must not launch a server after shutdown
+      cancelStarts(); // a start still waiting on the installer must not launch a server after shutdown
       activeProgress?.stop();
       // Wait for the child to exit so a quitting pi does not leave it holding the port, but never
       // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.
