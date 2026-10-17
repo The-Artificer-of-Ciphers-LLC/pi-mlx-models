@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
@@ -100,6 +100,8 @@ async function setup(
     discovered?: string[];
     select?: (options: string[]) => string | undefined;
     env?: Record<string, string | undefined>;
+    /** Settings sources to use instead of a fresh empty one, e.g. to write the global file from the test. */
+    settings?: ReturnType<typeof freshSettings>;
     sleep?: (ms: number) => Promise<void>;
   } = {},
 ) {
@@ -114,7 +116,7 @@ async function setup(
       await options.ensureInstalled?.(opts);
     }) as any,
     discoverModelIds: async () => options.discovered ?? [],
-    settings: freshSettings(options.env ?? {}),
+    settings: options.settings ?? freshSettings(options.env ?? {}),
     ...(options.sleep ? { sleep: options.sleep } : {}),
   });
   await extension(fakePi.pi);
@@ -608,4 +610,101 @@ test("a discovered model id with control characters is cleaned in the display na
   assert.equal(model.id, hostile, "the id is what the server expects and stays as discovered");
   assert.doesNotMatch(model.name, /[\u0000-\u001f\u007f-\u009f]/);
   assert.match(model.name, /^org\/model/);
+});
+
+// ---- a refused start has no side effects, and the corrected file is read on the next start (D-05, D-06) ----
+
+const warnings = (notes: Note[]) => notes.filter((n) => n.type === "warning").map((n) => n.message);
+
+test("a global file with several problems is refused with one report and nothing else happens", async () => {
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, '{"server":{"port":99999,"logLevel":"debug","hots":"x"}}');
+  const { server, installCalls, commands, providerCalls, ctx, notes, statuses, widgets } = await setup({ settings });
+  const providersBefore = providerCalls.length;
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(notes, [
+    {
+      type: "error",
+      message: [
+        "mlx-start failed: invalid configuration",
+        "  server.port (global config.json): 99999 is not an integer from 1 to 65535 (flag --port)",
+        '  server.logLevel (global config.json): "debug" must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL (flag --log-level)',
+        "  server.hots (global config.json): unknown key (did you mean server.host?)",
+      ].join("\n"),
+    },
+  ]);
+  assert.equal(installCalls.length, 0, "the runtime installer was not called");
+  assert.deepEqual(server.startCalls, [], "no server was started");
+  assert.equal(providerCalls.length, providersBefore, "no provider was registered");
+  assert.deepEqual(widgets, [], "no progress widget was shown");
+  assert.deepEqual(statuses, [], "no status was set");
+});
+
+test("a global file that is not valid JSON is refused with one error naming the file", async () => {
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, "{ nope");
+  const { server, installCalls, commands, ctx, notes } = await setup({ settings });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  const found = errors(notes);
+  assert.equal(found.length, 1);
+  assert.ok(
+    found[0].startsWith("mlx-start failed: invalid configuration\n  global config.json: is not valid JSON ("),
+    found[0],
+  );
+  assert.equal(notes.length, 1, "nothing but the error was shown");
+  assert.equal(installCalls.length, 0);
+  assert.deepEqual(server.startCalls, []);
+});
+
+test("nothing about a refused start is remembered: the corrected file is used by the next start", async () => {
+  const preset = MODEL_PRESETS.find((p) => p.key === "qwen3_4b")!;
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, '{"server":{"port":"9000"}}');
+  const { server, commands, ctx, notes, statuses } = await setup({ settings });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+  assert.equal(errors(notes).length, 1);
+  assert.deepEqual(server.startCalls, []);
+
+  writeFileSync(settings.globalConfigPath, '{"server":{"logLevel":"INFO"}}');
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.equal(errors(notes).length, 1, "no further error");
+  assert.deepEqual(server.startCalls, [preset.modelId]);
+  assert.equal(lastStatus(statuses), `mlx: running (${preset.modelId})`);
+});
+
+test("a missing global file is no error and nothing is created at its path", async () => {
+  const settings = freshSettings({});
+  const { server, commands, ctx, notes } = await setup({ settings });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(errors(notes), []);
+  assert.equal(server.startCalls.length, 1);
+  assert.equal(existsSync(settings.globalConfigPath), false);
+});
+
+test("an environment warning comes before the config error, and a second refused start does not repeat it", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_PORT: "abc" });
+  writeFileSync(settings.globalConfigPath, '{"server":{"port":0}}');
+  const { commands, ctx, notes } = await setup({ settings });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(
+    notes.map((n) => n.type),
+    ["warning", "error"],
+  );
+  assert.match(notes[0].message, /PI_MLX_MODELS_PORT/);
+  assert.ok(notes[1].message.startsWith("mlx-start failed: invalid configuration\n  server.port (global config.json): 0 is not an integer"));
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.equal(warnings(notes).length, 1, "the warning is shown once");
+  assert.equal(errors(notes).length, 2, "the refusal is shown on every refused start");
 });
