@@ -13,3 +13,4 @@ dist/
 CLAUDE.md
 AGENTS.md
 .pi/
+.codegraph/
