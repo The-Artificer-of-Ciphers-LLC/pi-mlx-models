@@ -4,18 +4,15 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_PORT, baseUrlWarning, parsePort, resolveAgentDir } from "./config.js";
+import { DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, parsePort, resolveAgentDir } from "./config.js";
 
 interface LoadedConfig {
-  PORT: number;
-  HOST: string;
-  BASE_URL: string;
   DATA_DIR: string;
   VENV_DIR: string;
   VENV_PYTHON: string;
   HF_HOME: string;
-  CONFIG_WARNINGS: string[];
-  DEFAULT_MODEL: string;
+  GLOBAL_CONFIG_PATH: string;
+  [name: string]: unknown;
 }
 
 // Load the compiled config.js in a child Node process with a fully controlled
@@ -30,28 +27,28 @@ function loadConfig(overrides: Record<string, string> = {}): LoadedConfig {
   return JSON.parse(result.stdout) as LoadedConfig;
 }
 
-test("default port is 8080 and BASE_URL follows it when no env is set", () => {
-  const cfg = loadConfig();
+test("the default port is 8080", () => {
   assert.equal(DEFAULT_PORT, 8080);
-  assert.equal(cfg.PORT, 8080);
-  assert.equal(cfg.HOST, "127.0.0.1");
-  assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1");
-  assert.deepEqual(cfg.CONFIG_WARNINGS, []);
 });
 
-test("PI_MLX_MODELS_PORT overrides the default port and BASE_URL", () => {
-  const cfg = loadConfig({ PI_MLX_MODELS_PORT: "9123" });
-  assert.equal(cfg.PORT, 9123);
-  assert.equal(cfg.BASE_URL, "http://127.0.0.1:9123/v1");
-  assert.deepEqual(cfg.CONFIG_WARNINGS, []);
+test("deriveBaseUrl ends in /v1 and brackets a bare IPv6 host", () => {
+  assert.equal(deriveBaseUrl("127.0.0.1", 8080), "http://127.0.0.1:8080/v1");
+  assert.equal(deriveBaseUrl("::1", 9123), "http://[::1]:9123/v1");
+  assert.equal(deriveBaseUrl("[::1]", 9123), "http://[::1]:9123/v1");
 });
 
-test("an invalid PI_MLX_MODELS_PORT falls back to 8080 with exactly one warning", () => {
-  const cfg = loadConfig({ PI_MLX_MODELS_PORT: "abc" });
-  assert.equal(cfg.PORT, 8080);
-  assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1");
-  assert.equal(cfg.CONFIG_WARNINGS.length, 1);
-  assert.match(cfg.CONFIG_WARNINGS[0], /PI_MLX_MODELS_PORT/);
+// D-05: nothing user-editable is read when the module loads, so the settings that used to be
+// import-time constants are not exported at all, whatever the environment says.
+test("the module exports no import-time port, host, base URL, default model or warning list", () => {
+  const cfg = loadConfig({
+    PI_MLX_MODELS_PORT: "9123",
+    PI_MLX_MODELS_HOST: "::1",
+    PI_MLX_MODELS_BASE_URL: "http://127.0.0.1:9999/v1",
+    PI_MLX_MODELS_DEFAULT_MODEL: "org/model",
+  });
+  for (const name of ["PORT", "HOST", "BASE_URL", "DEFAULT_MODEL", "CONFIG_WARNINGS"]) {
+    assert.ok(!(name in cfg), `${name} must not be exported`);
+  }
 });
 
 test("parsePort accepts undefined, plain and padded integers without a warning", () => {
@@ -177,58 +174,9 @@ test("baseUrlWarning reads an omitted port as 80 for http and 443 for https", ()
   assert.ok(baseUrlWarning({ baseUrl: "http://127.0.0.1/v1", host: "127.0.0.1", port: 8080 }));
 });
 
-test("a mismatching PI_MLX_MODELS_BASE_URL yields exactly one config warning", () => {
-  const cfg = loadConfig({ PI_MLX_MODELS_BASE_URL: "http://127.0.0.1:9999/v1" });
-  assert.equal(cfg.BASE_URL, "http://127.0.0.1:9999/v1");
-  assert.equal(cfg.CONFIG_WARNINGS.length, 1);
-});
-
-test("a loopback-alias PI_MLX_MODELS_BASE_URL yields no config warning", () => {
-  const cfg = loadConfig({ PI_MLX_MODELS_BASE_URL: "http://localhost:8080/v1" });
-  assert.deepEqual(cfg.CONFIG_WARNINGS, []);
-});
-
-test("an IPv6 launch host is bracketed in the derived BASE_URL", () => {
-  const cfg = loadConfig({ PI_MLX_MODELS_HOST: "::1" });
-  assert.equal(cfg.BASE_URL, "http://[::1]:8080/v1");
-  assert.deepEqual(cfg.CONFIG_WARNINGS, []);
-});
-
-// WR-04: an empty or blank default model is treated as unset, like the port.
-test("an empty or blank PI_MLX_MODELS_DEFAULT_MODEL falls back to the built-in default", () => {
-  const builtIn = loadConfig().DEFAULT_MODEL;
-  assert.ok(builtIn.length > 0);
-  assert.equal(loadConfig({ PI_MLX_MODELS_DEFAULT_MODEL: "" }).DEFAULT_MODEL, builtIn);
-  assert.equal(loadConfig({ PI_MLX_MODELS_DEFAULT_MODEL: "   " }).DEFAULT_MODEL, builtIn);
-  assert.equal(loadConfig({ PI_MLX_MODELS_DEFAULT_MODEL: " org/model " }).DEFAULT_MODEL, "org/model");
-});
-
-// WR-05: empty HOST / BASE_URL are unset, and a trailing slash in BASE_URL must not produce "//models".
-test("an empty or blank PI_MLX_MODELS_HOST is treated as unset", () => {
-  for (const value of ["", "   "]) {
-    const cfg = loadConfig({ PI_MLX_MODELS_HOST: value });
-    assert.equal(cfg.HOST, "127.0.0.1", JSON.stringify(value));
-    assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1");
-    assert.deepEqual(cfg.CONFIG_WARNINGS, []);
-  }
-});
-
-test("an empty or blank PI_MLX_MODELS_BASE_URL is treated as unset, without a warning", () => {
-  for (const value of ["", "   "]) {
-    const cfg = loadConfig({ PI_MLX_MODELS_BASE_URL: value });
-    assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1", JSON.stringify(value));
-    assert.deepEqual(cfg.CONFIG_WARNINGS, []);
-  }
-});
-
-test("trailing slashes are stripped from PI_MLX_MODELS_BASE_URL and the address still matches the launch address", () => {
-  const cfg = loadConfig({ PI_MLX_MODELS_BASE_URL: "http://127.0.0.1:8080/v1//" });
-  assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1");
-  assert.deepEqual(cfg.CONFIG_WARNINGS, []);
-});
-
-test("surrounding whitespace is trimmed from PI_MLX_MODELS_HOST and PI_MLX_MODELS_BASE_URL", () => {
-  const cfg = loadConfig({ PI_MLX_MODELS_HOST: " 127.0.0.1 ", PI_MLX_MODELS_BASE_URL: " http://127.0.0.1:8080/v1 " });
-  assert.equal(cfg.HOST, "127.0.0.1");
-  assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1");
+test("GLOBAL_CONFIG_PATH is config.json inside DATA_DIR", (t) => {
+  const agent = mkdtempSync(join(tmpdir(), "pi-mlx-agent-"));
+  t.after(() => rmSync(agent, { recursive: true, force: true }));
+  const cfg = loadConfig({ PI_CODING_AGENT_DIR: agent });
+  assert.equal(cfg.GLOBAL_CONFIG_PATH, join(agent, "pi-mlx-models", "config.json"));
 });
