@@ -404,3 +404,126 @@ test("diagnostic text has control characters removed", async () => {
     return true;
   });
 });
+
+/** A host whose /models answers 200 and whose completion endpoint is scripted per call (exhausted script = 200). */
+function scriptedWarmup(script: Array<Response | Error>) {
+  const requests: string[] = [];
+  const { host, procs } = makeHost({
+    fetch: async (url) => {
+      const target = String(url);
+      requests.push(target);
+      if (target.endsWith("/models")) return new Response("{}", { status: 200 });
+      const next = script.shift() ?? new Response("{}", { status: 200 });
+      if (next instanceof Error) throw next;
+      return next;
+    },
+  });
+  return { host, procs, completionCalls: () => requests.filter((r) => r.endsWith("/chat/completions")).length };
+}
+
+for (const status of [400, 404, 500]) {
+  test(`a warm-up answered with HTTP ${status} fails the start at once, showing the server's message`, async () => {
+    const { host, completionCalls } = scriptedWarmup([new Response('{"error":"bad model"}', { status })]);
+    const server = createMlxServer({ ...opts, host });
+    const events: string[] = [];
+
+    await assert.rejects(server.start("m", (e) => events.push(e.type)), (err: Error) => {
+      assert.match(err.message, new RegExp(`Warm-up request failed \\(HTTP ${status}\\): .*bad model`));
+      return true;
+    });
+
+    assert.equal(completionCalls(), 1, "a 4xx/5xx warm-up must not be retried");
+    assert.ok(!events.includes("ready"));
+  });
+}
+
+test("a warm-up error body is clipped to 400 characters from the start", async () => {
+  const { host } = scriptedWarmup([new Response(`${"x".repeat(2000)}TAIL`, { status: 400 })]);
+  const server = createMlxServer({ ...opts, host });
+
+  await assert.rejects(server.start("m"), (err: Error) => {
+    const body = /^Warm-up request failed \(HTTP 400\): ([\s\S]*)$/.exec(err.message)?.[1];
+    assert.ok(body, `message should carry a body: ${err.message}`);
+    assert.equal(body.length, 400);
+    assert.ok(!body.includes("TAIL"));
+    return true;
+  });
+});
+
+test("a warm-up error body has control characters removed", async () => {
+  const { host } = scriptedWarmup([new Response("\u001b[31mbad\u001b[0m\u0007 model\u007f", { status: 400 })]);
+  const server = createMlxServer({ ...opts, host });
+
+  await assert.rejects(server.start("m"), (err: Error) => {
+    assert.doesNotMatch(err.message, /[\u0000-\u0008\u000b-\u001f\u007f]/);
+    assert.match(err.message, /bad/);
+    return true;
+  });
+});
+
+test("an empty or unreadable warm-up error body leaves the status without a colon part", async () => {
+  const broken = new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(new Error("socket hang up"));
+      },
+    }),
+    { status: 502 },
+  );
+  for (const response of [new Response("", { status: 500 }), broken]) {
+    const { host } = scriptedWarmup([response]);
+    const server = createMlxServer({ ...opts, host });
+    await assert.rejects(server.start("m"), /Warm-up request failed \(HTTP \d{3}\)$/);
+  }
+});
+
+test("a warm-up that fails on the network twice is retried and then reaches ready", async () => {
+  const { host, completionCalls } = scriptedWarmup([new Error("refused"), new Error("timed out")]);
+  const server = createMlxServer({ ...opts, host });
+  const events: string[] = [];
+
+  await server.start("m", (e) => events.push(e.type));
+
+  assert.equal(completionCalls(), 3);
+  assert.ok(events.includes("ready"));
+});
+
+test("a non-ok /v1/models response is retried, not fatal", async () => {
+  let modelCalls = 0;
+  const { host } = makeHost({
+    fetch: async (url) => {
+      if (String(url).endsWith("/models")) {
+        modelCalls += 1;
+        return new Response("loading", { status: modelCalls < 3 ? 503 : 200 });
+      }
+      return new Response("{}", { status: 200 });
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+
+  await server.start("m");
+
+  assert.equal(modelCalls, 3);
+  assert.equal(server.running, true);
+});
+
+test("every request carries its own AbortSignal, distinct for health and warm-up", async () => {
+  const signals: Array<{ kind: "health" | "warmup"; signal: AbortSignal | null | undefined }> = [];
+  const { host } = makeHost({
+    fetch: async (url, init) => {
+      signals.push({ kind: String(url).endsWith("/models") ? "health" : "warmup", signal: init?.signal });
+      return new Response("{}", { status: 200 });
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+
+  await server.start("m");
+
+  const health = signals.find((s) => s.kind === "health")?.signal;
+  const warmup = signals.find((s) => s.kind === "warmup")?.signal;
+  assert.ok(health instanceof AbortSignal, "the health request needs an AbortSignal");
+  assert.ok(warmup instanceof AbortSignal, "the warm-up request needs an AbortSignal");
+  assert.notEqual(health, warmup, "health and warm-up use separate signals");
+  assert.equal(health.aborted, false);
+  assert.equal(warmup.aborted, false);
+});

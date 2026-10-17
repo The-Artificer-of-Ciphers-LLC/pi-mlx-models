@@ -226,3 +226,94 @@ test("an early exit reports the stderr tail and the stdout tail", { timeout: 30_
   });
   assert.equal(server.running, false);
 });
+
+test("a warm-up answered with HTTP 400 fails within seconds showing the server's message", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const { host, children } = stubHost({ STUB_MODE: "warmup-400" });
+  t.after(() => killAll(children));
+
+  const server = createMlxServer({
+    host,
+    address: { host: "127.0.0.1", port },
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    healthPollMs: 25,
+    warmupPollMs: 25,
+    killWaitMs: 1000,
+  });
+
+  const startedAt = Date.now();
+  await assert.rejects(server.start("stub/model"), (err: Error) => {
+    assert.match(err.message, /HTTP 400/);
+    assert.match(err.message, /stub: unsupported request/);
+    return true;
+  });
+  assert.ok(Date.now() - startedAt < 5000, "a 4xx warm-up must fail fast instead of polling");
+});
+
+test("a long warm-up error body from the server is truncated to 400 characters", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const { host, children } = stubHost({ STUB_MODE: "warmup-400", STUB_ERROR_PAD: "2000" });
+  t.after(() => killAll(children));
+
+  const server = createMlxServer({
+    host,
+    address: { host: "127.0.0.1", port },
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    healthPollMs: 25,
+    warmupPollMs: 25,
+    killWaitMs: 1000,
+  });
+
+  await assert.rejects(server.start("stub/model"), (err: Error) => {
+    const body = /^Warm-up request failed \(HTTP 400\): ([\s\S]*)$/.exec(err.message)?.[1];
+    assert.ok(body, `message should carry a body: ${err.message}`);
+    assert.ok(body.length <= 400, `body portion is ${body.length} characters`);
+    return true;
+  });
+});
+
+// The health request timeout is the owner-confirmed 10 second value, so this waits it out once.
+// A listener that accepts connections and never answers must see its request aborted by the
+// per-request signal, and the poll loop must keep going afterwards (an abort is not fatal).
+test("a listener that never answers is cut off by the per-request health timeout", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const { host: stubbed, children } = stubHost({ STUB_MODE: "hang" });
+  t.after(() => killAll(children));
+
+  let firstAbort!: (outcome: { ms: number; name: string }) => void;
+  const aborted = new Promise<{ ms: number; name: string }>((resolve) => (firstAbort = resolve));
+  let requests = 0;
+  const host: ServerHost = {
+    ...stubbed,
+    fetch: async (input, init) => {
+      requests += 1;
+      const startedAt = Date.now();
+      try {
+        return await stubbed.fetch(input, init);
+      } catch (err) {
+        // Refused connections while the stub boots are expected; only the abort is the outcome.
+        if (err instanceof Error && err.name === "TimeoutError") firstAbort({ ms: Date.now() - startedAt, name: err.name });
+        throw err;
+      }
+    },
+  };
+
+  const server = createMlxServer({
+    host,
+    address: { host: "127.0.0.1", port },
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    healthRequestTimeoutMs: 10000,
+    healthPollMs: 25,
+    warmupPollMs: 25,
+    killWaitMs: 1000,
+  });
+
+  const started = server.start("stub/model");
+  const outcome = await aborted;
+  assert.equal(outcome.name, "TimeoutError");
+  assert.ok(outcome.ms >= 9000 && outcome.ms < 15000, `the request should be aborted by its own signal after about 10 s, took ${outcome.ms} ms`);
+
+  await server.stop();
+  await assert.rejects(started, /cancelled/);
+  assert.ok(requests >= 1);
+});
