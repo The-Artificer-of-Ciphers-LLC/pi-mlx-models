@@ -7,6 +7,7 @@ import { DEFAULT_MODEL_ID } from "./config.js";
 import {
   buildLaunch,
   describeFlags,
+  formatConfigErrors,
   prepareSettings,
   readLayerFile,
   toLaunchSpec,
@@ -604,4 +605,232 @@ test("an unreadable parent directory is unusable, not absent", { skip: cannotRea
   } finally {
     chmodSync(sub, 0o700); // so the temporary directory can be removed
   }
+});
+
+// ---- the report: every problem in every layer, one line each (D-24, D-07, CFG-03) ----
+
+const PROJECT = "project .pi/pi-mlx-models.json";
+const GLOBAL = "global config.json";
+
+/** The errors of a resolution that must have been refused. */
+function refused(input: Partial<PrepareInput>): string[] {
+  const result = resolve(input);
+  assert.equal(result.ok, false, "expected the configuration to be refused");
+  assert.ok(!result.ok);
+  return result.errors;
+}
+
+test("the approved example: two layers, a range error, a typo and an enum error in one report", () => {
+  const errors = refused({
+    project: ok({ server: { port: 99999, hots: "x" } }),
+    global: ok({ server: { logLevel: "debug" } }),
+  });
+  assert.equal(
+    formatConfigErrors(errors),
+    [
+      "invalid configuration",
+      `  server.port (${PROJECT}): 99999 is not an integer from 1 to 65535 (flag --port)`,
+      `  server.hots (${PROJECT}): unknown key (did you mean server.host?)`,
+      `  server.logLevel (${GLOBAL}): "debug" must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL (flag --log-level)`,
+    ].join("\n"),
+  );
+});
+
+test("problems from two layers and an unusable file are all reported, highest precedence first", () => {
+  const errors = refused({
+    global: ok({ server: { port: "x" } }),
+    project: { state: "unusable", reason: "is empty" },
+  });
+  assert.deepEqual(errors, [
+    `${PROJECT}: is empty`,
+    `server.port (${GLOBAL}): "x" is not an integer from 1 to 65535 (flag --port)`,
+  ]);
+});
+
+test("a clean layer adds nothing to the report", () => {
+  const errors = refused({ global: ok({ server: { port: 9000 } }), project: ok({ baseUrl: "ftp://x" }) });
+  assert.deepEqual(errors, [`baseUrl (${PROJECT}): "ftp://x" must be an http or https URL`]);
+});
+
+test("within a file the lines follow the order of the keys as written", () => {
+  const errors = refused({ global: ok({ server: { logLevel: "x", port: 0, host: 5 } }) });
+  assert.deepEqual(
+    errors.map((line) => line.split(" ")[0]),
+    ["server.logLevel", "server.port", "server.host"],
+  );
+});
+
+test("an environment problem is a warning, not part of the refusal report", () => {
+  const result = resolve({ global: ok({ server: { port: "x" } }), env: { PI_MLX_MODELS_PORT: "abc" } });
+  assert.ok(!result.ok);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.warnings.length, 1);
+});
+
+const PROBLEM_PHRASES: ReadonlyArray<[string, Record<string, unknown>, string]> = [
+  ["server.host", { server: { host: 5 } }, "5 is not a valid host name or address (flag --host)"],
+  ["server.port", { server: { port: "8080" } }, '"8080" is not an integer from 1 to 65535 (flag --port)'],
+  ["server.port", { server: { port: 1.5 } }, "1.5 is not an integer from 1 to 65535 (flag --port)"],
+  ["server.logLevel", { server: { logLevel: "debug" } }, '"debug" must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL (flag --log-level)'],
+  ["baseUrl", { baseUrl: "ftp://x" }, '"ftp://x" must be an http or https URL'],
+  ["defaultModel", { defaultModel: "" }, '"" must be a non-empty string'],
+  ["defaultModel", { defaultModel: null }, "null must be a non-empty string"],
+];
+
+for (const [path, data, phrase] of PROBLEM_PHRASES) {
+  test(`${path} with ${JSON.stringify(data)} reports: ${phrase}`, () => {
+    assert.deepEqual(refused({ global: ok(data) }), [`${path} (${GLOBAL}): ${phrase}`]);
+  });
+}
+
+for (const [name, block] of [
+  ["a number", 5],
+  ["an empty array", []],
+  ["null", null],
+  ["a string", "x"],
+] as const) {
+  test(`a server block that is ${name} is one line and is not descended into`, () => {
+    assert.deepEqual(refused({ global: ok({ server: block }) }), [`server (${GLOBAL}): ${JSON.stringify(block)} must be a JSON object`]);
+  });
+}
+
+test("fully valid layers, an empty object and an empty server block are accepted", () => {
+  for (const data of [{}, { server: {} }, { server: { host: "localhost", port: 9000, logLevel: "INFO" }, baseUrl: "http://localhost:9000/v1", defaultModel: "org/m" }]) {
+    assert.ok(resolve({ global: ok(data) }).ok, JSON.stringify(data));
+    assert.ok(resolve({ project: ok(data) }).ok, JSON.stringify(data));
+  }
+});
+
+// ---- unknown keys and did-you-mean (D-24) ----
+
+/** The single unknown-key line for a file holding exactly `data`. */
+function unknownLine(data: Record<string, unknown>): string {
+  const errors = refused({ global: ok(data) });
+  assert.equal(errors.length, 1, JSON.stringify(errors));
+  return errors[0];
+}
+
+const SUGGESTIONS: ReadonlyArray<[string, Record<string, unknown>, string, string | undefined]> = [
+  // [label, file, key as shown, suggested path]
+  ["a one-edit typo", { server: { hots: "x" } }, "server.hots", "server.host"],
+  ["a missing letter", { server: { loglevl: "INFO" } }, "server.loglevl", "server.logLevel"],
+  ["kebab-case", { server: { "log-level": "INFO" } }, "server.log-level", "server.logLevel"],
+  ["snake_case", { server: { log_level: "INFO" } }, "server.log_level", "server.logLevel"],
+  ["different case", { server: { LogLevel: "INFO" } }, "server.LogLevel", "server.logLevel"],
+  ["all lowercase", { server: { loglevel: "INFO" } }, "server.loglevel", "server.logLevel"],
+  ["a tie goes to the earlier row", { server: { hort: 1 } }, "server.hort", "server.host"],
+  ["a top-level key that belongs in server: host", { host: "localhost" }, "host", "server.host"],
+  ["a top-level key that belongs in server: port", { port: 9000 }, "port", "server.port"],
+  ["a top-level key that belongs in server: logLevel", { logLevel: "INFO" }, "logLevel", "server.logLevel"],
+  ["a typo of a block name", { sever: {} }, "sever", "server"],
+  ["a top-level key in another case", { baseurl: "http://x" }, "baseurl", "baseUrl"],
+  ["a top-level key that is a typo of a server key", { hots: "x" }, "hots", "server.host"],
+  ["a top-level row written inside server", { server: { baseUrl: "http://x" } }, "server.baseUrl", "baseUrl"],
+  ["nothing close", { server: { zzzzzzzz: 1 } }, "server.zzzzzzzz", undefined],
+  ["nothing close at the top level", { zzzzzzzz: 1 }, "zzzzzzzz", undefined],
+  ["an editor schema key", { $schema: "https://example.test/schema.json" }, "$schema", undefined],
+  ["a key too short for the distance rule", { server: { ho: 1 } }, "server.ho", undefined],
+];
+
+for (const [label, data, key, suggestion] of SUGGESTIONS) {
+  test(`unknown key, ${label}: ${suggestion ? `did you mean ${suggestion}` : "no hint"}`, () => {
+    const hint = suggestion ? ` (did you mean ${suggestion}?)` : "";
+    assert.equal(unknownLine(data), `${key} (${GLOBAL}): unknown key${hint}`);
+  });
+}
+
+test("an unknown key carries the layer that set it", () => {
+  assert.deepEqual(refused({ project: ok({ server: { hots: 1 } }) }), [`server.hots (${PROJECT}): unknown key (did you mean server.host?)`]);
+});
+
+// ---- hostile JSON keys (T-02-08) ----
+
+for (const key of ["__proto__", "constructor", "prototype"]) {
+  test(`a parsed ${key} key is an unknown key, the rest still validates, and no prototype is touched`, () => {
+    const data = JSON.parse(`{"${key}": {"polluted": true}, "server": {"port": 70000}}`);
+    const errors = refused({ global: ok(data) });
+    assert.equal(errors.length, 2, JSON.stringify(errors));
+    assert.equal(errors[0], `${key} (${GLOBAL}): unknown key`);
+    assert.ok(errors[1].startsWith(`server.port (${GLOBAL}): 70000 is not an integer`), errors[1]);
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "polluted"), false);
+  });
+
+  test(`a parsed ${key} key inside the server block is an unknown key`, () => {
+    const data = JSON.parse(`{"server": {"${key}": {"polluted": true}, "port": 9000}}`);
+    const errors = refused({ global: ok(data) });
+    assert.equal(errors.length, 1);
+    assert.ok(errors[0].startsWith(`server.${key} (${GLOBAL}): unknown key`), errors[0]);
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+  });
+}
+
+test("a valid server value is still used when a hostile key is present only at a layer that is refused", () => {
+  const data = JSON.parse('{"__proto__": {"polluted": true}}');
+  assert.equal(resolve({ global: ok(data) }).ok, false);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
+});
+
+// ---- sanitizing and bounds (T-02-09) ----
+
+const NOISE = "a\u001b[31mb\u0085c\nd\te\u007ff";
+
+test("keys and values with control characters are echoed without them, on a single line", () => {
+  const errors = refused({
+    global: ok({ [NOISE]: 1, server: { [NOISE]: 2, logLevel: NOISE, host: NOISE } }),
+  });
+  assert.equal(errors.length, 4);
+  for (const line of errors) {
+    assert.ok(!CONTROL_CHARACTERS.test(line), JSON.stringify(line));
+  }
+});
+
+test("a long value is clipped to 60 characters", () => {
+  const [line] = refused({ global: ok({ server: { logLevel: "x".repeat(500) } }) });
+  assert.ok(line.includes(`"${"x".repeat(59)} must be one of`), line);
+  assert.ok(!line.includes("x".repeat(60)), line);
+});
+
+test("a long key is clipped to 80 characters", () => {
+  const [line] = refused({ global: ok({ ["k".repeat(500)]: 1 }) });
+  const shown = line.slice(0, line.indexOf(" ("));
+  assert.equal(shown.length, 80, line);
+});
+
+test("a long nested key is clipped to 80 characters including the block name", () => {
+  const [line] = refused({ global: ok({ server: { ["k".repeat(500)]: 1 } }) });
+  assert.equal(line.slice(0, line.indexOf(" (")).length, 80, line);
+});
+
+test("an unusable reason from a hostile source is cleaned and bounded", () => {
+  const [line] = refused({ global: { state: "unusable", reason: `is not valid JSON (${NOISE}${"z".repeat(500)})` } });
+  assert.ok(!CONTROL_CHARACTERS.test(line), JSON.stringify(line));
+  assert.ok(line.length <= `${GLOBAL}: `.length + 200, `${line.length}`);
+});
+
+test("the report is capped at 20 problem lines with a count of the rest", () => {
+  const data: Record<string, unknown> = {};
+  for (let i = 0; i < 25; i += 1) data[`unknownkey${String(i).padStart(2, "0")}`] = i;
+  const errors = refused({ global: ok(data) });
+  assert.equal(errors.length, 25);
+  const lines = formatConfigErrors(errors).split("\n");
+  assert.equal(lines.length, 22, "header, 20 problems and the tail");
+  assert.equal(lines[0], "invalid configuration");
+  assert.equal(lines[20], `  ${errors[19]}`);
+  assert.equal(lines[21], "  ...and 5 more problems");
+});
+
+test("exactly 20 problems are all shown with no tail", () => {
+  const data: Record<string, unknown> = {};
+  for (let i = 0; i < 20; i += 1) data[`unknownkey${String(i).padStart(2, "0")}`] = i;
+  const lines = formatConfigErrors(refused({ global: ok(data) })).split("\n");
+  assert.equal(lines.length, 21);
+  assert.ok(!lines.at(-1)!.includes("more problem"));
+});
+
+test("a single problem over the cap is described in the singular", () => {
+  const data: Record<string, unknown> = {};
+  for (let i = 0; i < 21; i += 1) data[`unknownkey${String(i).padStart(2, "0")}`] = i;
+  const lines = formatConfigErrors(refused({ global: ok(data) })).split("\n");
+  assert.equal(lines.at(-1), "  ...and 1 more problem");
 });
