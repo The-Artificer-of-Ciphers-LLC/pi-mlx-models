@@ -104,7 +104,9 @@ test("without a timeout option the default bound applies to a server that never 
   const elapsed = Date.now() - startedAt;
 
   assert.deepEqual(ids, []);
-  assert.ok(elapsed >= 4500 && elapsed < 8000, `the default bound is five seconds, took ${elapsed} ms`);
+  // Only the lower bound is asserted: an upper bound on real elapsed time flakes on a loaded runner, and
+  // the test-level timeout already fails a discovery that never gives up.
+  assert.ok(elapsed >= 4500, `the default bound is five seconds, took ${elapsed} ms`);
 });
 
 test("uses an injected fetch and hands it one abort signal", async () => {

@@ -10,7 +10,12 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The product is macOS-only and port.ts relies on macOS wildcard bind/connect behaviour, so macOS must run too.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
