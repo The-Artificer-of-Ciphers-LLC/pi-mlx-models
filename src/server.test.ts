@@ -610,3 +610,30 @@ test("a start cancelled by a newer start does not stop the newer start's child",
   assert.equal(procs[1].killed, undefined, "the newer start's child must stay alive");
   assert.equal(server.running, true);
 });
+
+// WR-02: a stop() issued while a restart is tearing down the previous server must cancel the restart.
+test("stop during the previous server's teardown cancels the pending restart without spawning", async () => {
+  const proc = new ManualProc();
+  let spawns = 0;
+  const { host } = makeHost({
+    spawn: () => {
+      spawns += 1;
+      return proc;
+    },
+    // The kill-wait window never elapses, so only the exit event settles the teardown.
+    sleep: () => new Promise<void>(() => {}),
+  });
+  const server = createMlxServer({ ...opts, host });
+  await server.start("a");
+
+  const restarting = server.start("b");
+  await tick();
+  assert.deepEqual(proc.signals, ["SIGTERM"], "premise: the restart is tearing down the old server");
+  const stopping = server.stop();
+  proc.die(0);
+
+  await assert.rejects(restarting, /cancelled/);
+  await stopping;
+  assert.equal(spawns, 1, "the cancelled restart must not spawn a second process");
+  assert.equal(server.running, false);
+});
