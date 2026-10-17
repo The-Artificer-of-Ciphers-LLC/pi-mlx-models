@@ -557,3 +557,32 @@ test("session_shutdown while the runtime installs: the server is never started a
 
   assert.deepEqual(server.startCalls, []);
 });
+
+// WR-01: a failed start must not leave a stale spinner frame in the status bar.
+test("a failed start replaces the last spinner frame in the status bar with a failed status", async () => {
+  const { commands, ctx, statuses } = await setup({
+    server: {
+      start: async (_model, onEvent) => {
+        onEvent?.({ type: "launched" });
+        throw new Error("boom");
+      },
+    },
+  });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.ok(statuses.some((s) => s.text?.startsWith("[")), "premise: a spinner frame was shown");
+  assert.equal(lastStatus(statuses), "mlx: failed");
+});
+
+test("a failed install also leaves a failed status rather than an empty one", async () => {
+  const { commands, ctx, statuses } = await setup({
+    ensureInstalled: async () => {
+      throw new Error("no python");
+    },
+  });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.equal(lastStatus(statuses), "mlx: failed");
+});
