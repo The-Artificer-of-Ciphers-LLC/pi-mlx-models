@@ -7,6 +7,7 @@ class FakeProc extends EventEmitter implements ServerProcess {
   stderr = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
   stdout = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
   killed: string | undefined;
+  pid?: number;
   /** Shared with makeHost so tests can assert the order of kills, exits, probes and spawns. */
   log?: string[];
   kill(signal?: NodeJS.Signals) {
@@ -124,6 +125,41 @@ test("a process dying during startup rejects with its stderr instead of waiting 
   await assert.rejects(started, /exited \(code 1\).*ModuleNotFoundError/s);
   assert.ok(events.includes("exited"));
   assert.equal(server.running, false);
+});
+
+// WR-02 (round 2): spawn reports ENOENT/EACCES only through 'error'; there is no 'exit' afterwards.
+test("a spawn error rejects the start with a launch message instead of polling for the health timeout", async () => {
+  // A start that ignored the error would poll forever; fail the poll loop after a few rounds instead.
+  let polls = 0;
+  const { host, procs } = makeHost({
+    fetch: async () => new Response("{}", { status: 503 }),
+    sleep: async () => {
+      polls += 1;
+      if (polls > 20) throw new Error("kept polling after the spawn error");
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const events: string[] = [];
+  const started = server.start("m", (e) => events.push(e.type));
+  await tick();
+  procs[0].emit("error", new Error("spawn /nope ENOENT"));
+
+  await assert.rejects(started, /Could not launch the MLX server: spawn \/nope ENOENT/);
+
+  assert.equal(server.running, false);
+  assert.ok(!events.includes("exited"), "a rejected start does not also report an exit");
+});
+
+test("an error on a process that did start (for example a failed kill) is handled but does not mark it dead", async () => {
+  const { host, procs } = makeHost();
+  const server = createMlxServer({ ...opts, host });
+  const started = server.start("m");
+  await tick();
+  procs[0].pid = 4242;
+  procs[0].emit("error", new Error("kill EPERM"));
+  await started;
+
+  assert.equal(server.running, true);
 });
 
 test("stop during startup cancels the pending start without an exited event", async () => {

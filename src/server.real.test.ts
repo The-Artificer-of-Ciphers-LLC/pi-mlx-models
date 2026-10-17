@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createConnection, createServer, type Server } from "node:net";
 import { createServer as createHttpServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { createMlxServer, createSystemHost, type ServerHost } from "./server.js";
 import { freePort, stubArgs, waitForExit } from "./testkit.js";
@@ -70,6 +72,24 @@ test("start reaches ready against the stub process and stop resolves only after 
   const child = children[0];
   assert.ok(child.exitCode !== null || child.signalCode !== null, "the child must have exited before stop() resolved");
   assert.equal(await connectRefused(port), true, "the port must refuse connections after stop()");
+});
+
+// WR-02 (round 2): a spawn failure arrives only as an 'error' event, which would crash the host if unhandled.
+test("a missing server command fails the start at once with a clear message and leaves running false", async () => {
+  const port = await freePort();
+  const missing = join(tmpdir(), `pi-mlx-missing-command-${process.pid}-${port}`);
+  const host = createSystemHost({ command: missing, buildArgs: stubArgs });
+  const server = createMlxServer({
+    host,
+    address: { host: "127.0.0.1", port },
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    healthPollMs: 25,
+    warmupPollMs: 25,
+  });
+
+  await assert.rejects(server.start("stub/model"), /Could not launch the MLX server: .*ENOENT/);
+
+  assert.equal(server.running, false);
 });
 
 test("a restart waits for the old stub to exit and release the port, then serves from a new process", { timeout: 30_000 }, async (t) => {
