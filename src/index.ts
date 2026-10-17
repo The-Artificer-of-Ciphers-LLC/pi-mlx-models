@@ -115,6 +115,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
   async function startModelFromInput(pi: PiHost, ctx: any, args: string | undefined) {
     const selected = resolveModel(args, deps.defaultModel);
+    // Bad input is reported before anything runs: no provider refresh, no install, no spawn.
+    if (selected.error !== undefined) {
+      ctx.ui.notify(`mlx-start failed: ${selected.error}`, "error");
+      return;
+    }
     const model = selected.modelId;
     currentModel = model;
     await registerProvider(pi, { includeFallback: false });

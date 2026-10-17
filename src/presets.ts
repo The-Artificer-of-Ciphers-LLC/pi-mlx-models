@@ -28,8 +28,19 @@ export const MODEL_PRESETS = [
 
 export type ModelPreset = (typeof MODEL_PRESETS)[number];
 
-/** Resolve a preset number, preset key, or full model id; empty input falls back to `defaultModel`. */
-export function resolveModel(input: string | undefined, defaultModel: string): { modelId: string; preset?: ModelPreset } {
+/**
+ * Either a model to start, or an `error` explaining why the input cannot be one. The failure variant lists
+ * `modelId` and `preset` as optional undefined so reading them off an unnarrowed result still compiles.
+ */
+export type ResolvedModel =
+  | { modelId: string; preset?: ModelPreset; error?: undefined }
+  | { error: string; modelId?: undefined; preset?: undefined };
+
+/**
+ * Resolve a preset number, preset key, or full model id; empty input falls back to `defaultModel`.
+ * A number outside the preset range, and an id that starts with "-" (it would become a server flag), are errors.
+ */
+export function resolveModel(input: string | undefined, defaultModel: string): ResolvedModel {
   const normalized = (input || "").trim();
   if (!normalized) {
     const preset = MODEL_PRESETS.find((p) => p.modelId === defaultModel || p.key === defaultModel);
@@ -38,10 +49,15 @@ export function resolveModel(input: string | undefined, defaultModel: string): {
 
   if (/^\d+$/.test(normalized)) {
     const idx = Number(normalized) - 1;
-    if (idx >= 0 && idx < MODEL_PRESETS.length) {
-      const preset = MODEL_PRESETS[idx];
-      return { modelId: preset.modelId, preset };
+    if (idx < 0 || idx >= MODEL_PRESETS.length) {
+      return { error: `Preset number ${normalized} is out of range (choose 1-${MODEL_PRESETS.length})` };
     }
+    const preset = MODEL_PRESETS[idx];
+    return { modelId: preset.modelId, preset };
+  }
+
+  if (normalized.startsWith("-")) {
+    return { error: `Model ids must not start with "-" (got ${JSON.stringify(normalized)})` };
   }
 
   const preset = MODEL_PRESETS.find((p) => p.key === normalized || p.modelId === normalized);
