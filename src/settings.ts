@@ -1,4 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
@@ -81,14 +83,25 @@ export interface SettingsSource {
   home: string;
 }
 
-export type SettingValue = string | number | boolean;
+/** A JSON value as it sits in a setting that holds an object: parsed, checked and copied, never the parser's own objects. */
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
-type CheckResult = { ok: true; value: SettingValue } | { ok: false };
+/** An object-valued setting; its objects have no prototype, so no key can reach `Object.prototype`. */
+export type SettingObject = { [key: string]: JsonValue };
+
+export type SettingValue = string | number | boolean | SettingObject;
+
+/** A value that failed its check; `problem` words the line when this row's usual phrase does not fit the failure. */
+type CheckResult = { ok: true; value: SettingValue } | { ok: false; problem?: (shown: string) => string };
 
 export interface SettingDef {
   /** Dotted key in the config file: "server.port" is the `port` key of the `server` block; a top-level key has no dot (D-01). */
   path: string;
-  kind: "string" | "integer" | "enum" | "list" | "bool";
+  kind: "string" | "integer" | "enum" | "list" | "bool" | "path" | "jsonObject";
+  /** A model option: decided per model in `buildLaunch` (the `model` block and the `models` entries), not once per start. */
+  perModel?: boolean;
+  /** A path row whose file is read at launch time; the file's text is the value that is emitted (D-23). */
+  template?: boolean;
   /** The allowed values in words, used in every error and warning about this row. */
   expected: string;
   /** Strict check of a value read from a JSON file: no coercion (D-07). */
@@ -179,6 +192,90 @@ function checkBoolean(value: unknown): CheckResult {
 
 const valued = (flag: string) => (value: SettingValue) => [`${flag}=${value}`];
 
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** The longest path or model id a setting may hold; real ones are far shorter. */
+const MAX_TEXT_LENGTH = 4096;
+
+/**
+ * A model id or a file system path: not empty after trimming, one line, no control characters (a NUL would make the
+ * spawn throw). A path is kept as written; `~` and relative paths are resolved when the launch is built.
+ */
+function checkOneLineText(value: unknown): CheckResult {
+  if (typeof value !== "string") return bad;
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= MAX_TEXT_LENGTH && !CONTROL_CHARACTER.test(trimmed) ? ok(trimmed) : bad;
+}
+
+function checkDraftTokens(value: unknown): CheckResult {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? ok(value) : bad;
+}
+
+/** The most the extension will place in one argv element for the template (T-02-21). */
+const MAX_TEMPLATE_BYTES = 64 * 1024;
+/** The most serialized text the template arguments may hold (T-02-21). */
+const MAX_TEMPLATE_ARGS_BYTES = 16 * 1024;
+/** Object levels allowed in the template arguments; deeper values are refused, so no walk can exhaust the stack. */
+const MAX_ARGS_DEPTH = 32;
+
+/** Keys that could reach `Object.prototype` if a value were ever assigned through them (T-02-20). */
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+type Sanitized = { ok: true; value: JsonValue } | { ok: false; problem: (shown: string) => string };
+
+/**
+ * Copy a parsed JSON value into objects without a prototype, refusing everything that is not plain JSON: a
+ * forbidden key at any depth, a value JSON cannot hold, or nesting beyond the limit. Keys are only read here
+ * (`Object.keys`), and the copy is assigned into a prototype-less object, so a hostile key has no effect.
+ */
+function sanitizeJson(value: unknown, depth: number): Sanitized {
+  if (depth > MAX_ARGS_DEPTH) return { ok: false, problem: PHRASES.tooDeep };
+  if (value === null || typeof value === "string" || typeof value === "boolean") return { ok: true, value };
+  if (typeof value === "number") return Number.isFinite(value) ? { ok: true, value } : { ok: false, problem: PHRASES.notJson };
+  if (Array.isArray(value)) {
+    const items: JsonValue[] = [];
+    for (const item of value) {
+      const copy = sanitizeJson(item, depth + 1);
+      if (!copy.ok) return copy;
+      items.push(copy.value);
+    }
+    return { ok: true, value: items };
+  }
+  if (typeof value !== "object") return { ok: false, problem: PHRASES.notJson };
+  const result = Object.create(null) as SettingObject;
+  for (const key of Object.keys(value)) {
+    if (FORBIDDEN_KEYS.has(key)) return { ok: false, problem: PHRASES.forbiddenKey(key) };
+    const copy = sanitizeJson((value as Record<string, unknown>)[key], depth + 1);
+    if (!copy.ok) return copy;
+    result[key] = copy.value;
+  }
+  return { ok: true, value: result };
+}
+
+/** The chat template arguments as a JSON object, checked and copied; the serialized text is bounded. */
+function checkTemplateArgs(value: unknown): CheckResult {
+  if (!isPlainObject(value)) return bad;
+  const copy = sanitizeJson(value, 0);
+  if (!copy.ok) return { ok: false, problem: copy.problem };
+  if (Buffer.byteLength(JSON.stringify(copy.value)) > MAX_TEMPLATE_ARGS_BYTES) return { ok: false, problem: PHRASES.argsTooLarge };
+  return ok(copy.value as SettingObject);
+}
+
+/** The same value typed as text, in mlx-lm's own form: a JSON string of an object. */
+function parseTemplateArgs(raw: string): CheckResult {
+  const text = raw.trim();
+  if (Buffer.byteLength(text) > MAX_TEMPLATE_ARGS_BYTES) return { ok: false, problem: PHRASES.argsTooLarge };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: false, problem: PHRASES.jsonText };
+  }
+  return checkTemplateArgs(parsed);
+}
+
+const emitJson = (flag: string) => (value: SettingValue) => [`${flag}=${JSON.stringify(value)}`];
+
 /**
  * The wording of every "this value is wrong" line, one phrase per kind of row. `shown` is the offending
  * value as JSON, already cleaned and clipped, so nothing here needs to sanitize (D-24).
@@ -193,6 +290,12 @@ const PHRASES = {
   url: (shown: string) => `${shown} must be an http or https URL`,
   list: (shown: string) => `${shown} must be a list of non-empty strings without commas or spaces`,
   object: (shown: string) => `${shown} must be a JSON object`,
+  path: (shown: string) => `${shown} must be a non-empty path`,
+  jsonText: (shown: string) => `${shown} is not valid JSON; give a JSON object`,
+  forbiddenKey: (key: string) => (shown: string) => `${shown} contains the key ${showKey(key)}, which is not allowed`,
+  argsTooLarge: (shown: string) => `${shown} is larger than 16 KiB`,
+  tooDeep: (shown: string) => `${shown} is nested too deeply`,
+  notJson: (shown: string) => `${shown} contains a value that is not JSON`,
 };
 
 /** The schema, in the order flags are listed in the start message. */
@@ -270,6 +373,86 @@ export const SETTINGS: readonly SettingDef[] = [
     default: false,
   },
   {
+    path: "model.adapterPath",
+    kind: "path",
+    perModel: true,
+    expected: "a non-empty path",
+    check: checkOneLineText,
+    problem: PHRASES.path,
+    parseText: (raw) => checkOneLineText(raw),
+    cli: "--adapter-path",
+    mlxFlag: "--adapter-path",
+    emit: valued("--adapter-path"),
+  },
+  {
+    path: "model.draftModel",
+    kind: "string",
+    perModel: true,
+    expected: "a non-empty model id",
+    check: checkOneLineText,
+    problem: PHRASES.string,
+    parseText: (raw) => checkOneLineText(raw),
+    cli: "--draft-model",
+    mlxFlag: "--draft-model",
+    emit: valued("--draft-model"),
+  },
+  {
+    path: "model.numDraftTokens",
+    kind: "integer",
+    perModel: true,
+    expected: "an integer of at least 1",
+    check: checkDraftTokens,
+    problem: PHRASES.integerAtLeast(1),
+    parseText: (raw) => {
+      const trimmed = raw.trim();
+      return /^\d+$/.test(trimmed) ? checkDraftTokens(Number(trimmed)) : bad;
+    },
+    cli: "--num-draft-tokens",
+    mlxFlag: "--num-draft-tokens",
+    emit: valued("--num-draft-tokens"),
+  },
+  {
+    // The value is a path to a Jinja file; the launch reads the file and passes its text (D-23).
+    path: "model.chatTemplate",
+    kind: "path",
+    perModel: true,
+    template: true,
+    expected: "a non-empty path to a template file",
+    check: checkOneLineText,
+    problem: PHRASES.path,
+    parseText: (raw) => checkOneLineText(raw),
+    cli: "--chat-template",
+    mlxFlag: "--chat-template",
+    emit: valued("--chat-template"),
+  },
+  {
+    path: "model.useDefaultChatTemplate",
+    kind: "bool",
+    perModel: true,
+    expected: "true or false",
+    check: checkBoolean,
+    problem: PHRASES.boolean,
+    parseText: (raw) => (raw.trim() === "true" ? ok(true) : bad),
+    cli: "--use-default-chat-template",
+    bare: true,
+    mlxFlag: "--use-default-chat-template",
+    emit: (value) => (value === true ? ["--use-default-chat-template"] : []),
+    default: false,
+  },
+  {
+    // An object in a file; on the command line mlx-lm's own form, a JSON string (D-22).
+    path: "model.chatTemplateArgs",
+    kind: "jsonObject",
+    perModel: true,
+    expected: "a JSON object",
+    check: checkTemplateArgs,
+    problem: PHRASES.object,
+    parseText: parseTemplateArgs,
+    cli: "--chat-template-args",
+    mlxFlag: "--chat-template-args",
+    emit: emitJson("--chat-template-args"),
+  },
+  {
     path: "baseUrl",
     kind: "string",
     expected: "an http or https URL",
@@ -315,6 +498,10 @@ export function cliFlagSpecs(): CliFlagSpec[] {
 }
 
 const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
+/** The top-level key whose entries override the model block for one preset key or model id (D-21). */
+const MODELS_KEY = "models";
+/** The block the entries of `models` are written in: an entry holds the keys of the `model` block. */
+const MODEL_BLOCK = "model";
 /** The block names of nested keys, e.g. "server". */
 const BLOCKS = new Set(SETTINGS.filter((row) => row.path.includes(".")).map((row) => row.path.split(".")[0]));
 
@@ -325,7 +512,10 @@ interface Candidate {
 }
 
 /** The keys valid at the top level of a file, in schema order: block names and top-level rows. */
-const TOP_LEVEL: readonly Candidate[] = [...new Set(SETTINGS.map((row) => row.path.split(".")[0]))].map((name) => ({ path: name, name }));
+const TOP_LEVEL: readonly Candidate[] = [...new Set([...SETTINGS.map((row) => row.path.split(".")[0]), MODELS_KEY])].map((name) => ({
+  path: name,
+  name,
+}));
 
 /** The keys of nested rows, in schema order; `inBlock` keeps only that block's, `exceptBlock` drops it. */
 function nestedKeys(filter: { inBlock?: string; exceptBlock?: string }): Candidate[] {
@@ -391,7 +581,14 @@ const FILE_LABEL = { global: "global config.json", project: "project .pi/pi-mlx-
 
 /** Text that came from a file, the environment or a flag, made safe and bounded before it is shown (D-24). */
 const show = (text: string): string => clipDiagnostic(cleanLabel(text), 60, "start");
-const showValue = (value: unknown): string => show(JSON.stringify(value) ?? String(value));
+const showValue = (value: unknown): string => {
+  try {
+    return show(JSON.stringify(value) ?? String(value));
+  } catch {
+    // A value nested too deeply to serialize, or one that cannot be: still reported, never thrown.
+    return "(a value that cannot be shown)";
+  }
+};
 
 /** The layer name as it appears in the flags line. */
 function displayLabel(layer: LayerName, row: SettingDef): string {
@@ -456,6 +653,21 @@ export interface Prepared {
   sources: ReadonlyMap<string, { layer: LayerName; label: string }>;
   /** What the project file asked for that it may never ask for; decided on its own content before any merge (D-16). */
   projectViolations: ProjectViolation[];
+  /** The validated model options of every layer, held until a model is chosen: `buildLaunch` is their second stage. */
+  modelSettings: ModelSettings;
+}
+
+/** One file's model options: the `model` block, and each `models` entry by its key or model id. */
+interface ModelLayer {
+  layer: "global" | "project";
+  model: ReadonlyMap<string, SettingValue>;
+  models: ReadonlyMap<string, ReadonlyMap<string, SettingValue>>;
+}
+
+/** The model options before a model is known: the file layers from lowest to highest precedence, and the typed flags. */
+export interface ModelSettings {
+  layers: readonly ModelLayer[];
+  args: ReadonlyMap<string, SettingValue>;
 }
 
 /** One setting in the project file that enables running code or opening the network. */
@@ -480,13 +692,13 @@ const showKey = (path: string): string => clipDiagnostic(cleanLabel(path), 80, "
  * Keys are compared against the schema with Map and Set lookups only, and parsed keys are never assigned onto
  * another object, so a key such as `__proto__` is just an unknown key (T-02-08).
  */
-function readFileLayer(file: LayerFile | undefined, layer: "global" | "project", problems: string[]): Map<string, SettingValue> {
-  const values = new Map<string, SettingValue>();
+function readFileLayer(file: LayerFile | undefined, layer: "global" | "project", problems: string[]): FileLayerData {
+  const data: FileLayerData = { values: new Map(), models: new Map() };
   const label = FILE_LABEL[layer];
-  if (file === undefined || file.state === "absent") return values;
+  if (file === undefined || file.state === "absent") return data;
   if (file.state === "unusable") {
     problems.push(`${label}: ${clipDiagnostic(cleanLabel(file.reason), 200, "start")}`);
-    return values;
+    return data;
   }
   const consider = (block: string | undefined, key: string, value: unknown) => {
     const path = block === undefined ? key : `${block}.${key}`;
@@ -498,11 +710,38 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
       return;
     }
     const result = row.check(value);
-    if (result.ok) values.set(path, result.value);
-    else problems.push(`${path} (${label}): ${row.problem(showValue(value))}${flagSuffix(row)}`);
+    if (result.ok) data.values.set(path, result.value);
+    else problems.push(`${path} (${label}): ${(result.problem ?? row.problem)(showValue(value))}${flagSuffix(row)}`);
+  };
+  /** One `models` entry: the same keys and checks as the `model` block, with the entry's own path in every line. */
+  const considerEntry = (id: string, entry: Map<string, SettingValue>, key: string, value: unknown) => {
+    const where = `${entryPath(id)}.${showKey(key)}`;
+    const row = key.includes(".") ? undefined : ROWS_BY_PATH.get(`${MODEL_BLOCK}.${key}`);
+    if (row === undefined) {
+      const meant = suggestKey(key, MODEL_BLOCK);
+      problems.push(`${where} (${label}): unknown key${meant === undefined ? "" : ` (did you mean ${meant}?)`}`);
+      return;
+    }
+    const result = row.check(value);
+    if (result.ok) entry.set(row.path, result.value);
+    else problems.push(`${where} (${label}): ${(result.problem ?? row.problem)(showValue(value))}${flagSuffix(row)}`);
   };
   for (const [key, value] of Object.entries(file.data)) {
-    if (!BLOCKS.has(key)) {
+    if (key === MODELS_KEY) {
+      if (!isPlainObject(value)) {
+        problems.push(`${key} (${label}): ${PHRASES.object(showValue(value))}`);
+        continue;
+      }
+      for (const [id, entryValue] of Object.entries(value)) {
+        if (!isPlainObject(entryValue)) {
+          problems.push(`${entryPath(id)} (${label}): ${PHRASES.object(showValue(entryValue))}`);
+          continue;
+        }
+        const entry = new Map<string, SettingValue>();
+        data.models.set(id, entry);
+        for (const [child, childValue] of Object.entries(entryValue)) considerEntry(id, entry, child, childValue);
+      }
+    } else if (!BLOCKS.has(key)) {
       consider(undefined, key, value);
     } else if (!isPlainObject(value)) {
       problems.push(`${key} (${label}): ${PHRASES.object(showValue(value))}`);
@@ -510,8 +749,17 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
       for (const [child, childValue] of Object.entries(value)) consider(key, child, childValue);
     }
   }
-  return values;
+  return data;
 }
+
+/** What one config file holds: the validated top-level and block values, and the validated `models` entries. */
+interface FileLayerData {
+  values: Map<string, SettingValue>;
+  models: Map<string, Map<string, SettingValue>>;
+}
+
+/** The path of a `models` entry as an error line shows it: `models["id"]`, the id cleaned and at most 80 characters. */
+const entryPath = (id: string): string => `${MODELS_KEY}[${JSON.stringify(showKey(id))}]`;
 
 const isLoopbackUrl = (baseUrl: string): boolean => {
   try {
@@ -552,10 +800,11 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
   const warnings: string[] = [];
   // Problems are collected per layer and reported highest precedence first (the environment only warns).
   const problems: Record<LayerName, string[]> = { args: [], piFlags: [], env: [], project: [], global: [] };
-  const fileValues = {
+  const files = {
     global: readFileLayer(input.global, "global", problems.global),
     project: readFileLayer(input.project, "project", problems.project),
   };
+  const fileValues = { global: files.global.values, project: files.project.values };
 
   const resolved = new Map<string, { value: SettingValue; layer: LayerName }>();
   const candidate = (row: SettingDef, layer: LayerName): SettingValue | undefined => {
@@ -591,12 +840,13 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
         }
         const result = row.parseText(raw);
         if (result.ok) return result.value;
-        problems[layer].push(`${where}: ${row.problem(showValue(raw))}`);
+        problems[layer].push(`${where}: ${(result.problem ?? row.problem)(showValue(raw))}`);
         return undefined;
       }
     }
   };
   for (const row of SETTINGS) {
+    if (row.perModel === true) continue;
     for (const layer of PRECEDENCE) {
       const value = candidate(row, layer);
       if (value !== undefined) {
@@ -604,6 +854,14 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
         break;
       }
     }
+  }
+  // A model option is decided per model, in `buildLaunch`; only what was typed is read here, so that a bad flag is
+  // reported in this one report with the others.
+  const typedModel = new Map<string, SettingValue>();
+  for (const row of SETTINGS) {
+    if (row.perModel !== true) continue;
+    const typed = candidate(row, "args");
+    if (typed !== undefined) typedModel.set(row.path, typed);
   }
   const errors = PRECEDENCE.flatMap((layer) => problems[layer]);
   if (errors.length > 0) return { ok: false, errors, warnings };
@@ -658,6 +916,14 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
       flags,
       sources,
       projectViolations: projectViolationsOf(fileValues.project),
+      modelSettings: {
+        layers: (["global", "project"] as const).map((layer) => ({
+          layer,
+          model: new Map([...files[layer].values].filter(([path]) => ROWS_BY_PATH.get(path)?.perModel === true)),
+          models: files[layer].models,
+        })),
+        args: typedModel,
+      },
     },
     warnings,
   };
@@ -678,11 +944,120 @@ export interface LaunchContext {
   cwd: string;
 }
 
-/** Pair the prepared settings with the model being started. Later plans add model-specific rows here. */
-export function buildLaunch(prepared: Prepared, model: { modelId: string; presetKey?: string }, _context?: LaunchContext): BuildResult {
+const isSettingObject = (value: unknown): value is SettingObject => isPlainObject(value);
+
+/**
+ * Two objects merged key by key, recursing into objects and replacing arrays and scalars (D-12). The result is
+ * a new prototype-less object and neither input is changed (T-02-20).
+ */
+function mergeObjects(base: SettingObject, over: SettingObject): SettingObject {
+  const merged = Object.create(null) as SettingObject;
+  for (const [key, value] of Object.entries(base)) merged[key] = value;
+  for (const [key, value] of Object.entries(over)) {
+    const previous = merged[key];
+    merged[key] = isSettingObject(previous) && isSettingObject(value) ? mergeObjects(previous, value) : value;
+  }
+  return merged;
+}
+
+/** A path as the user wrote it, made absolute: `~` is the home directory, anything relative is under the project directory. */
+function resolveUserPath(text: string, context: LaunchContext): string {
+  if (text === "~") return context.home;
+  if (text.startsWith("~/")) return join(context.home, text.slice(2));
+  return isAbsolute(text) ? text : resolvePath(context.cwd, text);
+}
+
+type TemplateText = { ok: true; text: string } | { ok: false; reason: string };
+
+/** Read a chat template: a regular file of at most 64 KiB holding non-empty UTF-8 text. Never throws (T-02-19, T-02-21). */
+function readTemplateFile(path: string): TemplateText {
+  let bytes: Buffer;
+  try {
+    const info = statSync(path);
+    if (!info.isFile()) return { ok: false, reason: "is not a regular file" };
+    if (info.size > MAX_TEMPLATE_BYTES) return { ok: false, reason: "is larger than 64 KiB" };
+    bytes = readFileSync(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return { ok: false, reason: `cannot be read (${typeof code === "string" ? reasonText(code, 40) : "unknown error"})` };
+  }
+  // The file may have grown between the stat and the read.
+  if (bytes.length > MAX_TEMPLATE_BYTES) return { ok: false, reason: "is larger than 64 KiB" };
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return { ok: false, reason: "is not valid UTF-8 text" };
+  }
+  if (text.trim() === "") return { ok: false, reason: "is empty" };
+  // A NUL cannot be part of a process argument.
+  if (text.includes("\u0000")) return { ok: false, reason: "is not text (contains a NUL character)" };
+  return { ok: true, text };
+}
+
+/** The layer as a problem line about a model option labels it: a file, or the flag typed on `/mlx-start`. */
+const layerLabel = (layer: LayerName, row: SettingDef): string =>
+  layer === "global" || layer === "project" ? FILE_LABEL[layer] : problemLabel("args", row);
+
+/**
+ * The second stage: pair the prepared settings with the model being started. The model options of each file layer
+ * are overlaid by `models[preset key]` and then `models[model id]`, the layers are applied from the lowest
+ * precedence up (so a project `model` block beats a global `models` entry), and what was typed on `/mlx-start`
+ * comes last. Paths are resolved, the chat template file is read, and the flags come out in schema order.
+ */
+export function buildLaunch(prepared: Prepared, model: { modelId: string; presetKey?: string }, context?: LaunchContext): BuildResult {
+  const where: LaunchContext = context ?? { home: homedir(), cwd: process.cwd() };
+  const folded = new Map<string, { value: SettingValue; layer: LayerName }>();
+  const apply = (values: ReadonlyMap<string, SettingValue> | undefined, layer: LayerName) => {
+    if (values === undefined) return;
+    for (const [path, value] of values) {
+      const previous = folded.get(path)?.value;
+      folded.set(path, { value: isSettingObject(previous) && isSettingObject(value) ? mergeObjects(previous, value) : value, layer });
+    }
+  };
+  for (const data of prepared.modelSettings.layers) {
+    apply(data.model, data.layer);
+    if (model.presetKey !== undefined) apply(data.models.get(model.presetKey), data.layer);
+    apply(data.models.get(model.modelId), data.layer);
+  }
+  apply(prepared.modelSettings.args, "args");
+
+  const errors: string[] = [];
+  const modelFlags: LaunchFlag[] = [];
+  for (const row of SETTINGS) {
+    const hit = folded.get(row.path);
+    if (row.perModel !== true || row.mlxFlag === undefined || hit === undefined || hit.value === row.default) continue;
+    let value = hit.value;
+    let display: string;
+    if (row.kind === "path") {
+      const resolved = resolveUserPath(String(value), where);
+      display = clipDiagnostic(cleanLabel(resolved), 200, "start");
+      if (row.template === true) {
+        const read = readTemplateFile(resolved);
+        if (!read.ok) {
+          errors.push(`${row.path} (${layerLabel(hit.layer, row)}): cannot read ${display}: ${read.reason}`);
+          continue;
+        }
+        value = read.text;
+      } else {
+        value = resolved;
+      }
+    } else if (isSettingObject(value)) {
+      const text = JSON.stringify(value);
+      if (Buffer.byteLength(text) > MAX_TEMPLATE_ARGS_BYTES) {
+        errors.push(`${row.path} (${layerLabel(hit.layer, row)}): the merged value is larger than 16 KiB`);
+        continue;
+      }
+      display = show(text);
+    } else {
+      display = typeof value === "boolean" ? "" : show(String(value));
+    }
+    modelFlags.push({ path: row.path, flag: row.mlxFlag, args: row.emit(value), display, label: displayLabel(hit.layer, row), core: false });
+  }
+  if (errors.length > 0) return { ok: false, errors };
   return {
     ok: true,
-    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: prepared.flags },
+    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: [...prepared.flags, ...modelFlags] },
   };
 }
 
