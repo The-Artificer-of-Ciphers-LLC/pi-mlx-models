@@ -19,6 +19,13 @@ export interface ServerProcess {
   on(event: "exit", listener: (code: number | null) => void): unknown;
   /** Fires after `exit` once stdio is fully read; the death diagnostics wait for it. */
   on(event: "close", listener: (code: number | null) => void): unknown;
+  /**
+   * ENOENT, EACCES and similar launch failures arrive only here (no `exit` follows), and an
+   * unhandled `error` event is an uncaught exception in the host. Also fired for a failed kill.
+   */
+  on(event: "error", listener: (error: Error) => void): unknown;
+  /** Undefined when the process could not be spawned. */
+  readonly pid?: number;
   kill(signal?: NodeJS.Signals): unknown;
 }
 
@@ -350,6 +357,16 @@ export function createMlxServer(
       });
 
       proc.on("close", () => resolveClose());
+
+      proc.on("error", (error) => {
+        // An error on a process that did start (a failed kill) leaves it alive; teardown still escalates to SIGKILL.
+        if (proc.pid !== undefined) return;
+        // Nothing was launched, so no `exit` will follow: record why and release everything waiting on one.
+        c.fatal ??= `Could not launch the MLX server: ${clipDiagnostic(error.message, 400)}`;
+        c.exited = true;
+        resolveExit();
+        resolveClose();
+      });
 
       emit({ type: "launched" });
       try {

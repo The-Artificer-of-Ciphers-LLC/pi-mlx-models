@@ -130,18 +130,20 @@ test("a process dying during startup rejects with its stderr instead of waiting 
 // WR-02 (round 2): spawn reports ENOENT/EACCES only through 'error'; there is no 'exit' afterwards.
 test("a spawn error rejects the start with a launch message instead of polling for the health timeout", async () => {
   // A start that ignored the error would poll forever; fail the poll loop after a few rounds instead.
-  let polls = 0;
+  let errored = false;
+  let pollsAfterError = 0;
   const { host, procs } = makeHost({
     fetch: async () => new Response("{}", { status: 503 }),
-    sleep: async () => {
-      polls += 1;
-      if (polls > 20) throw new Error("kept polling after the spawn error");
+    sleep: () => {
+      if (errored && (pollsAfterError += 1) > 20) return Promise.reject(new Error("kept polling after the spawn error"));
+      return new Promise((r) => setImmediate(r));
     },
   });
   const server = createMlxServer({ ...opts, host });
   const events: string[] = [];
   const started = server.start("m", (e) => events.push(e.type));
   await tick();
+  errored = true;
   procs[0].emit("error", new Error("spawn /nope ENOENT"));
 
   await assert.rejects(started, /Could not launch the MLX server: spawn \/nope ENOENT/);
