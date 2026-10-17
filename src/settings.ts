@@ -1059,19 +1059,27 @@ export function buildLaunch(prepared: Prepared, model: { modelId: string; preset
   };
 }
 
-/** What the server host needs: the address, the URL, and the optional flags in schema order. */
-export function toLaunchSpec(launch: ResolvedLaunch, _skipped?: ReadonlySet<string>): LaunchSpec {
+/**
+ * What the server host needs: the address, the URL, and the optional flags in schema order. Flags the installed
+ * mlx-lm cannot do (`skipped`, by flag name) are left out (D-19); host and port are never skipped.
+ */
+export function toLaunchSpec(launch: ResolvedLaunch, skipped?: ReadonlySet<string>): LaunchSpec {
   return {
     address: launch.address,
     baseUrl: launch.baseUrl,
-    extraArgs: launch.flags.filter((flag) => !flag.core).flatMap((flag) => flag.args),
+    extraArgs: launch.flags.filter((flag) => !flag.core && !skipped?.has(flag.flag)).flatMap((flag) => flag.args),
   };
 }
 
-/** The "flags: ..." line of the start message, or "" when no flag differs from its default (D-11). */
-export function describeFlags(launch: ResolvedLaunch, _skipped?: ReadonlySet<string>): string {
+/**
+ * The "flags: ..." line of the start message, or "" when no flag differs from its default (D-11). A flag in `skipped`
+ * is still listed, marked ", skipped" inside its parentheses, so the line shows what was configured and what ran.
+ */
+export function describeFlags(launch: ResolvedLaunch, skipped?: ReadonlySet<string>): string {
   if (launch.flags.length === 0) return "";
-  const parts = launch.flags.map((flag) => `${flag.flag}${flag.display ? ` ${flag.display}` : ""} (${flag.label})`);
+  const parts = launch.flags.map(
+    (flag) => `${flag.flag}${flag.display ? ` ${flag.display}` : ""} (${flag.label}${!flag.core && skipped?.has(flag.flag) ? ", skipped" : ""})`,
+  );
   return `flags: ${parts.join(", ")}`;
 }
 

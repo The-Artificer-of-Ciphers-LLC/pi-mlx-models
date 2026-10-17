@@ -8,11 +8,12 @@ import {
   GLOBAL_CONFIG_PATH,
   PROJECT_CONFIG_RELPATH,
   PROVIDER_ID,
+  VENV_PYTHON,
   deriveBaseUrl,
 } from "./config.js";
 import { cleanLabel } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
-import type { ProbeResult } from "./flagprobe.js";
+import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
 import { createProgress, type Progress } from "./progress.js";
 import { ensureInstalled, type RuntimeEvent } from "./runtime.js";
@@ -110,7 +111,8 @@ function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
     ensureInstalled: overrides.ensureInstalled ?? ensureInstalled,
     discoverModelIds: overrides.discoverModelIds ?? ((baseUrl) => discoverModelIds({ baseUrl })),
     settings: overrides.settings ?? { env: process.env, globalConfigPath: GLOBAL_CONFIG_PATH, home: homedir() },
-    probeFlags: overrides.probeFlags ?? (async () => ({ ok: false, reason: "not implemented" })),
+    // One probe per extension instance: its cache is keyed by the installed mlx-lm version and lives as long as the session.
+    probeFlags: overrides.probeFlags ?? createFlagProbe({ python: VENV_PYTHON }).probe,
     shutdownWaitMs: overrides.shutdownWaitMs ?? 5000,
     sleep: overrides.sleep ?? unrefSleep,
   };
@@ -310,9 +312,26 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         },
       });
       if (isStale()) return; // stopped or superseded while installing
+
+      // Ask the installed server which of the configured optional flags it supports. Only a launch that has some
+      // pays for it (a default launch is exactly as fast as before), and only now: the venv has to exist (D-18).
+      const skipped = new Set<string>();
+      if (launch.flags.some((flag) => !flag.core)) {
+        progress.update(0, { state: "active", detail: "Checking which server flags mlx-lm supports" });
+        const probe = await deps.probeFlags();
+        if (isStale()) return;
+        const split = partitionFlags(launch.flags, probe);
+        for (const flag of split.skipped) skipped.add(flag.flag);
+        // A plain notification, never through the once-per-text set: every launch that skips something says so.
+        if (!probe.ok) {
+          ctx.ui.notify(`Could not check which flags mlx-lm supports (${probe.reason}); passing every configured flag.`, "warning");
+        } else if (split.skipped.length > 0) {
+          ctx.ui.notify(skippedNotice(split.skipped.map((flag) => flag.flag), probe.version), "warning");
+        }
+      }
       progress.done(0, "Runtime ready");
 
-      const flagsLine = describeFlags(launch);
+      const flagsLine = describeFlags(launch, skipped);
       ctx.ui.notify(
         `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...${flagsLine ? `\n${flagsLine}` : ""}`,
         "info",
@@ -359,7 +378,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             ctx.ui.setStatus(PROVIDER_ID, "mlx: stopped");
             break;
         }
-      }, toLaunchSpec(launch));
+      }, toLaunchSpec(launch, skipped));
 
       if (isStale()) return;
       activate(5, "Refreshing provider model list");
