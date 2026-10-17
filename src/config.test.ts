@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, parsePort, resolveAgentDir } from "./config.js";
+import { DEFAULT_PORT, PROJECT_CONFIG_RELPATH, baseUrlWarning, deriveBaseUrl, isLoopbackHost, parsePort, resolveAgentDir } from "./config.js";
 
 interface LoadedConfig {
   DATA_DIR: string;
@@ -179,4 +179,34 @@ test("GLOBAL_CONFIG_PATH is config.json inside DATA_DIR", (t) => {
   t.after(() => rmSync(agent, { recursive: true, force: true }));
   const cfg = loadConfig({ PI_CODING_AGENT_DIR: agent });
   assert.equal(cfg.GLOBAL_CONFIG_PATH, join(agent, "pi-mlx-models", "config.json"));
+});
+
+test("isLoopbackHost accepts exactly the three loopback spellings, in any case and with IPv6 brackets", () => {
+  for (const host of ["127.0.0.1", "localhost", "LOCALHOST", "LocalHost", "::1", "[::1]"]) {
+    assert.equal(isLoopbackHost(host), true, host);
+  }
+});
+
+test("isLoopbackHost rejects wildcards, other loopback-looking addresses and names", () => {
+  const hosts = [
+    "0.0.0.0",
+    "::",
+    "[::]",
+    "::0",
+    "127.0.0.2",
+    "127.1",
+    "::ffff:127.0.0.1",
+    "0:0:0:0:0:0:0:1",
+    "example.test",
+    "192.168.1.5",
+    "localhost.example.test",
+    "localhost.",
+    " localhost",
+    "",
+  ];
+  for (const host of hosts) assert.equal(isLoopbackHost(host), false, JSON.stringify(host));
+});
+
+test("the project config file is .pi/pi-mlx-models.json relative to the working directory", () => {
+  assert.equal(PROJECT_CONFIG_RELPATH, join(".pi", "pi-mlx-models.json"));
 });

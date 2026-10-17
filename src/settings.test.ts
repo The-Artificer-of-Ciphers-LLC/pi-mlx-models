@@ -11,9 +11,11 @@ import {
   cliFlagSpecs,
   describeFlags,
   formatConfigErrors,
+  formatProjectRefusal,
   prepareSettings,
   readLayerFile,
   toLaunchSpec,
+  trustRisks,
   type LayerFile,
   type PrepareInput,
   type Prepared,
@@ -1089,4 +1091,297 @@ test("server.allowedOrigins is a known key: it is not reported as unknown and no
   assert.deepEqual(resolved({ global: ok({ server: {} }) }).prepared.flags, []);
   const lines = refused({ global: ok({ server: { allowedOrigin: ["http://a.test"] } }) });
   assert.ok(lines[0].includes("did you mean server.allowedOrigins?"), lines[0]);
+});
+
+// ---- server.trustRemoteCode: a bare boolean flag (D-08, D-01) ----
+
+const TRUST_FLAG = "--trust-remote-code";
+
+test("server.trustRemoteCode: true in a file is emitted as the bare flag, false is never emitted", () => {
+  const on = resolved({ global: ok({ server: { trustRemoteCode: true } }) });
+  assert.deepEqual(
+    on.prepared.flags.map((flag) => [flag.path, flag.flag, flag.args, flag.display, flag.label]),
+    [["server.trustRemoteCode", TRUST_FLAG, [TRUST_FLAG], "", "global file"]],
+  );
+  assert.deepEqual(toLaunchSpec(buildOk(on.prepared)).extraArgs, [TRUST_FLAG]);
+  const off = resolved({ global: ok({ server: { trustRemoteCode: false } }) });
+  assert.deepEqual(off.prepared.flags, []);
+  assert.deepEqual(toLaunchSpec(buildOk(off.prepared)).extraArgs, []);
+  assert.equal(describeFlags(buildOk(off.prepared)), "");
+});
+
+test("server.trustRemoteCode: anything but a JSON boolean in a file is an error", () => {
+  for (const value of ["true", "false", 1, 0, null, [], {}]) {
+    const lines = refused({ global: ok({ server: { trustRemoteCode: value } }) });
+    assert.equal(lines.length, 1, JSON.stringify(value));
+    assert.ok(lines[0].startsWith(`server.trustRemoteCode (${GLOBAL}):`), lines[0]);
+    assert.ok(lines[0].includes("must be true or false"), lines[0]);
+    assert.ok(lines[0].endsWith(`(flag ${TRUST_FLAG})`), lines[0]);
+  }
+});
+
+test("server.trustRemoteCode is accepted on /mlx-start as a flag that takes no value", () => {
+  const specs = cliFlagSpecs();
+  assert.deepEqual(
+    specs.find((spec) => spec.flag === TRUST_FLAG),
+    { flag: TRUST_FLAG, path: "server.trustRemoteCode", takesValue: false },
+  );
+  for (const spec of specs) if (spec.flag !== TRUST_FLAG) assert.equal(spec.takesValue, true, spec.flag);
+});
+
+test("server.trustRemoteCode: the bare flag typed on /mlx-start turns it on and is labelled with the command", () => {
+  const { prepared } = resolved({ args: { "server.trustRemoteCode": true } });
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [TRUST_FLAG]);
+  assert.equal(describeFlags(buildOk(prepared)), `flags: ${TRUST_FLAG} (/mlx-start)`);
+});
+
+test("server.trustRemoteCode: text other than true is an error labelled with the flag", () => {
+  assert.deepEqual(refused({ args: { "server.trustRemoteCode": "yes" } }), [
+    `server.trustRemoteCode (/mlx-start ${TRUST_FLAG}): "yes" must be true or false`,
+  ]);
+  assert.deepEqual(toLaunchSpec(buildOk(resolved({ args: { "server.trustRemoteCode": "true" } }).prepared)).extraArgs, [TRUST_FLAG]);
+});
+
+test("server.trustRemoteCode has no environment variable and no pi flag: nothing but a file or the command turns it on", () => {
+  const row = SETTINGS.find((setting) => setting.path === "server.trustRemoteCode");
+  assert.ok(row);
+  assert.equal(row.env, undefined);
+  assert.equal(row.piFlag, undefined);
+  const { prepared } = resolved({ env: { PI_MLX_MODELS_TRUST_REMOTE_CODE: "true" }, piFlags: { "mlx-trust-remote-code": "true" } });
+  assert.deepEqual(prepared.flags, []);
+});
+
+test("server.trustRemoteCode: the flag sits after the log level in the launch arguments", () => {
+  const { prepared } = resolved({ global: ok({ server: { trustRemoteCode: true, logLevel: "DEBUG" } }) });
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--log-level=DEBUG", TRUST_FLAG]);
+});
+
+test("server.trustRemoteCode: a project file value beats the global file and a command-line flag beats both", () => {
+  const global = ok({ server: { trustRemoteCode: true } });
+  const project = ok({ server: { trustRemoteCode: false } });
+  assert.deepEqual(resolved({ global, project }).prepared.flags, []);
+  assert.equal(resolved({ global, project, args: { "server.trustRemoteCode": true } }).prepared.flags[0].label, "/mlx-start");
+});
+
+// ---- the project file may never enable code execution or network exposure (D-16, CFG-06) ----
+
+const violationsOf = (project: LayerFile, extra: Partial<PrepareInput> = {}) => resolved({ project, ...extra }).prepared.projectViolations;
+
+test("a project file with server.trustRemoteCode true is a violation; false and absence are not", () => {
+  assert.deepEqual(violationsOf(ok({ server: { trustRemoteCode: true } })), [
+    { path: "server.trustRemoteCode", shown: "", reason: "lets the model repository run Python code" },
+  ]);
+  assert.deepEqual(violationsOf(ok({ server: { trustRemoteCode: false } })), []);
+  assert.deepEqual(violationsOf(ok({ server: {} })), []);
+  assert.deepEqual(resolved().prepared.projectViolations, []);
+});
+
+test("a project file host is a violation unless it is one of the loopback spellings", () => {
+  for (const host of ["0.0.0.0", "::", "[::]", "::0", "example.test", "192.168.1.5", "127.0.0.2", "::ffff:127.0.0.1"]) {
+    assert.deepEqual(
+      violationsOf(ok({ server: { host } })),
+      [{ path: "server.host", shown: host, reason: "listens on a non-loopback address" }],
+      host,
+    );
+  }
+  for (const host of ["127.0.0.1", "localhost", "LocalHost", "::1", "[::1]"]) {
+    assert.deepEqual(violationsOf(ok({ server: { host } })), [], host);
+  }
+});
+
+test("a project file baseUrl is a violation unless its host is loopback", () => {
+  for (const baseUrl of ["http://example.test:8080/v1", "https://example.test/v1", "http://0.0.0.0:8080/v1", "http://192.168.1.5:8080/v1"]) {
+    assert.deepEqual(
+      violationsOf(ok({ baseUrl })),
+      [{ path: "baseUrl", shown: baseUrl, reason: "sends prompts to a non-loopback address" }],
+      baseUrl,
+    );
+  }
+  for (const baseUrl of ["http://localhost:9999/v1", "http://[::1]:9000/v1", "http://127.0.0.1:8080/v1", "http://LOCALHOST:1/v1"]) {
+    assert.deepEqual(violationsOf(ok({ baseUrl })), [], baseUrl);
+  }
+});
+
+test("the project check is on the file's own content: a higher layer overriding the value does not launder it", () => {
+  const project = ok({ server: { host: "0.0.0.0", trustRemoteCode: true } });
+  const viaEnv = resolved({ project, env: { PI_MLX_MODELS_HOST: "127.0.0.1" } });
+  assert.equal(viaEnv.prepared.address.host, "127.0.0.1");
+  assert.deepEqual(
+    viaEnv.prepared.projectViolations.map((violation) => violation.path),
+    ["server.trustRemoteCode", "server.host"],
+  );
+  const viaArgs = resolved({ project, args: { "server.host": "localhost" }, piFlags: { "mlx-host": "localhost" } });
+  assert.equal(viaArgs.prepared.projectViolations.length, 2);
+});
+
+test("violations are listed in the order trustRemoteCode, host, baseUrl", () => {
+  const project = ok({ baseUrl: "http://example.test/v1", server: { host: "0.0.0.0", trustRemoteCode: true } });
+  assert.deepEqual(
+    violationsOf(project).map((violation) => violation.path),
+    ["server.trustRemoteCode", "server.host", "baseUrl"],
+  );
+});
+
+test("risky values in the global file are never project violations", () => {
+  const global = ok({ baseUrl: "http://example.test/v1", server: { host: "0.0.0.0", trustRemoteCode: true } });
+  assert.deepEqual(resolved({ global }).prepared.projectViolations, []);
+});
+
+test("a project file that fails validation is an error, not a violation", () => {
+  const lines = refused({ project: ok({ server: { host: "0.0.0.0", trustRemoteCode: "yes" } }) });
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].startsWith(`server.trustRemoteCode (${PROJECT}):`), lines[0]);
+});
+
+test("a violation's echoed value is cleaned of control characters and clipped", () => {
+  const baseUrl = `http://example.test/${"a".repeat(300)}\u001b[31m`;
+  const [violation] = violationsOf(ok({ baseUrl }));
+  assert.ok(violation, "the remote base URL must be a violation");
+  assert.ok(!CONTROL_CHARACTERS.test(violation.shown), JSON.stringify(violation.shown));
+  assert.ok(violation.shown.length <= 60, `${violation.shown.length}`);
+});
+
+// ---- trust risks: what needs a confirm on every start (D-13, D-14, D-17) ----
+
+const kindsOf = (input: Partial<PrepareInput>) => trustRisks(resolved(input).prepared).map((risk) => risk.kind);
+
+test("trustRemoteCode from the global file or the command line is a risk with the right source label", () => {
+  const [fromGlobal] = trustRisks(resolved({ global: ok({ server: { trustRemoteCode: true } }) }).prepared);
+  assert.deepEqual(fromGlobal, {
+    kind: "trustRemoteCode",
+    phrase: "--trust-remote-code",
+    title: "Allow remote code from the model repository?",
+    message:
+      "--trust-remote-code (from global file) lets the model repository run Python code on this machine. Only continue for repositories you trust.",
+  });
+  const [fromArgs] = trustRisks(resolved({ args: { "server.trustRemoteCode": true } }).prepared);
+  assert.ok(fromArgs.message.startsWith("--trust-remote-code (from /mlx-start) lets the model repository"), fromArgs.message);
+  assert.deepEqual(kindsOf({ global: ok({ server: { trustRemoteCode: false } }) }), []);
+});
+
+test("a non-loopback host is a risk whichever layer except the project file supplied it", () => {
+  const message = (source: string, host = "0.0.0.0", port = 8080) =>
+    `The MLX server will listen on ${host}:${port} (from ${source}), reachable from your network. mlx_lm.server has no authentication.`;
+  const env = trustRisks(resolved({ env: { PI_MLX_MODELS_HOST: "0.0.0.0" } }).prepared);
+  assert.deepEqual(env, [
+    { kind: "host", phrase: "listening on 0.0.0.0", title: "Listen on a non-loopback address?", message: message("env PI_MLX_MODELS_HOST") },
+  ]);
+  assert.ok(trustRisks(resolved({ piFlags: { "mlx-host": "::" } }).prepared)[0].message.includes("(from pi flag --mlx-host)"));
+  assert.equal(
+    trustRisks(resolved({ args: { "server.host": "0.0.0.0", "server.port": "9000" } }).prepared)[0].message,
+    message("/mlx-start", "0.0.0.0", 9000),
+  );
+  assert.equal(
+    trustRisks(resolved({ global: ok({ server: { host: "example.test" } }) }).prepared)[0].message,
+    message("global file", "example.test"),
+  );
+});
+
+test("an IPv6 wildcard host is shown bracketed in front of the port", () => {
+  const [risk] = trustRisks(resolved({ env: { PI_MLX_MODELS_HOST: "::" } }).prepared);
+  assert.ok(risk.message.startsWith("The MLX server will listen on [::]:8080 (from env PI_MLX_MODELS_HOST)"), risk.message);
+  assert.equal(risk.phrase, "listening on ::");
+});
+
+test("a non-loopback base URL from the global file or the environment is a risk", () => {
+  const [fromGlobal] = trustRisks(resolved({ global: ok({ baseUrl: "http://example.test/v1" }) }).prepared);
+  assert.deepEqual(fromGlobal, {
+    kind: "baseUrl",
+    phrase: "sending prompts to http://example.test/v1",
+    title: "Send prompts to a non-loopback address?",
+    message: "pi will send your conversation to http://example.test/v1 (from global file), which is not on this machine.",
+  });
+  const [fromEnv] = trustRisks(resolved({ env: { PI_MLX_MODELS_BASE_URL: "https://example.test:9000/v1" } }).prepared);
+  assert.ok(fromEnv.message.includes("(from env PI_MLX_MODELS_BASE_URL)"), fromEnv.message);
+});
+
+test("only the effective value counts: a loopback project value over a risky global one is no risk", () => {
+  assert.deepEqual(kindsOf({ global: ok({ server: { host: "0.0.0.0" } }), project: ok({ server: { host: "127.0.0.1" } }) }), []);
+  assert.deepEqual(
+    kindsOf({ global: ok({ baseUrl: "http://example.test/v1" }), project: ok({ baseUrl: "http://localhost:8080/v1" }) }),
+    [],
+  );
+  assert.deepEqual(
+    kindsOf({ global: ok({ server: { trustRemoteCode: true } }), project: ok({ server: { trustRemoteCode: false } }) }),
+    [],
+  );
+});
+
+test("a value that comes from the project file is not a trust risk (the project check refuses it instead)", () => {
+  const project = ok({ baseUrl: "http://example.test/v1", server: { host: "0.0.0.0", trustRemoteCode: true } });
+  assert.deepEqual(kindsOf({ project }), []);
+});
+
+test("a risky value in a higher layer than a risky project value is a risk and the project still violates", () => {
+  const project = ok({ server: { host: "0.0.0.0" } });
+  const { prepared } = resolved({ project, env: { PI_MLX_MODELS_HOST: "::" } });
+  assert.deepEqual(
+    trustRisks(prepared).map((risk) => risk.kind),
+    ["host"],
+  );
+  assert.equal(prepared.projectViolations.length, 1);
+});
+
+test("defaults and loopback values everywhere produce no risk", () => {
+  assert.deepEqual(kindsOf({}), []);
+  assert.deepEqual(
+    kindsOf({
+      env: { PI_MLX_MODELS_HOST: "127.0.0.1", PI_MLX_MODELS_BASE_URL: "http://localhost:8080/v1" },
+      global: ok({ server: { host: "::1" } }),
+      args: { "server.port": "9000" },
+    }),
+    [],
+  );
+});
+
+test("a wildcard host without an explicit base URL is a host risk only: the derived URL is not a setting", () => {
+  assert.deepEqual(kindsOf({ env: { PI_MLX_MODELS_HOST: "0.0.0.0" } }), ["host"]);
+});
+
+test("several risks come in the order trustRemoteCode, host, baseUrl", () => {
+  assert.deepEqual(
+    kindsOf({
+      global: ok({ baseUrl: "http://example.test/v1", server: { trustRemoteCode: true } }),
+      env: { PI_MLX_MODELS_HOST: "0.0.0.0" },
+    }),
+    ["trustRemoteCode", "host", "baseUrl"],
+  );
+});
+
+test("risk texts contain no control characters even for a base URL that carries them", () => {
+  const baseUrl = "http://example.test/v1\u001b[31m\u0007";
+  const risks = trustRisks(resolved({ global: ok({ baseUrl }) }).prepared);
+  assert.equal(risks.length, 1);
+  for (const text of [risks[0].message, risks[0].phrase, risks[0].title]) assert.ok(!CONTROL_CHARACTERS.test(text), JSON.stringify(text));
+});
+
+test("a long base URL is shown in full up to 300 characters so its host cannot be hidden by clipping", () => {
+  const baseUrl = `http://localhost.${"a".repeat(100)}.example.test/v1`;
+  const [risk] = trustRisks(resolved({ global: ok({ baseUrl }) }).prepared);
+  assert.ok(risk, "a look-alike host is not loopback");
+  assert.ok(risk.message.includes(baseUrl), risk.message);
+});
+
+test("formatProjectRefusal lists every violation with its key and ends with the move-to-global line", () => {
+  const project = ok({ baseUrl: "http://example.test/v1", server: { host: "0.0.0.0", trustRemoteCode: true } });
+  const text = formatProjectRefusal(violationsOf(project), "/home/u/.pi/agent/pi-mlx-models/config.json");
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+      "  server.trustRemoteCode: lets the model repository run Python code",
+      "  server.host (0.0.0.0): listens on a non-loopback address",
+      "  baseUrl (http://example.test/v1): sends prompts to a non-loopback address",
+      "Move them to /home/u/.pi/agent/pi-mlx-models/config.json; starting then asks for confirmation.",
+    ].join("\n"),
+  );
+});
+
+test("formatProjectRefusal strips control characters from echoed values and from the path", () => {
+  const text = formatProjectRefusal(
+    [{ path: "server.host", shown: "bad\u001b[31m\nhost", reason: "listens on a non-loopback address" }],
+    "/tmp/\u001b[0mconfig.json",
+  );
+  assert.ok(!CONTROL_CHARACTERS.test(text.replace(/\n/g, "")), JSON.stringify(text));
+  assert.equal(text.split("\n").length, 3);
 });

@@ -431,6 +431,16 @@ export interface Prepared {
   defaultModel: string;
   /** Every row with an mlx flag that some layer set to a value other than its default, in schema order. */
   flags: LaunchFlag[];
+  /** What the project file asked for that it may never ask for; decided on its own content before any merge (D-16). */
+  projectViolations: ProjectViolation[];
+}
+
+/** One setting in the project file that enables running code or opening the network. */
+export interface ProjectViolation {
+  path: string;
+  /** The offending value, cleaned and clipped; empty for a boolean. */
+  shown: string;
+  reason: string;
 }
 
 export type PrepareResult =
@@ -581,7 +591,7 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
 
   return {
     ok: true,
-    prepared: { address, baseUrl, defaultModel: String(value("defaultModel") ?? DEFAULT_MODEL_ID), flags },
+    prepared: { address, baseUrl, defaultModel: String(value("defaultModel") ?? DEFAULT_MODEL_ID), flags, projectViolations: [] },
     warnings,
   };
 }
@@ -628,4 +638,23 @@ export function formatConfigErrors(errors: readonly string[]): string {
   const more = errors.length - MAX_REPORT_LINES;
   if (more > 0) lines.push(`  ...and ${more} more problem${more === 1 ? "" : "s"}`);
   return lines.join("\n");
+}
+
+/** A setting that needs the user's confirmation on every start because it runs code or opens the network (D-13). */
+export interface TrustRisk {
+  kind: "trustRemoteCode" | "host" | "baseUrl";
+  /** The short phrase used in the refusal and cancel notices. */
+  phrase: string;
+  title: string;
+  message: string;
+}
+
+/** The risks in the effective values that come from any layer except the project file. */
+export function trustRisks(_prepared: Prepared): TrustRisk[] {
+  return [];
+}
+
+/** The text that refuses a project file asking for a risky setting, without the "mlx-start failed: " prefix. */
+export function formatProjectRefusal(_violations: readonly ProjectViolation[], _globalConfigPath: string): string {
+  return "";
 }

@@ -71,6 +71,15 @@ function normalizeHost(host: string): string {
   return bare.toLowerCase();
 }
 
+/**
+ * True only for the three spellings of this machine's own loopback address: 127.0.0.1, localhost and ::1
+ * (case-insensitive, brackets stripped). Everything else is non-loopback, including the wildcards 0.0.0.0 and ::,
+ * other 127.x addresses and IPv4-mapped IPv6: the rule is deliberately conservative (D-17).
+ */
+export function isLoopbackHost(_host: string): boolean {
+  return false;
+}
+
 function hostsMatch(urlHost: string, launchHost: string): boolean {
   if (urlHost === launchHost) return true;
   if (LOOPBACK_HOSTS.has(urlHost) && LOOPBACK_HOSTS.has(launchHost)) return true;
@@ -116,6 +125,8 @@ export function envText(raw: string | undefined): string | undefined {
   return raw?.trim() || undefined;
 }
 
+/** The project-level config file, relative to the working directory of the command (never searched for in parents). */
+export const PROJECT_CONFIG_RELPATH = join(".pi", "pi-mlx-models.json");
 export const PROVIDER_ID = "pi-mlx-models";
 export const DATA_DIR = join(
   resolveAgentDir({
