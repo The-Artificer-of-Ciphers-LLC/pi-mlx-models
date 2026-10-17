@@ -683,3 +683,24 @@ test("a death message does not wait forever when close never arrives", async () 
 
   await assert.rejects(started, /exited \(code 1\).*ModuleNotFoundError/s);
 });
+
+// WR-06: C1 controls (U+0080-U+009F, including CSI U+009B) are interpreted by some terminals.
+test("diagnostic text has C1 control characters removed", async () => {
+  const { host, procs } = makeHost({
+    fetch: async () => {
+      throw new Error("refused");
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const started = server.start("m");
+  await tick();
+  procs[0].stderr.emit("data", "red\u009b31mtext\u0085more");
+  procs[0].stdout.emit("data", "out\u009dput");
+  procs[0].die(1);
+
+  await assert.rejects(started, (err: Error) => {
+    assert.doesNotMatch(err.message, /[\u0080-\u009f]/, "no C1 control character may reach the message");
+    assert.match(err.message, /red/);
+    return true;
+  });
+});

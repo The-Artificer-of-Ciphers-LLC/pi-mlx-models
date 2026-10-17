@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { BASE_URL, HF_HOME, HOST, PORT, VENV_PYTHON } from "./config.js";
+import { clipDiagnostic } from "./diagnostic.js";
 import { probePort, waitForPortFree } from "./port.js";
 
 export type ServerEvent =
@@ -81,16 +82,6 @@ export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
 }
 
 const systemHost = createSystemHost();
-
-/**
- * Untrusted text (child output, response bodies) is shown in pi's UI, so it is clipped and has
- * C0 control characters other than newline and tab, and DEL, replaced by a space so a terminal
- * escape sequence cannot be injected. `from` picks which end survives the clip.
- */
-const clipDiagnostic = (text: string, max: number, from: "start" | "end" = "end"): string => {
-  const clean = text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ").trim();
-  return from === "end" ? clean.slice(-max) : clean.slice(0, max);
-};
 
 export function createMlxServer(
   options: {

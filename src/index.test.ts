@@ -586,3 +586,15 @@ test("a failed install also leaves a failed status rather than an empty one", as
 
   assert.equal(lastStatus(statuses), "mlx: failed");
 });
+
+// WR-06: discovered model ids come from the local server and are rendered as the model name.
+test("a discovered model id with control characters is cleaned in the display name only", async () => {
+  const hostile = "org/model\u001b]0;pwned\u0007\u009b31m";
+  const { providerCalls } = await setup({ discovered: [hostile] });
+
+  const [model] = providerCalls.at(-1)!.config.models as Array<{ id: string; name: string }>;
+
+  assert.equal(model.id, hostile, "the id is what the server expects and stays as discovered");
+  assert.doesNotMatch(model.name, /[\u0000-\u001f\u007f-\u009f]/);
+  assert.match(model.name, /^org\/model/);
+});

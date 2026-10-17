@@ -244,3 +244,40 @@ test("run reports stderr that a lingering grandchild writes after the child has 
 
   await assert.rejects(run(process.execPath, ["-e", child]), /LATE-TAIL/);
 });
+
+// WR-06: pip output is untrusted text that reaches the UI.
+test("pip progress lines are cleaned of control characters before they become event details", async () => {
+  const { host } = fakeHost({
+    venv: true,
+    run: async (_cmd, _args, onLine) => {
+      onLine?.("\u001b[31mDownloading\u009b31m 42%\u0007");
+    },
+  });
+  const events: RuntimeEvent[] = [];
+
+  await ensureInstalled({ host, upgrade: true, onEvent: (e) => events.push(e) });
+
+  const details = events.filter((e) => e.phase === "pip" && e.detail?.includes("Downloading")).map((e) => e.detail ?? "");
+  assert.ok(details.length > 0, "premise: the scripted line reached an event");
+  for (const detail of details) assert.doesNotMatch(detail, /[\u0000-\u001f\u007f-\u009f]/);
+});
+
+test("run's failure message is cleaned of control characters", async () => {
+  const script = "process.stderr.write('\\u001b[31mpip exploded\\u009b31m\\u0007'); process.exit(1)";
+
+  await assert.rejects(run(process.execPath, ["-e", script]), (err: Error) => {
+    assert.match(err.message, /pip exploded/);
+    assert.doesNotMatch(err.message, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+    return true;
+  });
+});
+
+test("run's onLine lines are cleaned of control characters", async () => {
+  const script = "process.stdout.write('\\u001b[2Kline\\u009b\\n')";
+  const lines: string[] = [];
+
+  await run(process.execPath, ["-e", script], (line) => lines.push(line));
+
+  assert.ok(lines.some((l) => l.includes("line")));
+  for (const line of lines) assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f]/);
+});
