@@ -105,14 +105,30 @@ export function createMlxServer(
   const portReleaseTimeoutMs = options.portReleaseTimeoutMs ?? 10_000;
   const portPollMs = options.portPollMs ?? 200;
 
-  type Current = { proc: ServerProcess; exited: boolean; exitCode: number | null; stderrTail: string; onExit: Promise<void> };
+  type Current = {
+    proc: ServerProcess;
+    exited: boolean;
+    exitCode: number | null;
+    stderrTail: string;
+    onExit: Promise<void>;
+    /** Set when stderr reported an address-in-use bind failure; the process is then being terminated. */
+    fatal?: string;
+  };
   let current: Current | null = null;
+
+  /**
+   * mlx_lm.server stays alive after it fails to bind (the OSError ends the main thread but a
+   * non-daemon worker thread keeps the interpreter running), so liveness alone cannot catch a
+   * bind conflict. The message is matched against the rolling stderr tail so a split line is caught.
+   */
+  const BIND_FAILURE = /Address already in use|Errno (?:48|98)\b/;
 
   const describeDeath = (c: Current) =>
     `MLX server exited (code ${c.exitCode ?? "unknown"})${c.stderrTail.trim() ? `: ${c.stderrTail.trim().slice(-400)}` : ""}`;
 
-  /** Throws when `c` died or was replaced/stopped while a start was waiting on it. */
+  /** Throws when `c` failed to bind, died, or was replaced/stopped while a start was waiting on it. */
   const assertAlive = (c: Current) => {
+    if (c.fatal) throw new Error(c.fatal);
     if (c.exited) throw new Error(describeDeath(c));
     if (current !== c) throw new Error("MLX server start was cancelled");
   };
@@ -132,12 +148,17 @@ export function createMlxServer(
     const start = Date.now();
     while (Date.now() - start < healthTimeoutMs) {
       assertAlive(c);
+      let ok = false;
       try {
         const res = await host.fetch(`${baseUrl}/models`);
-        if (res.ok) return;
+        ok = res.ok;
       } catch {
         // retry
       }
+      // A response only counts while the process we spawned is still alive: an old listener
+      // on the port can keep answering after the new process died (D-06).
+      assertAlive(c);
+      if (ok) return;
       await host.sleep(healthPollMs);
     }
     assertAlive(c);
@@ -148,6 +169,7 @@ export function createMlxServer(
     const start = Date.now();
     while (Date.now() - start < warmupTimeoutMs) {
       assertAlive(c);
+      let ok = false;
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 120_000);
@@ -165,15 +187,25 @@ export function createMlxServer(
             signal: controller.signal,
           })
           .finally(() => clearTimeout(timer));
-        if (res.ok) return;
+        ok = res.ok;
       } catch {
         // still loading/downloading
       }
+      assertAlive(c); // same rule as the health check: never ready on a dead process's say-so
+      if (ok) return;
       await host.sleep(warmupPollMs);
     }
     assertAlive(c);
     throw new Error("Model did not become inference-ready in time");
   }
+
+  /** Wait up to `killWaitMs` for a SIGTERMed child to exit; if it does not, SIGKILL it and wait once more. */
+  const awaitExit = async (c: Current): Promise<void> => {
+    await Promise.race([c.onExit, host.sleep(killWaitMs)]);
+    if (c.exited) return;
+    c.proc.kill("SIGKILL");
+    await Promise.race([c.onExit, host.sleep(killWaitMs)]);
+  };
 
   /**
    * SIGTERM, then SIGKILL after `killWaitMs`, each followed by a bounded wait for the exit
@@ -182,11 +214,7 @@ export function createMlxServer(
   const terminate = async (c: Current): Promise<void> => {
     if (!c.exited) {
       c.proc.kill("SIGTERM");
-      await Promise.race([c.onExit, host.sleep(killWaitMs)]);
-      if (!c.exited) {
-        c.proc.kill("SIGKILL");
-        await Promise.race([c.onExit, host.sleep(killWaitMs)]);
-      }
+      await awaitExit(c);
     }
     // A child that survived SIGKILL still holds the port; there is nothing more to wait for.
     if (!c.exited) return;
@@ -258,6 +286,11 @@ export function createMlxServer(
       proc.stderr?.on("data", (chunk) => {
         const text = chunk.toString();
         c.stderrTail = (c.stderrTail + text).slice(-800);
+        if (current === c && !c.fatal && BIND_FAILURE.test(c.stderrTail)) {
+          // The message deliberately omits the raw stderr text.
+          c.fatal = `Port ${address.port} on ${address.host} is already in use, so the MLX server could not bind it. Set PI_MLX_MODELS_PORT to use a different port.`;
+          c.proc.kill("SIGTERM");
+        }
         if (current === c) parseStderr(text, emit);
       });
       proc.on("exit", (code) => {
@@ -272,11 +305,17 @@ export function createMlxServer(
       });
 
       emit({ type: "launched" });
-      await waitForServer(c);
-      emit({ type: "loading" });
-      emit({ type: "warming" });
-      await waitForInferenceReady(c, model);
-      emit({ type: "ready" });
+      try {
+        await waitForServer(c);
+        emit({ type: "loading" });
+        emit({ type: "warming" });
+        await waitForInferenceReady(c, model);
+        emit({ type: "ready" });
+      } catch (error) {
+        // A bind failure leaves the real server alive; make sure it is gone (and has said so) before reporting.
+        if (c.fatal && !c.exited) await awaitExit(c);
+        throw error;
+      }
     },
   };
 }

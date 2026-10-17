@@ -157,6 +157,7 @@ test("a squatter answering /v1/models cannot make a stub that failed to bind loo
     baseUrl: `http://127.0.0.1:${port}/v1`,
     healthPollMs: 25,
     warmupPollMs: 25,
+    killWaitMs: 1000,
   });
   const events: string[] = [];
 
