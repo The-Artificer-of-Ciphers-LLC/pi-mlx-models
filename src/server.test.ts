@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { createMlxServer, type ServerEvent, type ServerHost, type ServerProcess } from "./server.js";
+import { createMlxServer, createSystemHost, type ServerEvent, type ServerHost, type ServerProcess } from "./server.js";
 
 class FakeProc extends EventEmitter implements ServerProcess {
   stderr = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
@@ -703,4 +703,23 @@ test("diagnostic text has C1 control characters removed", async () => {
     assert.match(err.message, /red/);
     return true;
   });
+});
+
+// IN-02: the real host's sleep must not keep the process alive after the awaited child has exited.
+test("the system host's sleep timer does not keep the process alive", async () => {
+  const realSetTimeout = globalThis.setTimeout;
+  let seen: { hasRef(): boolean } | undefined;
+  globalThis.setTimeout = ((handler: () => void, ms?: number) => {
+    const timer = realSetTimeout(handler, ms);
+    seen = timer;
+    return timer;
+  }) as typeof setTimeout;
+  try {
+    const sleeping = createSystemHost().sleep(1);
+    assert.ok(seen, "premise: sleep scheduled a timer");
+    assert.equal(seen.hasRef(), false);
+    await sleeping;
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
 });
