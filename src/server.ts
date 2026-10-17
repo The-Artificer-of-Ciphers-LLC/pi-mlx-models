@@ -344,6 +344,10 @@ export function createMlxServer(
       } catch (error) {
         // A bind failure leaves the real server alive; make sure it is gone (and has said so) before reporting.
         if (c.fatal && !c.exited) await awaitExit(c);
+        // Any other failure (fatal warm-up status, health or warm-up timeout) must not leave the
+        // child this start spawned running. When `current !== c`, a stop() or a newer start already
+        // owns the teardown and must not be interfered with.
+        if (current === c) await stop();
         throw error;
       }
     },

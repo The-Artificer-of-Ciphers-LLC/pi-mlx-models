@@ -528,6 +528,15 @@ test("every request carries its own AbortSignal, distinct for health and warm-up
   assert.equal(warmup.aborted, false);
 });
 
+/**
+ * Poll waits advance the mocked clock so a health or warm-up window elapses without real waiting;
+ * once the child has been signalled the wait is an ordinary tick, so its exit settles first.
+ */
+async function pollSleep(t: { mock: { timers: { tick(ms: number): void } } }, proc: () => FakeProc | undefined) {
+  if (proc()?.killed === undefined) t.mock.timers.tick(60_000);
+  else await tick();
+}
+
 // CR-01: a start that fails after spawning must not leave its own child behind.
 for (const status of [400, 500]) {
   test(`a warm-up answered with HTTP ${status} stops the child it spawned and leaves the server not running`, async () => {
@@ -550,8 +559,7 @@ test("a health timeout stops the child it spawned and leaves the server not runn
     fetch: async () => {
       throw new Error("refused");
     },
-    // Each poll wait advances the mocked clock, so the health window elapses without real waiting.
-    sleep: async () => t.mock.timers.tick(60_000),
+    sleep: () => pollSleep(t, () => procs[0]),
   });
   const server = createMlxServer({ ...opts, host });
 
@@ -568,7 +576,7 @@ test("a warm-up timeout stops the child it spawned and leaves the server not run
       if (String(url).endsWith("/models")) return new Response("{}", { status: 200 });
       throw new Error("still loading");
     },
-    sleep: async () => t.mock.timers.tick(60_000),
+    sleep: () => pollSleep(t, () => procs[0]),
   });
   const server = createMlxServer({ ...opts, host });
 

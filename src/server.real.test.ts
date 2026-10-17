@@ -248,6 +248,11 @@ test("a warm-up answered with HTTP 400 fails within seconds showing the server's
     return true;
   });
   assert.ok(Date.now() - startedAt < 5000, "a 4xx warm-up must fail fast instead of polling");
+  assert.equal(server.running, false);
+  assert.ok(
+    children[0].exitCode !== null || children[0].signalCode !== null,
+    "the failed start must have stopped the stub it spawned",
+  );
 });
 
 test("a long warm-up error body from the server is truncated to 400 characters", { timeout: 30_000 }, async (t) => {
