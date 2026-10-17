@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { createExtension } from "./index.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { createMlxServer, createSystemHost, type ServerHost } from "./server.js";
-import { connectRefused, freePort, makeCtx, makeFakePi, stubArgs } from "./testkit.js";
+import { connectRefused, freePort, makeCtx, makeFakePi, stubArgs, type CtxOptions } from "./testkit.js";
 
 /**
  * End-to-end proof of the layered-config path: a value written in the global config file reaches the
@@ -19,7 +19,7 @@ const QWEN = MODEL_PRESETS[3];
 
 type Settings = Record<string, string | undefined>;
 
-async function harness(t: TestContext, env: Settings = {}) {
+async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOptions = {}) {
   const dir = mkdtempSync(join(tmpdir(), "pi-mlx-e2e-"));
   const globalConfigPath = join(dir, "data", "config.json");
   const argvFile = join(dir, "argv.json");
@@ -57,7 +57,7 @@ async function harness(t: TestContext, env: Settings = {}) {
     shutdownWaitMs: 1000,
   });
   const fakePi = makeFakePi();
-  const fakeCtx = makeCtx();
+  const fakeCtx = makeCtx(undefined, ctxOptions);
   await extension(fakePi.pi);
 
   return {
@@ -71,6 +71,11 @@ async function harness(t: TestContext, env: Settings = {}) {
     writeConfig(value: unknown) {
       mkdirSync(dirname(globalConfigPath), { recursive: true });
       writeFileSync(globalConfigPath, JSON.stringify(value));
+    },
+    /** Write the working directory's own `.pi/pi-mlx-models.json`. */
+    writeProject(value: unknown) {
+      mkdirSync(join(fakeCtx.ctx.cwd, ".pi"), { recursive: true });
+      writeFileSync(join(fakeCtx.ctx.cwd, ".pi", "pi-mlx-models.json"), JSON.stringify(value));
     },
     argv: (): string[] => JSON.parse(readFileSync(argvFile, "utf8")),
     start: (input = "qwen3_4b") => fakePi.commands.get("mlx-start")!(input, fakeCtx.ctx),
@@ -224,6 +229,114 @@ test("a refused command line spawns nothing", { timeout: 30_000 }, async (t) => 
   assert.equal(errors.length, 2);
   assert.ok(errors[0].message.startsWith("mlx-start failed: invalid configuration"), errors[0].message);
   assert.ok(errors[1].message.startsWith("mlx-start failed: unknown flag --bogus"), errors[1].message);
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+});
+
+// ---- the project file layer and the trust boundary (plan 02-05: CFG-01, CFG-06) ----
+
+/** An env that puts the stub on a free port, so no test ever binds the default port 8080. */
+const onFreePort = async (): Promise<{ env: Settings; port: number }> => {
+  const port = await freePort();
+  return { env: { PI_MLX_MODELS_PORT: String(port) }, port };
+};
+
+test("a project file in the working directory beats the global file, and the flags line says so", { timeout: 30_000 }, async (t) => {
+  const { env, port } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeConfig({ server: { logLevel: "INFO" } });
+  h.writeProject({ server: { logLevel: "DEBUG" } });
+
+  await h.start();
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--log-level=DEBUG"]);
+  assert.match(startNotes(h.notes)[0].message, /\nflags: --port \d+ \(env PI_MLX_MODELS_PORT\), --log-level DEBUG \(project file\)$/);
+  assert.equal(h.confirms.length, 0);
+});
+
+test("a project file that turns on trustRemoteCode spawns nothing, installs nothing and asks nothing", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeProject({ server: { trustRemoteCode: true } });
+
+  await h.start();
+
+  const errors = h.notes.filter((n) => n.type === "error");
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0].message.includes("server.trustRemoteCode: lets the model repository run Python code"), errors[0].message);
+  assert.ok(errors[0].message.includes(".pi/pi-mlx-models.json"), errors[0].message);
+  assert.ok(errors[0].message.endsWith(`Move them to ${h.globalConfigPath}; starting then asks for confirmation.`), errors[0].message);
+  assert.equal(h.confirms.length, 0, "no prompt can override a project file");
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+  assert.equal(h.providerCalls.length, 1, "only the initial provider registration");
+});
+
+test("a project file with a wildcard host or a remote base URL spawns nothing either", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env);
+
+  h.writeProject({ server: { host: "0.0.0.0" } });
+  await h.start();
+  h.writeProject({ baseUrl: "http://example.test:8080/v1" });
+  await h.start();
+
+  const errors = h.notes.filter((n) => n.type === "error");
+  assert.equal(errors.length, 2);
+  assert.ok(errors[0].message.includes("server.host (0.0.0.0): listens on a non-loopback address"), errors[0].message);
+  assert.ok(errors[1].message.includes("baseUrl (http://example.test:8080/v1): sends prompts to a non-loopback address"), errors[1].message);
+  assert.equal(h.confirms.length, 0);
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+});
+
+test("trustRemoteCode in the global file asks on every start and reaches the process only when confirmed", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeConfig({ server: { trustRemoteCode: true } });
+
+  await h.start();
+
+  assert.equal(h.argv().at(-1), "--trust-remote-code");
+  assert.deepEqual(h.argv().slice(0, 2), ["--model", QWEN.modelId]);
+  assert.equal(h.confirms.length, 1);
+  assert.equal(h.confirms[0].title, "Allow remote code from the model repository?");
+  assert.ok(h.confirms[0].message.startsWith("--trust-remote-code (from global file) lets the model repository run Python code"));
+  assert.match(startNotes(h.notes)[0].message, /\nflags: .*--trust-remote-code \(global file\)$/);
+
+  await h.start();
+
+  assert.equal(h.confirms.length, 2, "nothing is remembered: the next start asks again");
+  assert.equal(h.argv().at(-1), "--trust-remote-code");
+});
+
+test("declining the dialog spawns nothing and says the start was cancelled", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env, { confirm: false });
+  h.writeConfig({ server: { trustRemoteCode: true } });
+
+  await h.start();
+
+  assert.equal(h.confirms.length, 1);
+  assert.deepEqual(h.notes, [{ type: "info", message: "mlx-start cancelled: --trust-remote-code was not confirmed." }]);
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+  assert.equal(h.providerCalls.length, 1, "only the initial provider registration");
+});
+
+test("without a UI a risky start is refused and spawns nothing", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env, { hasUI: false });
+
+  await h.start("qwen3_4b --trust-remote-code");
+
+  assert.deepEqual(h.notes, [
+    {
+      type: "error",
+      message: "mlx-start failed: --trust-remote-code needs interactive confirmation; run /mlx-start in an interactive pi session",
+    },
+  ]);
+  assert.equal(h.confirms.length, 0);
   assert.equal(h.installCalls, 0);
   assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
 });
