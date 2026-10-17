@@ -152,6 +152,38 @@ test("a spawn error rejects the start with a launch message instead of polling f
   assert.ok(!events.includes("exited"), "a rejected start does not also report an exit");
 });
 
+// IN-01 (round 3): a process that never spawned has no pid; claiming it launched would show "Server process started".
+test("a process that never spawned is not reported as launched before its launch failure", async () => {
+  const procs: FakeProc[] = [];
+  const { host } = makeHost({
+    fetch: async () => new Response("{}", { status: 503 }),
+    spawn: () => {
+      const p = new FakeProc();
+      p.pid = undefined;
+      procs.push(p);
+      return p;
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const events: string[] = [];
+  const started = server.start("m", (e) => events.push(e.type));
+  await tick();
+  procs[0].emit("error", new Error("spawn /nope ENOENT"));
+
+  await assert.rejects(started, /Could not launch the MLX server/);
+  assert.deepEqual(events, []);
+});
+
+test("a process that spawned is reported as launched", async () => {
+  const { host } = makeHost({
+    spawn: () => Object.assign(new FakeProc(), { pid: 4242 }),
+  });
+  const server = createMlxServer({ ...opts, host });
+  const events: string[] = [];
+  await server.start("m", (e) => events.push(e.type));
+  assert.equal(events[0], "launched");
+});
+
 test("an error on a process that did start (for example a failed kill) is handled but does not mark it dead", async () => {
   const { host, procs } = makeHost();
   const server = createMlxServer({ ...opts, host });
