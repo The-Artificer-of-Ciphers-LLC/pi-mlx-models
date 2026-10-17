@@ -92,6 +92,8 @@ export interface SettingDef {
   expected: string;
   /** Strict check of a value read from a JSON file: no coercion (D-07). */
   check(value: unknown): CheckResult;
+  /** The problem line for a value that failed `check`; `shown` is the value already cleaned and clipped. */
+  problem(shown: string): string;
   /** Check of a value that arrives as text (environment, later command flags); same range or enum as `check`. */
   parseText(raw: string): CheckResult;
   /** Environment variable that sets this row. */
@@ -155,6 +157,22 @@ function checkModel(value: unknown): CheckResult {
 
 const valued = (flag: string) => (value: SettingValue) => [`${flag}=${value}`];
 
+/**
+ * The wording of every "this value is wrong" line, one phrase per kind of row. `shown` is the offending
+ * value as JSON, already cleaned and clipped, so nothing here needs to sanitize (D-24).
+ */
+const PHRASES = {
+  integerRange: (min: number, max: number) => (shown: string) => `${shown} is not an integer from ${min} to ${max}`,
+  integerAtLeast: (min: number) => (shown: string) => `${shown} is not an integer of at least ${min}`,
+  oneOf: (members: readonly string[]) => (shown: string) => `${shown} must be one of ${members.join(", ")}`,
+  boolean: (shown: string) => `${shown} must be true or false`,
+  string: (shown: string) => `${shown} must be a non-empty string`,
+  host: (shown: string) => `${shown} is not a valid host name or address`,
+  url: (shown: string) => `${shown} must be an http or https URL`,
+  list: (shown: string) => `${shown} must be a list of non-empty strings without commas or spaces`,
+  object: (shown: string) => `${shown} must be a JSON object`,
+};
+
 /** The schema, in the order flags are listed in the start message. */
 export const SETTINGS: readonly SettingDef[] = [
   {
@@ -162,6 +180,7 @@ export const SETTINGS: readonly SettingDef[] = [
     kind: "string",
     expected: "a host name or address (1 to 253 characters: letters, digits and . : _ - [ ], not starting with -)",
     check: checkHost,
+    problem: PHRASES.host,
     parseText: (raw) => checkHost(raw.trim()),
     env: "PI_MLX_MODELS_HOST",
     mlxFlag: "--host",
@@ -174,6 +193,7 @@ export const SETTINGS: readonly SettingDef[] = [
     kind: "integer",
     expected: "a port number from 1 to 65535",
     check: checkPort,
+    problem: PHRASES.integerRange(1, 65535),
     parseText: (raw) => {
       const trimmed = raw.trim();
       return /^\d+$/.test(trimmed) ? checkPort(Number(trimmed)) : bad;
@@ -190,6 +210,7 @@ export const SETTINGS: readonly SettingDef[] = [
     kind: "enum",
     expected: `one of ${LOG_LEVELS.join(", ")}`,
     check: checkLogLevel,
+    problem: PHRASES.oneOf(LOG_LEVELS),
     parseText: (raw) => checkLogLevel(raw.trim()),
     mlxFlag: "--log-level",
     emit: valued("--log-level"),
@@ -199,6 +220,7 @@ export const SETTINGS: readonly SettingDef[] = [
     kind: "string",
     expected: "an http or https URL",
     check: checkBaseUrl,
+    problem: PHRASES.url,
     parseText: (raw) => checkBaseUrl(raw.trim()),
     env: "PI_MLX_MODELS_BASE_URL",
     emit: () => [],
@@ -208,6 +230,7 @@ export const SETTINGS: readonly SettingDef[] = [
     kind: "string",
     expected: "a non-empty model id or preset key",
     check: checkModel,
+    problem: PHRASES.string,
     parseText: checkModel,
     env: "PI_MLX_MODELS_DEFAULT_MODEL",
     emit: () => [],
@@ -217,6 +240,75 @@ export const SETTINGS: readonly SettingDef[] = [
 const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
 /** The block names of nested keys, e.g. "server". */
 const BLOCKS = new Set(SETTINGS.filter((row) => row.path.includes(".")).map((row) => row.path.split(".")[0]));
+
+/** A key a user could have meant: its full dotted path, and the name it is written as at its own level. */
+interface Candidate {
+  path: string;
+  name: string;
+}
+
+/** The keys valid at the top level of a file, in schema order: block names and top-level rows. */
+const TOP_LEVEL: readonly Candidate[] = [...new Set(SETTINGS.map((row) => row.path.split(".")[0]))].map((name) => ({ path: name, name }));
+
+/** The keys of nested rows, in schema order; `inBlock` keeps only that block's, `exceptBlock` drops it. */
+function nestedKeys(filter: { inBlock?: string; exceptBlock?: string }): Candidate[] {
+  return SETTINGS.filter((row) => row.path.includes(".")).flatMap((row) => {
+    const dot = row.path.indexOf(".");
+    const block = row.path.slice(0, dot);
+    if (filter.inBlock !== undefined && block !== filter.inBlock) return [];
+    if (filter.exceptBlock !== undefined && block === filter.exceptBlock) return [];
+    return [{ path: row.path, name: row.path.slice(dot + 1) }];
+  });
+}
+
+const normalizeKey = (key: string): string => key.toLowerCase().replace(/[-_]/g, "");
+
+/** Optimal string alignment distance: insertions, deletions, substitutions and adjacent swaps each cost 1. */
+function editDistance(a: string, b: string): number {
+  const d: number[][] = Array.from({ length: a.length + 1 }, (_, i) => {
+    const row = new Array<number>(b.length + 1).fill(0);
+    row[0] = i;
+    return row;
+  });
+  for (let j = 0; j <= b.length; j += 1) d[0][j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+  }
+  return d[a.length][b.length];
+}
+
+/** How far `key` is from a candidate name when they are close enough to suggest, else undefined. */
+function closeness(key: string, name: string): number | undefined {
+  if (normalizeKey(key) === normalizeKey(name)) return 0;
+  // Two characters of difference is the limit, so a much longer or shorter key cannot match (and is not measured).
+  if (key.length < 3 || name.length < 3 || Math.abs(key.length - name.length) > 2) return undefined;
+  const distance = editDistance(key.toLowerCase(), name.toLowerCase());
+  return distance <= 2 ? distance : undefined;
+}
+
+/** The nearest candidate, the earliest in schema order on a tie. */
+function nearest(key: string, candidates: readonly Candidate[]): string | undefined {
+  let best: { path: string; distance: number } | undefined;
+  for (const candidate of candidates) {
+    const distance = closeness(key, candidate.name);
+    if (distance !== undefined && (best === undefined || distance < best.distance)) best = { path: candidate.path, distance };
+  }
+  return best?.path;
+}
+
+/**
+ * The path of the key the user probably meant by an unknown `key` (inside `block`, or at the top level when
+ * undefined), or undefined when nothing is close. Keys valid at the same level are tried first; only when
+ * none is close are other levels tried, which catches a key written at the wrong level (D-24).
+ */
+function suggestKey(key: string, block: string | undefined): string | undefined {
+  if (block === undefined) return nearest(key, TOP_LEVEL) ?? nearest(key, nestedKeys({}));
+  return nearest(key, nestedKeys({ inBlock: block })) ?? nearest(key, [...nestedKeys({ exceptBlock: block }), ...TOP_LEVEL]);
+}
 
 const FILE_LABEL = { global: "global config.json", project: "project .pi/pi-mlx-models.json" } as const;
 
@@ -284,32 +376,44 @@ export type PrepareResult =
   | { ok: true; prepared: Prepared; warnings: string[] }
   | { ok: false; errors: string[]; warnings: string[] };
 
-/** The valid values of one config file, plus a line for everything wrong with it (D-06). */
-function readFileLayer(file: LayerFile | undefined, layer: "global" | "project", errors: string[]): Map<string, SettingValue> {
+const flagSuffix = (row: SettingDef): string => (row.mlxFlag === undefined ? "" : ` (flag ${row.mlxFlag})`);
+
+/** A key as echoed in a message: cleaned and at most 80 characters. */
+const showKey = (path: string): string => clipDiagnostic(cleanLabel(path), 80, "start");
+
+/**
+ * The valid values of one config file, plus a line in `problems` for everything wrong with it (D-06, D-07).
+ * Keys are compared against the schema with Map and Set lookups only, and parsed keys are never assigned onto
+ * another object, so a key such as `__proto__` is just an unknown key (T-02-08).
+ */
+function readFileLayer(file: LayerFile | undefined, layer: "global" | "project", problems: string[]): Map<string, SettingValue> {
   const values = new Map<string, SettingValue>();
   const label = FILE_LABEL[layer];
   if (file === undefined || file.state === "absent") return values;
   if (file.state === "unusable") {
-    errors.push(`${label}: ${file.reason}`);
+    problems.push(`${label}: ${clipDiagnostic(cleanLabel(file.reason), 200, "start")}`);
     return values;
   }
-  const consider = (path: string, value: unknown, topLevel: boolean) => {
-    const row = topLevel && path.includes(".") ? undefined : ROWS_BY_PATH.get(path);
+  const consider = (block: string | undefined, key: string, value: unknown) => {
+    const path = block === undefined ? key : `${block}.${key}`;
+    // A top-level key that happens to contain a dot is not the nested key it resembles.
+    const row = block === undefined && key.includes(".") ? undefined : ROWS_BY_PATH.get(path);
     if (row === undefined) {
-      errors.push(`${show(path)} (${label}): unknown key`);
+      const meant = suggestKey(key, block);
+      problems.push(`${showKey(path)} (${label}): unknown key${meant === undefined ? "" : ` (did you mean ${meant}?)`}`);
       return;
     }
     const result = row.check(value);
     if (result.ok) values.set(path, result.value);
-    else errors.push(`${path} (${label}): expected ${row.expected}, got ${showValue(value)}`);
+    else problems.push(`${path} (${label}): ${row.problem(showValue(value))}${flagSuffix(row)}`);
   };
   for (const [key, value] of Object.entries(file.data)) {
     if (!BLOCKS.has(key)) {
-      consider(key, value, true);
+      consider(undefined, key, value);
     } else if (!isPlainObject(value)) {
-      errors.push(`${key} (${label}): expected an object of settings, got ${showValue(value)}`);
+      problems.push(`${key} (${label}): ${PHRASES.object(showValue(value))}`);
     } else {
-      for (const [child, childValue] of Object.entries(value)) consider(`${key}.${child}`, childValue, false);
+      for (const [child, childValue] of Object.entries(value)) consider(key, child, childValue);
     }
   }
   return values;
@@ -322,11 +426,12 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
  * and resolution continues with the next lower layer.
  */
 export function prepareSettings(input: PrepareInput): PrepareResult {
-  const errors: string[] = [];
   const warnings: string[] = [];
+  // Problems are collected per layer and reported highest precedence first (the environment only warns).
+  const problems: Record<LayerName, string[]> = { args: [], piFlags: [], env: [], project: [], global: [] };
   const fileValues = {
-    global: readFileLayer(input.global, "global", errors),
-    project: readFileLayer(input.project, "project", errors),
+    global: readFileLayer(input.global, "global", problems.global),
+    project: readFileLayer(input.project, "project", problems.project),
   };
 
   const resolved = new Map<string, { value: SettingValue; layer: LayerName }>();
@@ -353,12 +458,12 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
         if (raw === undefined) return undefined;
         const label = displayLabel(layer, row);
         if (raw === true) {
-          errors.push(`${name} (${label}): needs a value (${row.expected})`);
+          problems[layer].push(`${name} (${label}): needs a value (${row.expected})${flagSuffix(row)}`);
           return undefined;
         }
         const result = row.parseText(raw);
         if (result.ok) return result.value;
-        errors.push(`${name} (${label}): expected ${row.expected}, got ${showValue(raw)}`);
+        problems[layer].push(`${name} (${label}): ${row.problem(showValue(raw))}${flagSuffix(row)}`);
         return undefined;
       }
     }
@@ -372,6 +477,7 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
       }
     }
   }
+  const errors = PRECEDENCE.flatMap((layer) => problems[layer]);
   if (errors.length > 0) return { ok: false, errors, warnings };
 
   const value = (path: string): SettingValue | undefined => resolved.get(path)?.value;
@@ -449,7 +555,13 @@ export function describeFlags(launch: ResolvedLaunch): string {
   return `flags: ${parts.join(", ")}`;
 }
 
-/** The body of an "invalid configuration" error notification. */
+/** The most problem lines one refusal shows; the rest are counted. */
+const MAX_REPORT_LINES = 20;
+
+/** The body of an "invalid configuration" error notification: every problem on its own indented line. */
 export function formatConfigErrors(errors: readonly string[]): string {
-  return ["invalid configuration", ...errors.map((line) => `  ${line}`)].join("\n");
+  const lines = ["invalid configuration", ...errors.slice(0, MAX_REPORT_LINES).map((line) => `  ${line}`)];
+  const more = errors.length - MAX_REPORT_LINES;
+  if (more > 0) lines.push(`  ...and ${more} more problem${more === 1 ? "" : "s"}`);
+  return lines.join("\n");
 }
