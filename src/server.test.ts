@@ -16,6 +16,18 @@ class FakeProc extends EventEmitter implements ServerProcess {
   }
 }
 
+/** Records every signal and exits only when told to (or when a chosen signal arrives). */
+class ManualProc extends FakeProc {
+  signals: string[] = [];
+  constructor(private readonly exitsOn: readonly string[] = []) {
+    super();
+  }
+  override kill(signal?: NodeJS.Signals) {
+    this.signals.push(String(signal));
+    if (signal !== undefined && this.exitsOn.includes(signal)) this.emit("exit", null);
+  }
+}
+
 function makeHost(overrides: Partial<ServerHost> = {}) {
   const procs: FakeProc[] = [];
   const host: ServerHost = {
@@ -102,5 +114,42 @@ test("stop during startup cancels the pending start without an exited event", as
   server.stop();
   await assert.rejects(started, /cancelled/);
   assert.ok(!events.includes("exited"));
+  assert.equal(server.running, false);
+});
+
+test("stop sends SIGTERM and resolves only after the process has exited", async () => {
+  const proc = new ManualProc();
+  const { host } = makeHost({
+    spawn: () => proc,
+    // The kill-wait window never elapses, so only the exit event can settle stop().
+    sleep: () => new Promise<void>(() => {}),
+  });
+  const server = createMlxServer({ ...opts, host });
+  await server.start("m");
+
+  let settled = false;
+  const stopping = server.stop().then(() => {
+    settled = true;
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(proc.signals, ["SIGTERM"]);
+  assert.equal(settled, false, "stop() must stay pending until the child's exit event");
+  assert.equal(server.running, false, "running reflects the stop request immediately");
+
+  proc.die(0);
+  await stopping;
+  assert.equal(settled, true);
+  assert.deepEqual(proc.signals, ["SIGTERM"]);
+});
+
+test("stop escalates to SIGKILL when SIGTERM is ignored", async () => {
+  const proc = new ManualProc(["SIGKILL"]);
+  const { host } = makeHost({ spawn: () => proc });
+  const server = createMlxServer({ ...opts, host });
+  await server.start("m");
+
+  await server.stop();
+
+  assert.deepEqual(proc.signals, ["SIGTERM", "SIGKILL"]);
   assert.equal(server.running, false);
 });
