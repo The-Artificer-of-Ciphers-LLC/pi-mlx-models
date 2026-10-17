@@ -240,6 +240,98 @@ test("start on a running server whose port stays busy rejects with 'still in use
   assert.equal(server.running, false);
 });
 
+test("a /v1/models response from an old listener cannot make a process that already died look ready", async () => {
+  const { host, procs } = makeHost({
+    // The response arrives fine, but the process we spawned died before it did.
+    fetch: async () => {
+      procs[0].stderr.emit("data", "ModuleNotFoundError: mlx");
+      procs[0].die(1);
+      return new Response("{}", { status: 200 });
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const events: string[] = [];
+
+  await assert.rejects(server.start("m", (e) => events.push(e.type)), /exited \(code 1\).*ModuleNotFoundError/s);
+
+  assert.deepEqual(events, ["launched", "exited"], "no loading, warming or ready event after a dead process answered");
+  assert.equal(server.running, false);
+});
+
+test("a warm-up response that arrives after the process died never reports ready", async () => {
+  const { host, procs } = makeHost({
+    fetch: async (url) => {
+      if (String(url).endsWith("/chat/completions")) {
+        procs[0].stderr.emit("data", "ModuleNotFoundError: mlx");
+        procs[0].die(1);
+      }
+      return new Response("{}", { status: 200 });
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+  const events: string[] = [];
+
+  await assert.rejects(server.start("m", (e) => events.push(e.type)), /exited \(code 1\).*ModuleNotFoundError/s);
+
+  assert.ok(!events.includes("ready"), "ready must not be emitted");
+  assert.equal(server.running, false);
+});
+
+/** Run a start whose server only ever refuses connections, feeding it `chunks` on stderr. */
+async function startWithBindFailure(chunks: string[]) {
+  const { host, procs } = makeHost({
+    fetch: async () => {
+      throw new Error("refused");
+    },
+  });
+  const server = createMlxServer({ ...opts, host, address: { host: "127.0.0.1", port: 54321 } });
+  const events: string[] = [];
+  let failure: Error | undefined;
+  let settled = false;
+  const started = server.start("m", (e) => events.push(e.type)).then(
+    () => {
+      settled = true;
+    },
+    (error: Error) => {
+      settled = true;
+      failure = error;
+    },
+  );
+  await tick();
+  for (const chunk of chunks) procs[0].stderr.emit("data", chunk);
+  // Give a correct implementation a few event-loop turns to fail the start on its own, then cancel
+  // whatever is still pending so a regression ends the test instead of polling for the health window.
+  for (let turn = 0; turn < 5; turn += 1) await tick();
+  const failedOnItsOwn = settled;
+  await server.stop();
+  await started;
+  return { server, events, proc: procs[0], failedOnItsOwn, failure };
+}
+
+function assertBindFailureMessage(err: Error) {
+  assert.match(err.message, /54321/);
+  assert.match(err.message, /PI_MLX_MODELS_PORT/);
+  assert.doesNotMatch(err.message, /Errno|Address already in use/, "the message must not embed raw stderr text");
+  return true;
+}
+
+for (const [label, chunks] of [
+  ["Errno 48", ["Traceback (most recent call last):\nOSError: [Errno 48] Address already in use\n"]],
+  ["Errno 98", ["OSError: [Errno 98] Address already in use\n"]],
+  ["a line split across two chunks", ["OSError: [Errno 48] Address alre", "ady in use\n"]],
+] as const) {
+  test(`a stderr bind failure (${label}) terminates the child and fails the start with the port message`, async () => {
+    const { server, events, proc, failedOnItsOwn, failure } = await startWithBindFailure([...chunks]);
+
+    assert.ok(failedOnItsOwn, "the start must fail on the bind error without waiting for the health window");
+    assert.ok(failure, "the start must reject");
+    assertBindFailureMessage(failure);
+    assert.equal(proc.killed, "SIGTERM");
+    assert.equal(server.running, false);
+    assert.equal(events.filter((e) => e === "exited").length, 1, "exited is emitted exactly once");
+  });
+}
+
 test("stop during the pre-spawn port probe cancels the pending start without spawning", async () => {
   let answer!: (inUse: boolean) => void;
   const { host, procs } = makeHost({ portInUse: () => new Promise<boolean>((r) => (answer = r)) });
