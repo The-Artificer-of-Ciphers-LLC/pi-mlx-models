@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
@@ -26,23 +26,50 @@ export type LayerFile =
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** Read and parse one config file. A missing file is simply absent; anything else wrong with it is unusable. */
+/** The largest config file that is read (T-02-07). A real config is a few hundred bytes. */
+const MAX_FILE_BYTES = 256 * 1024;
+
+/** Text from the file system or the JSON parser, made single-line, safe and bounded before it goes in a reason. */
+const reasonText = (text: string, max: number): string => clipDiagnostic(cleanLabel(text), max, "start");
+
+const unusable = (reason: string): LayerFile => ({ state: "unusable", reason });
+
+/**
+ * Read and parse one config file. Reading never throws.
+ *
+ * A path that is not there (or sits under something that is not a directory) is simply absent and nothing is
+ * created. Anything else wrong with the file is unusable, with a reason that never contains the path: the
+ * caller prefixes the layer label. The file is looked at with `stat` first so a directory, a device or a huge
+ * file is refused without being read (T-02-07).
+ */
 export function readLayerFile(path: string): LayerFile {
-  let text: string;
+  const cannotRead = (error: unknown): LayerFile => {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    return unusable(`cannot be read (${typeof code === "string" ? reasonText(code, 40) : "unknown error"})`);
+  };
+  let bytes: Buffer;
   try {
-    text = readFileSync(path, "utf8");
+    const info = statSync(path);
+    if (!info.isFile()) return unusable("is not a regular file");
+    if (info.size > MAX_FILE_BYTES) return unusable("is larger than 256 KiB");
+    bytes = readFileSync(path);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return { state: "absent" };
-    return { state: "unusable", reason: `cannot be read: ${clipDiagnostic(cleanLabel(String((error as Error).message ?? error)), 200, "start")}` };
+    return cannotRead(error);
   }
+  // The file may have grown between the stat and the read.
+  if (bytes.length > MAX_FILE_BYTES) return unusable("is larger than 256 KiB");
+  let text = bytes.toString("utf8");
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  if (text.trim() === "") return unusable("is empty");
   let data: unknown;
   try {
     data = JSON.parse(text);
   } catch (error) {
-    return { state: "unusable", reason: `is not valid JSON: ${clipDiagnostic(cleanLabel(String((error as Error).message ?? error)), 200, "start")}` };
+    return unusable(`is not valid JSON (${reasonText(String((error as Error).message ?? error), 120)})`);
   }
-  if (!isPlainObject(data)) return { state: "unusable", reason: "must contain a JSON object at the top level" };
+  if (!isPlainObject(data)) return unusable("must contain a JSON object at the top level");
   return { state: "ok", data };
 }
 

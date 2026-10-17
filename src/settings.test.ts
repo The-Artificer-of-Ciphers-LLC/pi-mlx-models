@@ -598,6 +598,10 @@ test("an unreadable parent directory is unusable, not absent", { skip: cannotRea
   mkdirSync(sub);
   writeFileSync(join(sub, "config.json"), "{}");
   chmodSync(sub, 0o000);
-  const reason = unusableReason(join(sub, "config.json"));
-  assert.ok(reason.startsWith("cannot be read ("), reason);
+  try {
+    const reason = unusableReason(join(sub, "config.json"));
+    assert.ok(reason.startsWith("cannot be read ("), reason);
+  } finally {
+    chmodSync(sub, 0o700); // so the temporary directory can be removed
+  }
 });
