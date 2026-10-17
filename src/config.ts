@@ -116,22 +116,6 @@ export function envText(raw: string | undefined): string | undefined {
   return raw?.trim() || undefined;
 }
 
-const portResult = parsePort(process.env.PI_MLX_MODELS_PORT);
-
-export const PORT = portResult.port;
-export const HOST = envText(process.env.PI_MLX_MODELS_HOST) ?? DEFAULT_HOST;
-const explicitBaseUrl = envText(process.env.PI_MLX_MODELS_BASE_URL);
-// Callers append "/models" and "/chat/completions", so a trailing slash would yield "//models".
-export const BASE_URL = explicitBaseUrl?.replace(/\/+$/, "") || deriveBaseUrl(HOST, PORT);
-export const DEFAULT_MODEL = envText(process.env.PI_MLX_MODELS_DEFAULT_MODEL) ?? DEFAULT_MODEL_ID;
-
-/** Warnings found while reading configuration; index.ts surfaces each once. config.ts never prints. */
-const baseUrlMismatch = baseUrlWarning({ baseUrl: explicitBaseUrl, host: HOST, port: PORT });
-export const CONFIG_WARNINGS: readonly string[] = [
-  ...(portResult.warning ? [portResult.warning] : []),
-  ...(baseUrlMismatch ? [baseUrlMismatch] : []),
-];
-
 export const PROVIDER_ID = "pi-mlx-models";
 export const DATA_DIR = join(
   resolveAgentDir({

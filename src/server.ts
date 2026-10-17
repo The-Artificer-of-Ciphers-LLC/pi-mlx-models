@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { BASE_URL, HF_HOME, HOST, PORT, VENV_PYTHON } from "./config.js";
+import { DEFAULT_HOST, DEFAULT_PORT, HF_HOME, VENV_PYTHON, deriveBaseUrl } from "./config.js";
 import { clipDiagnostic } from "./diagnostic.js";
 import { probePort, waitForPortFree } from "./port.js";
 
@@ -131,8 +131,8 @@ export function createMlxServer(
 ): MlxServer {
   const host = options.host ?? systemHost;
   // Only the fallback for a start() without a LaunchSpec; every running process carries its own address and base URL.
-  const defaultAddress = options.address ?? { host: HOST, port: PORT };
-  const defaultBaseUrl = options.baseUrl ?? BASE_URL;
+  const defaultAddress = options.address ?? { host: DEFAULT_HOST, port: DEFAULT_PORT };
+  const defaultBaseUrl = options.baseUrl ?? deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT);
   const healthTimeoutMs = options.healthTimeoutMs ?? 600_000;
   const warmupTimeoutMs = options.warmupTimeoutMs ?? 1_800_000;
   const healthRequestTimeoutMs = options.healthRequestTimeoutMs ?? 10_000;
