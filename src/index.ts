@@ -1,11 +1,23 @@
+import { homedir } from "node:os";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { BASE_URL, CONFIG_WARNINGS, DEFAULT_MODEL, PROVIDER_ID } from "./config.js";
+import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, GLOBAL_CONFIG_PATH, PROVIDER_ID, deriveBaseUrl } from "./config.js";
 import { cleanLabel } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
 import { createProgress, type Progress } from "./progress.js";
 import { ensureInstalled, type RuntimeEvent } from "./runtime.js";
 import { createMlxServer, type MlxServer } from "./server.js";
+import {
+  buildLaunch,
+  describeFlags,
+  formatConfigErrors,
+  prepareSettings,
+  readLayerFile,
+  toLaunchSpec,
+  type Prepared,
+  type ResolvedLaunch,
+  type SettingsSource,
+} from "./settings.js";
 
 const PROGRESS_WIDGET = "mlx-progress";
 
@@ -23,10 +35,10 @@ export interface PiHost {
 export interface ExtensionDeps {
   server: MlxServer;
   ensureInstalled: typeof ensureInstalled;
-  discoverModelIds: () => Promise<string[]>;
-  baseUrl: string;
-  defaultModel: string;
-  configWarnings: readonly string[];
+  /** Lists the model ids the server at `baseUrl` serves; the base URL is the launch's own, not a constant. */
+  discoverModelIds: (baseUrl: string) => Promise<string[]>;
+  /** Where layered settings are read from; the global file is read again on every /mlx-start. */
+  settings: SettingsSource;
   /** How long session_shutdown waits for the server to stop before letting pi exit. */
   shutdownWaitMs: number;
   sleep: (ms: number) => Promise<void>;
@@ -65,14 +77,11 @@ const unrefSleep = (ms: number) =>
   });
 
 function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
-  const baseUrl = overrides.baseUrl ?? BASE_URL;
   return {
     server: overrides.server ?? createMlxServer(),
     ensureInstalled: overrides.ensureInstalled ?? ensureInstalled,
-    discoverModelIds: overrides.discoverModelIds ?? (() => discoverModelIds({ baseUrl })),
-    baseUrl,
-    defaultModel: overrides.defaultModel ?? DEFAULT_MODEL,
-    configWarnings: overrides.configWarnings ?? CONFIG_WARNINGS,
+    discoverModelIds: overrides.discoverModelIds ?? ((baseUrl) => discoverModelIds({ baseUrl })),
+    settings: overrides.settings ?? { env: process.env, globalConfigPath: GLOBAL_CONFIG_PATH, home: homedir() },
     shutdownWaitMs: overrides.shutdownWaitMs ?? 5000,
     sleep: overrides.sleep ?? unrefSleep,
   };
@@ -82,9 +91,25 @@ function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
 export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   const deps = withDefaults(overrides);
   const { server } = deps;
-  let currentModel = deps.defaultModel;
+  let currentModel = DEFAULT_MODEL_ID;
+  /** The base URL the provider is registered with and discovery polls: the latest launch's, or the ambient one before any. */
+  let activeBaseUrl = deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT);
   let activeProgress: Progress | null = null;
-  let configWarningsShown = false;
+  /** Config warnings already shown, so each distinct text appears once per extension instance. */
+  const shownWarnings = new Set<string>();
+
+  /**
+   * The settings in effect outside any /mlx-start: the global file plus the environment, or the environment
+   * alone when the file is unusable. Never throws; it only supplies the initial provider URL and model.
+   */
+  function ambientSettings(): Pick<Prepared, "baseUrl" | "defaultModel"> {
+    const env = deps.settings.env;
+    const withFile = prepareSettings({ global: readLayerFile(deps.settings.globalConfigPath), env });
+    if (withFile.ok) return withFile.prepared;
+    const envOnly = prepareSettings({ global: { state: "absent" }, env });
+    if (envOnly.ok) return envOnly.prepared;
+    return { baseUrl: deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT), defaultModel: DEFAULT_MODEL_ID };
+  }
 
   /**
    * Bumped by every /mlx-start, /mlx-stop and session_shutdown. A start compares its own value after each
@@ -131,13 +156,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   }
 
   async function registerProvider(pi: PiHost, options?: { includeFallback?: boolean }) {
-    const discovered = await deps.discoverModelIds();
+    const discovered = await deps.discoverModelIds(activeBaseUrl);
     const includeFallback = options?.includeFallback ?? false;
     const modelIds = discovered.length ? discovered : includeFallback ? [currentModel] : [];
 
     pi.registerProvider(PROVIDER_ID, {
       name: "PI MLX Models",
-      baseUrl: deps.baseUrl,
+      baseUrl: activeBaseUrl,
       apiKey: "DUMMY",
       api: "openai-completions",
       models: asProviderModels(modelIds),
@@ -159,26 +184,33 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     ctx.ui.setStatus(PROVIDER_ID, "mlx: stopped");
   }
 
-  async function startModelFromInput(pi: PiHost, ctx: any, args: string | undefined) {
-    const selected = resolveModel(args, deps.defaultModel);
+  async function startModelFromInput(pi: PiHost, ctx: any, args: string | undefined, prepared: Prepared) {
+    const selected = resolveModel(args, prepared.defaultModel);
     // Bad input is reported before anything runs: no provider refresh, no install, no spawn.
     if (selected.error !== undefined) {
       ctx.ui.notify(`mlx-start failed: ${selected.error}`, "error");
+      return;
+    }
+    const built = buildLaunch(prepared, { modelId: selected.modelId, ...(selected.preset ? { presetKey: selected.preset.key } : {}) });
+    if (!built.ok) {
+      ctx.ui.notify(`mlx-start failed: ${formatConfigErrors(built.errors)}`, "error");
       return;
     }
     const mine = (startEpoch += 1);
     initEpoch += 1;
     startInFlight = mine;
     try {
-      await runStart(pi, ctx, selected.modelId, selected.preset?.key, mine);
+      await runStart(pi, ctx, built.launch, mine);
     } finally {
       if (startInFlight === mine) startInFlight = null;
     }
   }
 
-  async function runStart(pi: PiHost, ctx: any, model: string, presetKey: string | undefined, mine: number) {
+  async function runStart(pi: PiHost, ctx: any, launch: ResolvedLaunch, mine: number) {
     const isStale = () => startEpoch !== mine;
+    const { modelId: model, presetKey } = launch.model;
     currentModel = model;
+    activeBaseUrl = launch.baseUrl;
     await registerProvider(pi, { includeFallback: false });
     if (isStale()) return;
 
@@ -209,8 +241,9 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       if (isStale()) return; // stopped or superseded while installing
       progress.done(0, "Runtime ready");
 
+      const flagsLine = describeFlags(launch);
       ctx.ui.notify(
-        `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...`,
+        `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...${flagsLine ? `\n${flagsLine}` : ""}`,
         "info",
       );
       progress.status(`Start MLX server process (${model})`);
@@ -255,7 +288,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             ctx.ui.setStatus(PROVIDER_ID, "mlx: stopped");
             break;
         }
-      });
+      }, toLaunchSpec(launch));
 
       if (isStale()) return;
       activate(5, "Refreshing provider model list");
@@ -278,6 +311,9 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   }
 
   return async function extension(pi: PiHost) {
+    const ambient = ambientSettings();
+    activeBaseUrl = ambient.baseUrl;
+    currentModel = ambient.defaultModel;
     await registerProvider(pi, { includeFallback: false });
 
     pi.registerCommand("mlx-init", {
@@ -323,10 +359,22 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     pi.registerCommand("mlx-start", {
       description: "Start local MLX server. Usage: /mlx-start [preset-number|preset-key|hf-model-id]",
       handler: async (args, ctx) => {
-        if (!configWarningsShown) {
-          configWarningsShown = true;
-          for (const warning of deps.configWarnings) ctx.ui.notify(warning, "warning");
+        // The global file is read on every start, so an edit needs no reload (D-05).
+        const result = prepareSettings({
+          global: readLayerFile(deps.settings.globalConfigPath),
+          env: deps.settings.env,
+        });
+        for (const warning of result.warnings) {
+          if (shownWarnings.has(warning)) continue;
+          shownWarnings.add(warning);
+          ctx.ui.notify(warning, "warning");
         }
+        // Invalid configuration stops the start before any install, provider refresh or spawn (D-06).
+        if (!result.ok) {
+          ctx.ui.notify(`mlx-start failed: ${formatConfigErrors(result.errors)}`, "error");
+          return;
+        }
+        const { prepared } = result;
 
         const normalizedArgs = (args || "").trim();
         if (!normalizedArgs) {
@@ -335,11 +383,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             ctx.ui.notify("Preset selection cancelled.", "info");
             return;
           }
-          await startModelFromInput(pi, ctx, preset.key);
+          await startModelFromInput(pi, ctx, preset.key, prepared);
           return;
         }
 
-        await startModelFromInput(pi, ctx, normalizedArgs);
+        await startModelFromInput(pi, ctx, normalizedArgs, prepared);
       },
     });
 
