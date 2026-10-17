@@ -21,13 +21,13 @@ Local MLX model launcher for [Pi](https://pi.dev) on Apple Silicon.
 ### From npm
 
 ```bash
-pi install npm:pi-mlx-models
+pi install npm:@taoc/pi-mlx-models
 ```
 
 ### From GitHub
 
 ```bash
-pi install git:github.com/vmarinogg/pi-mlx-models
+pi install git:github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models
 ```
 
 ## Quick start

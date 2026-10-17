@@ -1,5 +1,5 @@
 {
-  "name": "pi-mlx-models",
+  "name": "@taoc/pi-mlx-models",
   "version": "0.1.4",
   "description": "Local MLX model launcher extension for Pi",
   "type": "module",
@@ -25,21 +25,27 @@
     "llm",
     "extension"
   ],
-  "author": "vmarinogg",
+  "author": "The Artificer of Ciphers LLC",
+  "contributors": [
+    "vmarinogg"
+  ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vmarinogg/pi-mlx-models.git"
+    "url": "git+https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models.git"
   },
   "bugs": {
-    "url": "https://github.com/vmarinogg/pi-mlx-models/issues"
+    "url": "https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/issues"
   },
-  "homepage": "https://github.com/vmarinogg/pi-mlx-models#readme",
+  "homepage": "https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models#readme",
   "pi": {
     "extensions": [
       "dist/index.js"
     ],
-    "image": "https://raw.githubusercontent.com/vmarinogg/pi-mlx-models/main/assets/preset-selector.png"
+    "image": "https://raw.githubusercontent.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/main/assets/preset-selector.png"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*"
