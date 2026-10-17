@@ -1,5 +1,5 @@
-import { readFileSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
@@ -132,12 +132,19 @@ export interface SettingDef {
 const ok = (value: SettingValue): CheckResult => ({ ok: true, value });
 const bad: CheckResult = { ok: false };
 
-const HOST_PATTERN = /^[A-Za-z0-9.:_[\]-]+$/;
+const HOST_PATTERN = /^[A-Za-z0-9.:_-]+$/;
 
+/**
+ * The host as the server takes it. A bracketed IPv6 address ("[::1]", the URL spelling) is stored without its
+ * brackets, because Python cannot bind the bracketed form; `deriveBaseUrl` puts them back for URLs.
+ */
 function checkHost(value: unknown): CheckResult {
   if (typeof value !== "string" || value.length < 1 || value.length > 253) return bad;
-  if (value.startsWith("-") || !HOST_PATTERN.test(value)) return bad;
-  return ok(value);
+  const bracketed = value.startsWith("[") && value.endsWith("]");
+  const bare = bracketed ? value.slice(1, -1) : value;
+  if (bracketed && !bare.includes(":")) return bad;
+  if (bare.length < 1 || bare.startsWith("-") || !HOST_PATTERN.test(bare)) return bad;
+  return ok(bare);
 }
 
 function checkPort(value: unknown): CheckResult {
@@ -809,6 +816,11 @@ function projectViolationsOf(project: ReadonlyMap<string, SettingValue>): Projec
   if (typeof baseUrl === "string" && !isLoopbackUrl(baseUrl)) {
     violations.push({ path: "baseUrl", shown: show(baseUrl), reason: "sends prompts to a non-loopback address" });
   }
+  const origins = project.get("server.allowedOrigins");
+  // Held as the comma list the server flag takes; an empty list never gets this far.
+  if (typeof origins === "string") {
+    violations.push({ path: "server.allowedOrigins", shown: showValue(origins), reason: "lets web pages call the local server" });
+  }
   return violations;
 }
 
@@ -989,6 +1001,20 @@ function resolveUserPath(text: string, context: LaunchContext): string {
   return isAbsolute(text) ? text : resolvePath(context.cwd, text);
 }
 
+/** True when `target` is `directory` itself or lies under it, after following symlinks in the part of the path that exists. */
+function isInsideDirectory(directory: string, target: string): boolean {
+  const real = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      const parent = dirname(path);
+      return parent === path ? path : join(real(parent), basename(path));
+    }
+  };
+  const from = relative(real(directory), real(target));
+  return from === "" || (!from.startsWith("..") && !isAbsolute(from));
+}
+
 type TemplateText = { ok: true; text: string } | { ok: false; reason: string };
 
 /** Read a chat template: a regular file of at most 64 KiB holding non-empty UTF-8 text. Never throws (T-02-19, T-02-21). */
@@ -1053,6 +1079,11 @@ export function buildLaunch(prepared: Prepared, model: { modelId: string; preset
     if (row.kind === "path") {
       const resolved = resolveUserPath(String(value), where);
       display = clipDiagnostic(cleanLabel(resolved), 200, "start");
+      // A cloned repository must not make the extension read a file elsewhere on the machine into the server's argv.
+      if (row.template === true && hit.layer === "project" && !isInsideDirectory(where.cwd, resolved)) {
+        errors.push(`${row.path} (${layerLabel(hit.layer, row)}): ${display} is outside the project directory`);
+        continue;
+      }
       if (row.template === true) {
         const read = readTemplateFile(resolved);
         if (!read.ok) {
