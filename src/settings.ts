@@ -576,7 +576,32 @@ function suggestKey(key: string, block: string | undefined): string | undefined 
   return nearest(key, nestedKeys({ inBlock: block })) ?? nearest(key, [...nestedKeys({ exceptBlock: block }), ...TOP_LEVEL]);
 }
 
-const FILE_LABEL = { global: "global config.json", project: "project .pi/pi-mlx-models.json" } as const;
+/**
+ * The text that follows `unknown key` in a problem line: empty when nothing is close, else a space and a
+ * parenthesised hint. `key` is what the user wrote and `block` the block it was written in (undefined at the
+ * top level; `model` for a `models` entry). `container` names that place for the user: `"server"` for a block,
+ * `a "models" entry` for an entry (GAP-01).
+ *
+ * A key written at the top level, or whose nearest key lives in the same block, gets the plain "did you mean".
+ * Otherwise the nearest key lives elsewhere, and the hint says where, so that a suggestion never repeats the
+ * name the user typed without saying the key leaves the place it was written in. A spelling that differs from
+ * the real name only by case, `-` or `_` is the same key, and gets the plain statement with the real spelling.
+ *
+ * The output holds only schema-derived names and the fixed phrases below, plus the caller's `container`, which
+ * is a fixed label; nothing from the file is added (T-02-27).
+ */
+function unknownKeyHint(key: string, block: string | undefined, container: string): string {
+  const meant = suggestKey(key, block);
+  if (meant === undefined) return "";
+  const dot = meant.indexOf(".");
+  if (block === undefined || (dot !== -1 && meant.slice(0, dot) === block)) return ` (did you mean ${meant}?)`;
+  const name = meant.slice(dot + 1);
+  const home = dot === -1 ? "a top-level key" : `a "${meant.slice(0, dot)}" key`;
+  const where = `${home}, not part of ${container}`;
+  return normalizeKey(key) === normalizeKey(name) ? ` (${name} is ${where})` : ` (did you mean ${meant}? It is ${where})`;
+}
+
+const FILE_LABEL = { global:"global config.json", project: "project .pi/pi-mlx-models.json" } as const;
 
 /** Text that came from a file, the environment or a flag, made safe and bounded before it is shown (D-24). */
 const show = (text: string): string => clipDiagnostic(cleanLabel(text), 60, "start");
@@ -704,8 +729,7 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
     // A top-level key that happens to contain a dot is not the nested key it resembles.
     const row = block === undefined && key.includes(".") ? undefined : ROWS_BY_PATH.get(path);
     if (row === undefined) {
-      const meant = suggestKey(key, block);
-      problems.push(`${showKey(path)} (${label}): unknown key${meant === undefined ? "" : ` (did you mean ${meant}?)`}`);
+      problems.push(`${showKey(path)} (${label}): unknown key${unknownKeyHint(key, block, `"${block}"`)}`);
       return;
     }
     const result = row.check(value);
@@ -717,8 +741,7 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
     const where = `${entryPath(id)}.${showKey(key)}`;
     const row = key.includes(".") ? undefined : ROWS_BY_PATH.get(`${MODEL_BLOCK}.${key}`);
     if (row === undefined) {
-      const meant = suggestKey(key, MODEL_BLOCK);
-      problems.push(`${where} (${label}): unknown key${meant === undefined ? "" : ` (did you mean ${meant}?)`}`);
+      problems.push(`${where} (${label}): unknown key${unknownKeyHint(key, MODEL_BLOCK, `a "${MODELS_KEY}" entry`)}`);
       return;
     }
     const result = row.check(value);
