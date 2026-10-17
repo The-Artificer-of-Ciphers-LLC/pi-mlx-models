@@ -19,29 +19,38 @@ export interface RuntimeHost {
 
 const PYPI_INDEX = ["--index-url", "https://pypi.org/simple/"];
 
+/** mlx-lm 0.32 requires Python 3.11+. There is deliberately no ceiling. */
+const MIN_PYTHON_MINOR = 11;
+
 const PYTHON_CANDIDATES = [
+  "/opt/homebrew/bin/python3.14",
   "/opt/homebrew/bin/python3.13",
   "/opt/homebrew/bin/python3.12",
   "/opt/homebrew/bin/python3.11",
-  "/opt/homebrew/bin/python3.10",
   "/opt/homebrew/bin/python3",
   "/usr/local/bin/python3",
   "/usr/bin/python3",
 ];
 
-export function findPython(_options: { candidates?: string[]; env?: NodeJS.ProcessEnv } = {}): string | null {
-  for (const c of PYTHON_CANDIDATES) {
-    try {
-      const s = spawnSync(c, ["--version"], { stdio: ["ignore", "pipe", "pipe"], timeout: 3000 });
-      if (s.status !== 0) continue;
-      const out = `${s.stdout?.toString() || ""}${s.stderr?.toString() || ""}`;
-      const m = out.match(/Python\s+3\.(\d+)/);
-      if (!m) continue;
-      const minor = Number(m[1]);
-      if (minor >= 10 && minor <= 13) return c;
-    } catch {
-      // ignore
-    }
+type Probe = { ok: true } | { ok: false; reason: string };
+
+function probePython(candidate: string): Probe {
+  try {
+    const s = spawnSync(candidate, ["--version"], { stdio: ["ignore", "pipe", "pipe"], timeout: 3000 });
+    if (s.status !== 0) return { ok: false, reason: "did not run" };
+    const out = `${s.stdout?.toString() || ""}${s.stderr?.toString() || ""}`;
+    const m = out.match(/Python\s+3\.(\d+)/);
+    if (!m) return { ok: false, reason: "not a Python 3 interpreter" };
+    if (Number(m[1]) < MIN_PYTHON_MINOR) return { ok: false, reason: `Python 3.${m[1]} is older than 3.${MIN_PYTHON_MINOR}` };
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: "could not be executed" };
+  }
+}
+
+export function findPython(options: { candidates?: string[]; env?: NodeJS.ProcessEnv } = {}): string | null {
+  for (const c of options.candidates ?? PYTHON_CANDIDATES) {
+    if (probePython(c).ok) return c;
   }
   return null;
 }
@@ -67,7 +76,12 @@ function run(cmd: string, args: string[], onLine?: (line: string) => void): Prom
   });
 }
 
-export const systemHost: RuntimeHost = { findPython, exists: existsSync, run };
+export const systemHost: RuntimeHost = {
+  findPython,
+  searched: () => [...PYTHON_CANDIDATES],
+  exists: existsSync,
+  run,
+};
 
 /**
  * Make sure the venv with mlx-lm exists.
@@ -94,7 +108,18 @@ export async function ensureInstalled(options: {
   }
 
   const py = host.findPython();
-  if (!py) throw new Error("Python 3.10–3.13 not found. Install: brew install python@3.13");
+  if (!py) {
+    const searched = host.searched?.() ?? [];
+    throw new Error(
+      [
+        `Python 3.${MIN_PYTHON_MINOR}+ is required and no compatible interpreter was found.`,
+        searched.length ? `Searched: ${searched.join(", ")}` : "",
+        "Install one with: brew install python@3.13",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
   emit({ phase: "python", state: "active", detail: `Using ${py}` });
   emit({ phase: "python", state: "done", detail: "Compatible Python found" });
 
