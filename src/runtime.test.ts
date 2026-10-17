@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { VENV_PYTHON } from "./config.js";
+import { VENV_DIR, VENV_PYTHON } from "./config.js";
 import { ensureInstalled, findPython, pythonCandidates, run, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
 
 function fakeHost(overrides: Partial<RuntimeHost> & { venv?: boolean } = {}) {
@@ -280,4 +280,65 @@ test("run's onLine lines are cleaned of control characters", async () => {
 
   assert.ok(lines.some((l) => l.includes("line")));
   for (const line of lines) assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f]/);
+});
+
+// WR-07: a venv built by an older Python cannot take mlx-lm; it is recreated with a compatible interpreter.
+/** A host whose venv exists and whose `--version` probe reports `venvVersion`; the import check fails unless `importable`. */
+function venvHost(venvVersion: string, importable = false) {
+  const calls: string[][] = [];
+  const host: RuntimeHost = {
+    findPython: () => "/py3",
+    exists: () => true,
+    run: async (cmd, args, onLine) => {
+      calls.push([cmd, ...args]);
+      if (args[0] === "-c" && !importable) throw new Error("No module named mlx_lm");
+      if (args[0] === "--version") onLine?.(`Python ${venvVersion}`);
+    },
+  };
+  return { host, calls };
+}
+
+const recreates = (calls: string[][]) => calls.filter((c) => c[0] === "/py3" && c.includes("--clear"));
+
+test("a venv on Python 3.10 that cannot import mlx_lm is recreated before pip runs", async () => {
+  const { host, calls } = venvHost("3.10.14");
+  const events: RuntimeEvent[] = [];
+
+  await ensureInstalled({ host, onEvent: (e) => events.push(e) });
+
+  assert.deepEqual(recreates(calls), [["/py3", "-m", "venv", "--clear", VENV_DIR]]);
+  const clearAt = calls.findIndex((c) => c.includes("--clear"));
+  const pipAt = calls.findIndex((c) => c.includes("pip"));
+  assert.ok(clearAt >= 0 && clearAt < pipAt, "the venv must be recreated before pip installs into it");
+  const message = events.find((e) => e.phase === "venv" && e.detail?.includes("3.10"))?.detail ?? "";
+  assert.match(message, /3\.11/, "the message names the floor");
+  assert.match(message, /recreat/i);
+});
+
+test("mlx-init (upgrade) also recreates a venv on Python 3.9", async () => {
+  const { host, calls } = venvHost("3.9.6");
+
+  await ensureInstalled({ host, upgrade: true });
+
+  assert.equal(recreates(calls).length, 1);
+});
+
+test("a venv on Python 3.11 or newer is kept", async () => {
+  for (const version of ["3.11.0", "3.12.4", "3.15.0rc1"]) {
+    const { host, calls } = venvHost(version);
+    await ensureInstalled({ host });
+    assert.deepEqual(recreates(calls), [], version);
+  }
+});
+
+test("a venv whose version cannot be read is left alone", async () => {
+  const { host, calls } = venvHost("not a version");
+  await ensureInstalled({ host });
+  assert.deepEqual(recreates(calls), []);
+});
+
+test("a working install is not probed for its version at all", async () => {
+  const { host, calls } = venvHost("3.10.14", true);
+  await ensureInstalled({ host });
+  assert.ok(!calls.some((c) => c.includes("--version")));
 });
