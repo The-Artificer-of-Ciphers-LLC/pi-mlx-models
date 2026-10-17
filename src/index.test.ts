@@ -542,6 +542,82 @@ test("an mlx-init during an mlx-start install never runs two installs at once", 
   assert.equal(call, 2, "an upgrade install is not satisfied by a plain one");
 });
 
+// WR-01 (round 2): /mlx-init must not share the epoch that cancels starts.
+test("an mlx-init while the server is starting is refused and the start still completes", async () => {
+  const gate = deferred();
+  const { server, installCalls, commands, ctx, notes, statuses, providerCalls } = await setup({
+    discovered: [MODEL_PRESETS[0].modelId],
+    server: {
+      start: async (_model, onEvent) => {
+        onEvent?.({ type: "launched" });
+        await gate.promise;
+        onEvent?.({ type: "ready" });
+      },
+    },
+  });
+
+  const starting = commands.get("mlx-start")!("qwen3_4b", ctx);
+  await flush();
+  assert.equal(server.startCalls.length, 1, "premise: server.start is in flight");
+  await commands.get("mlx-init")!("", ctx);
+  gate.resolve();
+  await starting;
+
+  assert.equal(installCalls.length, 1, "the refused init must not run an install");
+  assert.ok(errors(notes).some((m) => m.includes("/mlx-stop")), "the refusal says how to recover");
+  assert.equal(lastStatus(statuses), `mlx: running (${MODEL_PRESETS[0].modelId})`);
+  assert.ok(notes.some((n) => n.message.startsWith("MLX server is ready for prompts")));
+  assert.deepEqual(modelIdsOf(providerCalls.at(-1)), [MODEL_PRESETS[0].modelId]);
+});
+
+test("an mlx-init after a start does not drop a later crash of the server", async () => {
+  let emit: ((event: ServerEvent) => void) | undefined;
+  const { commands, ctx, statuses } = await setup({
+    server: {
+      start: async (_model, onEvent) => {
+        emit = onEvent;
+        onEvent?.({ type: "ready" });
+      },
+    },
+  });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+  assert.equal(lastStatus(statuses), `mlx: running (${MODEL_PRESETS[0].modelId})`);
+  await commands.get("mlx-init")!("", ctx);
+  emit?.({ type: "exited" });
+
+  assert.equal(lastStatus(statuses), "mlx: stopped", "a crash after init must still be reported");
+});
+
+test("an mlx-init after an mlx-stop waits for the stopped start's install and then runs its own", async () => {
+  const gates = [deferred(), deferred()];
+  let running = 0;
+  let maxRunning = 0;
+  let call = 0;
+  const { commands, ctx } = await setup({
+    ensureInstalled: async () => {
+      const gate = gates[call++];
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      await gate?.promise;
+      running -= 1;
+    },
+  });
+
+  const starting = commands.get("mlx-start")!("qwen3_4b", ctx);
+  await flush();
+  await commands.get("mlx-stop")!("", ctx);
+  const initing = commands.get("mlx-init")!("", ctx);
+  await flush();
+  gates[0].resolve();
+  await flush();
+  gates[1].resolve();
+  await Promise.all([starting, initing]);
+
+  assert.equal(maxRunning, 1);
+  assert.equal(call, 2, "an upgrade install is not satisfied by a plain one");
+});
+
 test("session_shutdown while the runtime installs: the server is never started afterwards", async () => {
   const gate = deferred();
   const { server, handlers, commands, ctx } = await setup({
