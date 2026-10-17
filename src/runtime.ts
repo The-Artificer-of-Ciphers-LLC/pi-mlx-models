@@ -86,7 +86,7 @@ export function findPython(options: { candidates?: string[]; env?: NodeJS.Proces
   return null;
 }
 
-function run(cmd: string, args: string[], onLine?: (line: string) => void): Promise<void> {
+export function run(cmd: string, args: string[], onLine?: (line: string) => void): Promise<void> {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
     let err = "";

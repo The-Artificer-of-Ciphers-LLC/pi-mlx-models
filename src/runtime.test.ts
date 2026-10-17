@@ -4,7 +4,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { VENV_PYTHON } from "./config.js";
-import { ensureInstalled, findPython, pythonCandidates, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
+import { ensureInstalled, findPython, pythonCandidates, run, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
 
 function fakeHost(overrides: Partial<RuntimeHost> & { venv?: boolean } = {}) {
   const calls: string[][] = [];
@@ -234,4 +234,13 @@ test("PATH entries are expanded name-major so the newest name anywhere beats an 
     join("/a", "python3"),
     join("/b", "python3"),
   ]);
+});
+
+// WR-03: `exit` can fire before the child's stderr is fully read; a failure must carry the final output.
+test("run reports stderr that a lingering grandchild writes after the child has already exited", async () => {
+  // The child spawns a grandchild that inherits stderr and writes after Node starts up, then exits at once.
+  const grandchild = "process.stderr.write('LATE-TAIL')";
+  const child = `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: ['ignore', 'inherit', 'inherit'] }); process.exit(1)`;
+
+  await assert.rejects(run(process.execPath, ["-e", child]), /LATE-TAIL/);
 });
