@@ -43,8 +43,14 @@ export type ResolvedModel =
 export function resolveModel(input: string | undefined, defaultModel: string): ResolvedModel {
   const normalized = (input || "").trim();
   if (!normalized) {
-    const preset = MODEL_PRESETS.find((p) => p.modelId === defaultModel || p.key === defaultModel);
-    return { modelId: preset?.modelId ?? defaultModel, preset };
+    // The default comes from PI_MLX_MODELS_DEFAULT_MODEL, so it gets the same checks as typed input.
+    const fallback = defaultModel.trim();
+    if (!fallback) return { error: "No model was given and no default model is configured (PI_MLX_MODELS_DEFAULT_MODEL)" };
+    if (fallback.startsWith("-")) {
+      return { error: `The default model id must not start with "-" (got ${JSON.stringify(fallback)}); check PI_MLX_MODELS_DEFAULT_MODEL` };
+    }
+    const preset = MODEL_PRESETS.find((p) => p.modelId === fallback || p.key === fallback);
+    return { modelId: preset?.modelId ?? fallback, preset };
   }
 
   if (/^\d+$/.test(normalized)) {
