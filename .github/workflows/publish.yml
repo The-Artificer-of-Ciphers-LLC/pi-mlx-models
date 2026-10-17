@@ -7,6 +7,10 @@ name: Publish
 # package's trusted publisher must name this repository and this exact file name (publish.yml); every field is
 # case-sensitive. A package has to exist before a trusted publisher can be added, so the very first version is
 # published by hand. Do not set NODE_AUTH_TOKEN anywhere in this job: even an empty value stops npm falling back to OIDC.
+#
+# The trusted publisher allows only `npm stage publish` (the direct `npm publish` action is left off, as npm
+# recommends). So a tag stages the release and it goes live when a maintainer approves it with two-factor
+# authentication: the Approve button on the package's Staged Packages tab, or `npm stage approve <stage-id>`.
 on:
   push:
     tags: ["v*"]
@@ -95,7 +99,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
+            # Packs and checks the tarball; a dry run never talks to the registry, so it needs no permission.
             npm publish --provenance --access public --dry-run
           else
-            npm publish --provenance --access public
+            npm stage publish
+            echo "Staged. Approve it on the package's Staged Packages tab, or run: npm stage list" >> "$GITHUB_STEP_SUMMARY"
           fi

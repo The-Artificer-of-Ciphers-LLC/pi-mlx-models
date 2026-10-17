@@ -2,11 +2,17 @@
 
 All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.2.0 were published as `pi-mlx-models`; see the [tags](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/tags) for their code.
 
+## 0.2.2 - 2026-10-17
+
+### Project
+
+- Releases are now staged with `npm stage publish` from GitHub Actions, and go live when a maintainer approves them with two-factor authentication. This matches the trusted publisher, which does not allow a direct `npm publish`. There are no code changes since 0.2.0.
+
 ## 0.2.1 - 2026-10-17
 
 ### Project
 
-- First release published from GitHub Actions through npm trusted publishing, with a provenance statement linking the package to the build. There are no code changes since 0.2.0.
+- Not published to npm. The first CI publish of this version was refused because the workflow used a direct publish that the trusted publisher does not allow; 0.2.2 replaces it.
 
 ## 0.2.0 - 2026-10-17
 
