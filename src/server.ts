@@ -168,6 +168,9 @@ export function createMlxServer(
     }
   };
 
+  /** Poll bodies are never read; cancel them so undici gives the socket back instead of holding it until GC. */
+  const release = (res: Response) => res.body?.cancel().catch(() => {});
+
   async function waitForServer(c: Current) {
     const start = Date.now();
     while (Date.now() - start < healthTimeoutMs) {
@@ -176,6 +179,7 @@ export function createMlxServer(
       try {
         const res = await host.fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(healthRequestTimeoutMs) });
         ok = res.ok;
+        await release(res);
       } catch {
         // retry
       }
@@ -212,7 +216,10 @@ export function createMlxServer(
       }
       assertAlive(c); // same rule as the health check: never ready on a dead process's say-so
       if (res) {
-        if (res.ok) return;
+        if (res.ok) {
+          await release(res);
+          return;
+        }
         // Any HTTP error is the server's final answer about this request (D-11): show it, do not retry.
         const body = await res.text().catch(() => "");
         const detail = clipDiagnostic(body, 400, "start");
