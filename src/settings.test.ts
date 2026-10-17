@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MODEL_ID } from "./config.js";
 import {
+  PI_FLAGS,
+  SETTINGS,
   buildLaunch,
+  cliFlagSpecs,
   describeFlags,
   formatConfigErrors,
   prepareSettings,
@@ -14,6 +17,7 @@ import {
   type LayerFile,
   type PrepareInput,
   type Prepared,
+  type SettingDef,
 } from "./settings.js";
 
 const ok = (data: Record<string, unknown>): LayerFile => ({ state: "ok", data });
@@ -833,4 +837,256 @@ test("a single problem over the cap is described in the singular", () => {
   for (let i = 0; i < 21; i += 1) data[`unknownkey${String(i).padStart(2, "0")}`] = i;
   const lines = formatConfigErrors(refused({ global: ok(data) })).split("\n");
   assert.equal(lines.at(-1), "  ...and 1 more problem");
+});
+
+// ---- command-line flags and pi flags (plan 02-04) ----
+
+test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order, each with a value", () => {
+  assert.deepEqual(cliFlagSpecs(), [
+    { flag: "--host", path: "server.host", takesValue: true },
+    { flag: "--port", path: "server.port", takesValue: true },
+    { flag: "--allowed-origins", path: "server.allowedOrigins", takesValue: true },
+    { flag: "--log-level", path: "server.logLevel", takesValue: true },
+  ]);
+});
+
+test("cliFlagSpecs is derived from the table: a row with a cli name appears and one without does not", () => {
+  const extra: SettingDef = {
+    path: "server.example",
+    kind: "string",
+    expected: "anything",
+    check: (value) => ({ ok: true, value: String(value) }),
+    problem: (shown) => shown,
+    parseText: (raw) => ({ ok: true, value: raw }),
+    cli: "--example",
+    emit: () => [],
+  };
+  const table = SETTINGS as SettingDef[];
+  table.push(extra);
+  try {
+    assert.deepEqual(cliFlagSpecs().at(-1), { flag: "--example", path: "server.example", takesValue: true });
+  } finally {
+    table.pop();
+  }
+  assert.ok(!cliFlagSpecs().some((spec) => spec.flag === "--example"));
+  assert.ok(!cliFlagSpecs().some((spec) => spec.path === "baseUrl" || spec.path === "defaultModel"));
+});
+
+test("PI_FLAGS lists the four pi flags with descriptions; three of them map to settings", () => {
+  assert.deepEqual(
+    PI_FLAGS.map((flag) => [flag.name, flag.path]),
+    [
+      ["mlx-model", undefined],
+      ["mlx-port", "server.port"],
+      ["mlx-host", "server.host"],
+      ["mlx-log-level", "server.logLevel"],
+    ],
+  );
+  for (const flag of PI_FLAGS) assert.ok(flag.description.length > 10, flag.name);
+  for (const flag of PI_FLAGS) {
+    if (flag.path === undefined) continue;
+    assert.equal(SETTINGS.find((row) => row.path === flag.path)?.piFlag, flag.name, `${flag.name} must be the row's pi flag`);
+  }
+});
+
+test("server.port: a command-line flag beats a pi flag", () => {
+  const { prepared } = resolved({ args: { "server.port": "9000" }, piFlags: { "mlx-port": "9100" } });
+  assert.equal(prepared.address.port, 9000);
+  assert.equal(prepared.baseUrl, "http://127.0.0.1:9000/v1");
+  assert.deepEqual(
+    prepared.flags.map((flag) => [flag.flag, flag.display, flag.label]),
+    [["--port", "9000", "/mlx-start"]],
+  );
+});
+
+test("server.port: a pi flag beats the environment", () => {
+  const { prepared } = resolved({ piFlags: { "mlx-port": "9100" }, env: { PI_MLX_MODELS_PORT: "9200" } });
+  assert.equal(prepared.address.port, 9100);
+  assert.equal(prepared.flags[0].label, "pi flag --mlx-port");
+});
+
+test("server.port: the whole ladder, one layer removed at a time", () => {
+  const input: Partial<PrepareInput> = {
+    args: { "server.port": "9000" },
+    piFlags: { "mlx-port": "9100" },
+    env: { PI_MLX_MODELS_PORT: "9200" },
+    project: ok({ server: { port: 9300 } }),
+    global: ok({ server: { port: 9400 } }),
+  };
+  const portAndLabel = (i: Partial<PrepareInput>) => {
+    const { prepared } = resolved(i);
+    return [prepared.address.port, prepared.flags[0]?.label];
+  };
+  assert.deepEqual(portAndLabel(input), [9000, "/mlx-start"]);
+  assert.deepEqual(portAndLabel({ ...input, args: undefined }), [9100, "pi flag --mlx-port"]);
+  assert.deepEqual(portAndLabel({ ...input, args: undefined, piFlags: undefined }), [9200, "env PI_MLX_MODELS_PORT"]);
+  assert.deepEqual(portAndLabel({ ...input, args: undefined, piFlags: undefined, env: {} }), [9300, "project file"]);
+  assert.deepEqual(portAndLabel({ global: input.global }), [9400, "global file"]);
+  assert.deepEqual(portAndLabel({}), [8080, undefined]);
+});
+
+test("server.logLevel: a command-line flag beats a pi flag, which beats the project file", () => {
+  const project = ok({ server: { logLevel: "WARNING" } });
+  const piFlags = { "mlx-log-level": "ERROR" };
+  const withArgs = resolved({ args: { "server.logLevel": "DEBUG" }, piFlags, project });
+  assert.deepEqual(
+    withArgs.prepared.flags.map((flag) => [flag.args, flag.label]),
+    [[["--log-level=DEBUG"], "/mlx-start"]],
+  );
+  const withPi = resolved({ piFlags, project });
+  assert.deepEqual(
+    withPi.prepared.flags.map((flag) => [flag.args, flag.label]),
+    [[["--log-level=ERROR"], "pi flag --mlx-log-level"]],
+  );
+});
+
+test("server.host: a command-line flag beats a pi flag, which beats the environment", () => {
+  const env = { PI_MLX_MODELS_HOST: "127.0.0.3" };
+  const piFlags = { "mlx-host": "127.0.0.2" };
+  assert.equal(resolved({ args: { "server.host": "localhost" }, piFlags, env }).prepared.address.host, "localhost");
+  assert.equal(resolved({ piFlags, env }).prepared.address.host, "127.0.0.2");
+  assert.equal(resolved({ env }).prepared.address.host, "127.0.0.3");
+});
+
+test("the flags line shows every non-default flag with the layer that set it", () => {
+  assert.equal(
+    flagsLine({ args: { "server.port": "9000" }, piFlags: { "mlx-log-level": "DEBUG" } }),
+    "flags: --port 9000 (/mlx-start), --log-level DEBUG (pi flag --mlx-log-level)",
+  );
+});
+
+test("text from a flag is trimmed like text from the environment", () => {
+  const { prepared } = resolved({ args: { "server.port": " 9000 " }, piFlags: { "mlx-log-level": " DEBUG " } });
+  assert.equal(prepared.address.port, 9000);
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--log-level=DEBUG"]);
+});
+
+function buildOk(prepared: Prepared) {
+  const built = buildLaunch(prepared, { modelId: "org/model" });
+  assert.ok(built.ok);
+  return built.launch;
+}
+
+test("a blank pi flag value is ignored", () => {
+  const { prepared } = resolved({
+    piFlags: { "mlx-port": "   ", "mlx-host": "", "mlx-log-level": undefined },
+    global: ok({ server: { port: 9400 } }),
+  });
+  assert.equal(prepared.address.port, 9400);
+  assert.equal(prepared.address.host, "127.0.0.1");
+});
+
+test("command-line values for a path with no row, or a row with no flag, never reach the server", () => {
+  const { prepared } = resolved({ args: { "server.nonsense": "1", baseUrl: "http://evil.test/v1", defaultModel: "x/y", "--port": "1" } });
+  assert.deepEqual(prepared.flags, []);
+  assert.equal(prepared.baseUrl, "http://127.0.0.1:8080/v1");
+  assert.equal(prepared.address.port, 8080);
+});
+
+test("an invalid command-line value is an error labelled with the flag that carried it", () => {
+  assert.deepEqual(refused({ args: { "server.port": "abc" } }), [
+    'server.port (/mlx-start --port): "abc" is not an integer from 1 to 65535',
+  ]);
+  assert.deepEqual(refused({ args: { "server.logLevel": "loud" } }), [
+    'server.logLevel (/mlx-start --log-level): "loud" must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL',
+  ]);
+});
+
+test("an invalid pi flag value is an error labelled with the pi flag", () => {
+  assert.deepEqual(refused({ piFlags: { "mlx-port": "70000" } }), [
+    'server.port (pi flag --mlx-port): "70000" is not an integer from 1 to 65535',
+  ]);
+  assert.deepEqual(refused({ piFlags: { "mlx-host": "-bad" } }), [
+    'server.host (pi flag --mlx-host): "-bad" is not a valid host name or address',
+  ]);
+});
+
+test("a bad value is an error even when a lower layer would have supplied a good one", () => {
+  const lines = refused({ args: { "server.port": "abc" }, env: { PI_MLX_MODELS_PORT: "9200" }, global: ok({ server: { port: 9400 } }) });
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].startsWith("server.port (/mlx-start --port)"));
+});
+
+test("a flag given without its value is an error naming the flag", () => {
+  assert.deepEqual(refused({ args: { "server.port": true } }), [
+    "server.port (/mlx-start --port): needs a value (a port number from 1 to 65535)",
+  ]);
+});
+
+test("problems are listed command line first, then pi flags, then the project file, then the global file", () => {
+  const lines = refused({
+    global: ok({ server: { logLevel: "nope" } }),
+    project: ok({ server: { host: "bad host" } }),
+    piFlags: { "mlx-port": "70000" },
+    args: { "server.logLevel": "loud" },
+  });
+  assert.equal(lines.length, 4);
+  assert.ok(lines[0].startsWith("server.logLevel (/mlx-start --log-level)"), lines[0]);
+  assert.ok(lines[1].startsWith("server.port (pi flag --mlx-port)"), lines[1]);
+  assert.ok(lines[2].startsWith("server.host (project .pi/pi-mlx-models.json)"), lines[2]);
+  assert.ok(lines[3].startsWith(`server.logLevel (${GLOBAL})`), lines[3]);
+});
+
+test("an echoed flag value is cleaned of control characters and clipped", () => {
+  const [line] = refused({ args: { "server.port": `\u001b[31m${"9".repeat(300)}` } });
+  assert.ok(!CONTROL_CHARACTERS.test(line), JSON.stringify(line));
+  assert.ok(line.length < 200, `${line.length}`);
+});
+
+test("server.allowedOrigins: a list in a file and a comma list as text give the same flag", () => {
+  const fromFile = resolved({ global: ok({ server: { allowedOrigins: ["http://a.test", "http://b.test"] } }) });
+  assert.deepEqual(
+    fromFile.prepared.flags.map((flag) => [flag.flag, flag.args, flag.display, flag.label]),
+    [["--allowed-origins", ["--allowed-origins=http://a.test,http://b.test"], "http://a.test,http://b.test", "global file"]],
+  );
+  const fromText = resolved({ args: { "server.allowedOrigins": "http://a.test,http://b.test" } });
+  assert.deepEqual(
+    fromText.prepared.flags.map((flag) => flag.args),
+    [["--allowed-origins=http://a.test,http://b.test"]],
+  );
+});
+
+test("server.allowedOrigins accepts a single entry and the wildcard", () => {
+  assert.deepEqual(
+    resolved({ args: { "server.allowedOrigins": "*" } }).prepared.flags.map((flag) => flag.args),
+    [["--allowed-origins=*"]],
+  );
+  assert.deepEqual(
+    resolved({ global: ok({ server: { allowedOrigins: ["*"] } }) }).prepared.flags.map((flag) => flag.args),
+    [["--allowed-origins=*"]],
+  );
+});
+
+test("server.allowedOrigins: the extra argument is a single element and sits between port and log level", () => {
+  const { prepared } = resolved({
+    args: { "server.logLevel": "DEBUG", "server.allowedOrigins": "http://a.test", "server.port": "9000" },
+  });
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--allowed-origins=http://a.test", "--log-level=DEBUG"]);
+});
+
+test("server.allowedOrigins: lists that are empty, malformed or the wrong type are errors", () => {
+  const phrase = "must be a list of non-empty strings without commas or spaces";
+  const cases: unknown[] = [[], [""], ["a,b"], ["a b"], ["a\tb"], [1], ["ok", null], "http://a.test", 7, {}];
+  for (const value of cases) {
+    const lines = refused({ global: ok({ server: { allowedOrigins: value } }) });
+    assert.equal(lines.length, 1, JSON.stringify(value));
+    assert.ok(lines[0].includes(phrase), lines[0]);
+    assert.ok(lines[0].startsWith(`server.allowedOrigins (${GLOBAL}):`), lines[0]);
+  }
+});
+
+test("server.allowedOrigins: comma text with an empty or spaced entry is an error", () => {
+  const phrase = "must be a list of non-empty strings without commas or spaces";
+  for (const text of ["a,,b", "a,b,", ",a", "", "a, b", "a b"]) {
+    const lines = refused({ args: { "server.allowedOrigins": text } });
+    assert.equal(lines.length, 1, JSON.stringify(text));
+    assert.ok(lines[0].startsWith("server.allowedOrigins (/mlx-start --allowed-origins):"), lines[0]);
+    assert.ok(lines[0].includes(phrase), lines[0]);
+  }
+});
+
+test("server.allowedOrigins is a known key: it is not reported as unknown and no default is emitted", () => {
+  assert.deepEqual(resolved({ global: ok({ server: {} }) }).prepared.flags, []);
+  const lines = refused({ global: ok({ server: { allowedOrigin: ["http://a.test"] } }) });
+  assert.ok(lines[0].includes("did you mean server.allowedOrigins?"), lines[0]);
 });

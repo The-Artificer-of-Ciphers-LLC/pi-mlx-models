@@ -2,6 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
+import type { CliFlagSpec } from "./startargs.js";
 
 /**
  * Layered configuration. One table (`SETTINGS`) says what a setting is called in each layer, how its
@@ -102,6 +103,8 @@ export interface SettingDef {
   blankEnvInvalid?: boolean;
   /** `/mlx-start` flag name (a later plan fills this in). */
   arg?: string;
+  /** The flag spelling `/mlx-start` accepts for this row, for example `--port`. */
+  cli?: string;
   /** pi flag name (a later plan fills this in). */
   piFlag?: string;
   /** The mlx_lm.server flag this row becomes. */
@@ -236,6 +239,19 @@ export const SETTINGS: readonly SettingDef[] = [
     emit: () => [],
   },
 ];
+
+/** A pi flag: its name without dashes, what it does, and the setting it sets (none for `mlx-model`). */
+export interface PiFlagDef {
+  name: string;
+  description: string;
+  path?: string;
+}
+
+export const PI_FLAGS: readonly PiFlagDef[] = [];
+
+export function cliFlagSpecs(): CliFlagSpec[] {
+  return [];
+}
 
 const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
 /** The block names of nested keys, e.g. "server". */
