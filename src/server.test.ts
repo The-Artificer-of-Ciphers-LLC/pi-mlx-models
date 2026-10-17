@@ -723,3 +723,34 @@ test("the system host's sleep timer does not keep the process alive", async () =
     globalThis.setTimeout = realSetTimeout;
   }
 });
+
+// IN-03: poll responses whose body is never read keep the socket until GC.
+test("health and warm-up poll responses have their bodies released", async () => {
+  let released = 0;
+  let responses = 0;
+  const tracked = (status: number) => {
+    responses += 1;
+    const body = new ReadableStream({
+      cancel() {
+        released += 1;
+      },
+    });
+    return new Response(body, { status });
+  };
+  let modelCalls = 0;
+  const { host } = makeHost({
+    fetch: async (url) => {
+      if (String(url).endsWith("/models")) {
+        modelCalls += 1;
+        return tracked(modelCalls < 3 ? 503 : 200);
+      }
+      return tracked(200);
+    },
+  });
+  const server = createMlxServer({ ...opts, host });
+
+  await server.start("m");
+
+  assert.equal(responses, 4, "three health polls and one warm-up");
+  assert.equal(released, responses, "every poll response body must be cancelled or read");
+});
