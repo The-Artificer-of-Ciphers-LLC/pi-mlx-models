@@ -1,5 +1,4 @@
 import { readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
@@ -1005,8 +1004,7 @@ const layerLabel = (layer: LayerName, row: SettingDef): string =>
  * precedence up (so a project `model` block beats a global `models` entry), and what was typed on `/mlx-start`
  * comes last. Paths are resolved, the chat template file is read, and the flags come out in schema order.
  */
-export function buildLaunch(prepared: Prepared, model: { modelId: string; presetKey?: string }, context?: LaunchContext): BuildResult {
-  const where: LaunchContext = context ?? { home: homedir(), cwd: process.cwd() };
+export function buildLaunch(prepared: Prepared, model: { modelId: string; presetKey?: string }, where: LaunchContext): BuildResult {
   const folded = new Map<string, { value: SettingValue; layer: LayerName }>();
   const apply = (values: ReadonlyMap<string, SettingValue> | undefined, layer: LayerName) => {
     if (values === undefined) return;

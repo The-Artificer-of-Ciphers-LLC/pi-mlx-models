@@ -64,6 +64,9 @@ export interface ExtensionDeps {
 
 const errorMessage = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** The project directory of a command: pi's `ctx.cwd`, or the process's own when pi gives none. */
+const workingDirectory = (ctx: any): string => (typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd());
+
 /** "a", "a and b", "a, b and c". */
 const joinPhrases = (phrases: readonly string[]): string =>
   phrases.length > 1 ? `${phrases.slice(0, -1).join(", ")} and ${phrases[phrases.length - 1]}` : (phrases[0] ?? "");
@@ -248,7 +251,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       ctx.ui.notify(`mlx-start failed: ${selected.error}`, "error");
       return;
     }
-    const built = buildLaunch(prepared, { modelId: selected.modelId, ...(selected.preset ? { presetKey: selected.preset.key } : {}) });
+    // The model's own options (the `model` block and its `models` entries) are settled here; `~` and relative paths
+    // resolve against the configured home directory and the project directory, and the chat template is read now.
+    const built = buildLaunch(
+      prepared,
+      { modelId: selected.modelId, ...(selected.preset ? { presetKey: selected.preset.key } : {}) },
+      { home: deps.settings.home, cwd: workingDirectory(ctx) },
+    );
     if (!built.ok) {
       ctx.ui.notify(`mlx-start failed: ${formatConfigErrors(built.errors)}`, "error");
       return;
@@ -442,7 +451,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         // start, so an edit needs no reload (D-04, D-05).
         const result = prepareSettings({
           global: readLayerFile(deps.settings.globalConfigPath),
-          project: readLayerFile(join(typeof ctx.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd(), PROJECT_CONFIG_RELPATH)),
+          project: readLayerFile(join(workingDirectory(ctx), PROJECT_CONFIG_RELPATH)),
           env: deps.settings.env,
           piFlags,
           args: typed,
