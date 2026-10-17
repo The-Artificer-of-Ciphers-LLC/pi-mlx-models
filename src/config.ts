@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 // Namespace import so a pi build without the getAgentDir export yields undefined instead of a load-time failure.
-import * as pi from "@mariozechner/pi-coding-agent";
+import * as pi from "@earendil-works/pi-coding-agent";
 
 export const DEFAULT_PORT = 8080;
 export const DEFAULT_HOST = "127.0.0.1";

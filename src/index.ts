@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_HOST,
   DEFAULT_MODEL_ID,
@@ -77,7 +77,7 @@ const joinPhrases = (phrases: readonly string[]): string =>
 
 /**
  * The last line of every trust dialog (CFG-06, GAP-02). pi's `ctx.ui.confirm(title, message, opts?)` takes options of
- * type `ExtensionUIDialogOptions`, which carries only `signal` and `timeout` (checked in @mariozechner/pi-coding-agent
+ * type `ExtensionUIDialogOptions`, which carries only `signal` and `timeout` (checked in @earendil-works/pi-coding-agent
  * 0.73.0 and @earendil-works/pi-coding-agent 1.3.0). An extension therefore cannot choose which choice is highlighted,
  * and interactive pi opens the dialog with Yes highlighted. This sentence is the only protection available while the
  * call stays `ctx.ui.confirm` (D-13); pressing Enter without reading still selects Yes. The real fix is a default option

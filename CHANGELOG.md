@@ -4,6 +4,10 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 ## Unreleased
 
+### Changed
+
+- The extension now names pi's current package, `@earendil-works/pi-coding-agent`, as its peer dependency and in its imports. It named `@mariozechner/pi-coding-agent`, which npm has deprecated in favour of the new name and which has had no release since May 2026.
+
 ### Project
 
 - A release is now one manual run of the Release workflow: it bumps the version, updates this changelog, builds and tests, stages the release on npm and tags it. Pushing a tag no longer publishes anything.
