@@ -4,6 +4,10 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 ## Unreleased
 
+### Changed
+
+- The extension now names pi's current package, `@earendil-works/pi-coding-agent`, as its peer dependency and in its imports. It named `@mariozechner/pi-coding-agent`, which npm has deprecated in favour of the new name and which has had no release since May 2026.
+
 ### Fixed
 
 - A project file (`.pi/pi-mlx-models.json`) can no longer set `server.allowedOrigins`: like a non-loopback host, it is refused with a warning, and the same setting in the global file still works.
