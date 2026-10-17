@@ -281,8 +281,12 @@ export function createMlxServer(
       // Never spawn while the old process might still hold the port (D-05).
       const hadPrevious = current !== null || pendingStop !== null;
       const stopped = stop();
-      if (hadPrevious) await stopped;
+      // Captured before waiting on the teardown, so a stop() issued meanwhile cancels this start.
       const myGeneration = generation;
+      if (hadPrevious) {
+        await stopped;
+        if (generation !== myGeneration) throw new Error("MLX server start was cancelled");
+      }
 
       // Ownership check (D-04): refuse an occupied port before anything is spawned.
       const inUse = await host.portInUse(address.host, address.port);
