@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { createMlxServer, createSystemHost, type ServerEvent, type ServerHost, type ServerProcess } from "./server.js";
+import { buildServerArgs, createMlxServer, createSystemHost, type ServerEvent, type ServerHost, type ServerProcess } from "./server.js";
 
 class FakeProc extends EventEmitter implements ServerProcess {
   stderr = new EventEmitter() as EventEmitter & { on(event: "data", l: (c: Buffer | string) => void): unknown };
@@ -277,6 +277,7 @@ test("start refuses an occupied port when there was no previous server, naming t
   await assert.rejects(server.start("m"), (err: Error) => {
     assert.match(err.message, /54321/);
     assert.match(err.message, /PI_MLX_MODELS_PORT/);
+    assert.match(err.message, /--port on \/mlx-start/, "the per-launch option is offered first");
     assert.match(err.message, /lsof -nP -iTCP:54321 -sTCP:LISTEN/);
     assert.doesNotMatch(err.message, /still in use/);
     return true;
@@ -312,6 +313,7 @@ test("start on a running server whose port stays busy rejects with 'still in use
   await assert.rejects(server.start("b"), (err: Error) => {
     assert.match(err.message, /still in use/);
     assert.match(err.message, /PI_MLX_MODELS_PORT/);
+    assert.match(err.message, /--port on \/mlx-start/, "the per-launch option is offered first");
     return true;
   });
 
@@ -390,6 +392,7 @@ async function startWithBindFailure(chunks: string[]) {
 function assertBindFailureMessage(err: Error) {
   assert.match(err.message, /54321/);
   assert.match(err.message, /PI_MLX_MODELS_PORT/);
+  assert.match(err.message, /--port on \/mlx-start/, "the per-launch option is offered first");
   assert.doesNotMatch(err.message, /Errno|Address already in use/, "the message must not embed raw stderr text");
   return true;
 }
@@ -832,4 +835,24 @@ test("health and warm-up poll responses have their bodies released", async () =>
 
   assert.equal(responses, 4, "three health polls and one warm-up");
   assert.equal(released, responses, "every poll response body must be cancelled or read");
+});
+
+// Golden: a launch that sets nothing has the Phase 1 argv, byte for byte.
+test("buildServerArgs without extras is the Phase 1 argv", () => {
+  assert.deepEqual(buildServerArgs("m", { host: "127.0.0.1", port: 8080 }), [
+    "-m",
+    "mlx_lm.server",
+    "--model",
+    "m",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8080",
+  ]);
+});
+
+test("buildServerArgs appends extras last and changes nothing before them", () => {
+  const plain = buildServerArgs("m", { host: "127.0.0.1", port: 8080 });
+  const extended = buildServerArgs("m", { host: "127.0.0.1", port: 8080 }, ["--log-level=DEBUG"]);
+  assert.deepEqual(extended, [...plain, "--log-level=DEBUG"]);
 });

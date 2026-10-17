@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { BASE_URL, HF_HOME, HOST, PORT, VENV_PYTHON } from "./config.js";
+import { DEFAULT_HOST, DEFAULT_PORT, HF_HOME, VENV_PYTHON, deriveBaseUrl } from "./config.js";
 import { clipDiagnostic } from "./diagnostic.js";
 import { probePort, waitForPortFree } from "./port.js";
 
@@ -35,9 +35,20 @@ export interface ServerAddress {
   port: number;
 }
 
+/**
+ * Everything one launch needs beyond the model: where it listens, the URL clients use, and the extra
+ * server flags. Travels with the launch so nothing downstream reads a construction-time constant.
+ */
+export interface LaunchSpec {
+  address: ServerAddress;
+  baseUrl: string;
+  /** Extra argv elements appended after the Phase 1 argv; each valued flag is one `--flag=value` element. */
+  extraArgs: readonly string[];
+}
+
 /** The machine-facing seam: real child/fetch/timers in production, fakes in tests. */
 export interface ServerHost {
-  spawn(model: string, address: ServerAddress): ServerProcess;
+  spawn(model: string, address: ServerAddress, extraArgs?: readonly string[]): ServerProcess;
   fetch: typeof fetch;
   sleep(ms: number): Promise<void>;
   /** True when something already holds host:port (a connect or an exclusive bind says so). */
@@ -46,8 +57,11 @@ export interface ServerHost {
 
 export interface MlxServer {
   readonly running: boolean;
-  /** Start (or restart) the server on `model` and resolve once it answers a completion. Rejects if the process dies first. */
-  start(model: string, onEvent?: (event: ServerEvent) => void): Promise<void>;
+  /**
+   * Start (or restart) the server on `model` and resolve once it answers a completion. Rejects if the process dies first.
+   * `launch` carries this launch's address, base URL and extra flags; without it the construction-time address is used.
+   */
+  start(model: string, onEvent?: (event: ServerEvent) => void, launch?: LaunchSpec): Promise<void>;
   /** Stop the server. Resolves (never rejects) once the child has exited; SIGKILL follows SIGTERM after `killWaitMs`. */
   stop(): Promise<void>;
 }
@@ -56,31 +70,33 @@ export interface SystemHostOptions {
   /** Executable to spawn. Defaults to the venv python. */
   command?: string;
   /** argv for the command. Defaults to the module-form `python -m mlx_lm.server` launch. */
-  buildArgs?: (model: string, address: ServerAddress) => string[];
+  buildArgs?: (model: string, address: ServerAddress, extraArgs: readonly string[]) => string[];
   /** Extra environment, merged last so it wins over the defaults. */
   env?: NodeJS.ProcessEnv;
+  /** Working directory of the child. Defaults to pi's own, i.e. unchanged. */
+  cwd?: string;
 }
 
-const moduleArgs = (model: string, address: ServerAddress) => [
-  "-m",
-  "mlx_lm.server",
-  "--model",
-  model,
-  "--host",
-  address.host,
-  "--port",
-  String(address.port),
-];
+/**
+ * The module-form launch argv: the Phase 1 argv unchanged, then `extraArgs`. A launch that sets nothing
+ * therefore has the exact argv it had before layered configuration existed.
+ */
+export function buildServerArgs(model: string, address: ServerAddress, extraArgs: readonly string[] = []): string[] {
+  return ["-m", "mlx_lm.server", "--model", model, "--host", address.host, "--port", String(address.port), ...extraArgs];
+}
 
 /** The real child/fetch/timer host. Tests point `command`/`buildArgs` at a stub process. */
 export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
   const command = options.command ?? VENV_PYTHON;
-  const buildArgs = options.buildArgs ?? moduleArgs;
+  const buildArgs = options.buildArgs ?? buildServerArgs;
   return {
-    spawn: (model, address) =>
-      spawn(command, buildArgs(model, address), {
-        env: { ...process.env, HF_HOME, TRANSFORMERS_CACHE: HF_HOME, HF_HUB_DISABLE_TELEMETRY: "1", ...options.env },
+    spawn: (model, address, extraArgs = []) =>
+      spawn(command, buildArgs(model, address, extraArgs), {
+        // PYTHONSAFEPATH keeps the working directory off sys.path, so a cloned project directory cannot
+        // shadow mlx_lm with its own module (Python before 3.11 ignores the variable).
+        env: { ...process.env, HF_HOME, TRANSFORMERS_CACHE: HF_HOME, HF_HUB_DISABLE_TELEMETRY: "1", PYTHONSAFEPATH: "1", ...options.env },
         stdio: ["ignore", "pipe", "pipe"],
+        ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
       }),
     fetch: (input, init) => fetch(input, init),
     // Unref'd so a losing kill-wait race cannot hold pi open for the rest of its window.
@@ -93,6 +109,10 @@ export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
 }
 
 const systemHost = createSystemHost();
+
+/** The ways to pick another port, nearest first: this launch, then the files, then the environment. */
+const PORT_ADVICE = "set a different port with --port on /mlx-start, server.port in config.json, or PI_MLX_MODELS_PORT";
+const PORT_ADVICE_SENTENCE = `S${PORT_ADVICE.slice(1)}`;
 
 export function createMlxServer(
   options: {
@@ -114,8 +134,9 @@ export function createMlxServer(
   } = {},
 ): MlxServer {
   const host = options.host ?? systemHost;
-  const address = options.address ?? { host: HOST, port: PORT };
-  const baseUrl = options.baseUrl ?? BASE_URL;
+  // Only the fallback for a start() without a LaunchSpec; every running process carries its own address and base URL.
+  const defaultAddress = options.address ?? { host: DEFAULT_HOST, port: DEFAULT_PORT };
+  const defaultBaseUrl = options.baseUrl ?? deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT);
   const healthTimeoutMs = options.healthTimeoutMs ?? 600_000;
   const warmupTimeoutMs = options.warmupTimeoutMs ?? 1_800_000;
   const healthRequestTimeoutMs = options.healthRequestTimeoutMs ?? 10_000;
@@ -128,6 +149,10 @@ export function createMlxServer(
 
   type Current = {
     proc: ServerProcess;
+    /** Where this process was launched to listen; stop, probes and messages use this, never a shared constant. */
+    address: ServerAddress;
+    /** The URL the health and warm-up requests of this process go to. */
+    baseUrl: string;
     exited: boolean;
     exitCode: number | null;
     stderrTail: string;
@@ -184,7 +209,7 @@ export function createMlxServer(
       assertAlive(c);
       let ok = false;
       try {
-        const res = await host.fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(healthRequestTimeoutMs) });
+        const res = await host.fetch(`${c.baseUrl}/models`, { signal: AbortSignal.timeout(healthRequestTimeoutMs) });
         ok = res.ok;
         await release(res);
       } catch {
@@ -206,7 +231,7 @@ export function createMlxServer(
       assertAlive(c);
       let res: Response | undefined;
       try {
-        res = await host.fetch(`${baseUrl}/chat/completions`, {
+        res = await host.fetch(`${c.baseUrl}/chat/completions`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -258,8 +283,8 @@ export function createMlxServer(
     // A child that survived SIGKILL still holds the port; there is nothing more to wait for.
     if (!c.exited) return;
     await waitForPortFree({
-      host: address.host,
-      port: address.port,
+      host: c.address.host,
+      port: c.address.port,
       probe: host.portInUse,
       sleep: host.sleep,
       timeoutMs: portReleaseTimeoutMs,
@@ -291,8 +316,11 @@ export function createMlxServer(
       return current != null && !current.exited;
     },
     stop,
-    async start(model, onEvent) {
+    async start(model, onEvent, launch) {
       const emit = onEvent ?? (() => {});
+      const address = launch?.address ?? defaultAddress;
+      const baseUrl = launch?.baseUrl ?? defaultBaseUrl;
+      const extraArgs = launch?.extraArgs ?? [];
 
       // Never spawn while the old process might still hold the port (D-05).
       const hadPrevious = current !== null || pendingStop !== null;
@@ -310,16 +338,18 @@ export function createMlxServer(
       if (inUse) {
         throw new Error(
           hadPrevious
-            ? `Port ${address.port} is still in use after stopping the previous MLX server. Retry in a moment, or set PI_MLX_MODELS_PORT to use a different port.`
-            : `Port ${address.port} on ${address.host} is already in use by another process. Set PI_MLX_MODELS_PORT to a free port, or find what holds it with: lsof -nP -iTCP:${address.port} -sTCP:LISTEN`,
+            ? `Port ${address.port} is still in use after stopping the previous MLX server. Retry in a moment, or ${PORT_ADVICE}.`
+            : `Port ${address.port} on ${address.host} is already in use by another process. ${PORT_ADVICE_SENTENCE}, or find what holds it with: lsof -nP -iTCP:${address.port} -sTCP:LISTEN`,
         );
       }
 
-      const proc = host.spawn(model, address);
+      const proc = host.spawn(model, address, extraArgs);
       let resolveExit!: () => void;
       let resolveClose!: () => void;
       const c: Current = {
         proc,
+        address,
+        baseUrl,
         exited: false,
         exitCode: null,
         stderrTail: "",
@@ -340,7 +370,7 @@ export function createMlxServer(
         c.stderrTail = (c.stderrTail + text).slice(-800);
         if (current === c && !c.fatal && BIND_FAILURE.test(c.stderrTail)) {
           // The message deliberately omits the raw stderr text.
-          c.fatal = `Port ${address.port} on ${address.host} is already in use, so the MLX server could not bind it. Set PI_MLX_MODELS_PORT to use a different port.`;
+          c.fatal = `Port ${address.port} on ${address.host} is already in use, so the MLX server could not bind it. ${PORT_ADVICE_SENTENCE}.`;
           c.proc.kill("SIGTERM");
         }
         if (current === c) parseStderr(text, emit);

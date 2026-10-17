@@ -4,6 +4,14 @@ import { homedir } from "node:os";
 import * as pi from "@mariozechner/pi-coding-agent";
 
 export const DEFAULT_PORT = 8080;
+export const DEFAULT_HOST = "127.0.0.1";
+export const DEFAULT_MODEL_ID = "mlx-community/Qwen3-4B-Instruct-2507-4bit";
+
+/** The OpenAI-style base URL for a host and port. A bare IPv6 host is bracketed. Callers append "/models" etc. */
+export function deriveBaseUrl(host: string, port: number): string {
+  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${urlHost}:${port}/v1`;
+}
 
 export interface PortResult {
   port: number;
@@ -63,6 +71,15 @@ function normalizeHost(host: string): string {
   return bare.toLowerCase();
 }
 
+/**
+ * True only for the three spellings of this machine's own loopback address: 127.0.0.1, localhost and ::1
+ * (case-insensitive, brackets stripped). Everything else is non-loopback, including the wildcards 0.0.0.0 and ::,
+ * other 127.x addresses and IPv4-mapped IPv6: the rule is deliberately conservative (D-17).
+ */
+export function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(normalizeHost(host));
+}
+
 function hostsMatch(urlHost: string, launchHost: string): boolean {
   if (urlHost === launchHost) return true;
   if (LOOPBACK_HOSTS.has(urlHost) && LOOPBACK_HOSTS.has(launchHost)) return true;
@@ -74,20 +91,31 @@ function hostsMatch(urlHost: string, launchHost: string): boolean {
  * warning when they disagree (the extension would poll and register one address while
  * the server listens on another), or null when there is nothing to report.
  */
-export function baseUrlWarning({ baseUrl, host, port }: { baseUrl: string | undefined; host: string; port: number }): string | null {
+export function baseUrlWarning({
+  baseUrl,
+  host,
+  port,
+  source = "PI_MLX_MODELS_BASE_URL",
+}: {
+  baseUrl: string | undefined;
+  host: string;
+  port: number;
+  /** What names the value in the message: the variable by default, or the layer that set it. */
+  source?: string;
+}): string | null {
   if (baseUrl === undefined) return null;
   let url: URL;
   try {
     url = new URL(baseUrl);
   } catch {
-    return `PI_MLX_MODELS_BASE_URL=${JSON.stringify(baseUrl)} is not a valid URL.`;
+    return `${source}=${JSON.stringify(baseUrl)} is not a valid URL.`;
   }
   const urlHost = normalizeHost(url.hostname);
   const urlPort = Number(url.port || (url.protocol === "https:" ? 443 : 80));
   const launchHost = normalizeHost(host);
   if (hostsMatch(urlHost, launchHost) && urlPort === port) return null;
   return (
-    `PI_MLX_MODELS_BASE_URL points at ${urlHost}:${urlPort} but the server launches on ${launchHost}:${port}; ` +
+    `${source} points at ${urlHost}:${urlPort} but the server launches on ${launchHost}:${port}; ` +
     `polling and registration would use the URL while the server launches on the launch address.`
   );
 }
@@ -97,23 +125,8 @@ export function envText(raw: string | undefined): string | undefined {
   return raw?.trim() || undefined;
 }
 
-const portResult = parsePort(process.env.PI_MLX_MODELS_PORT);
-
-export const PORT = portResult.port;
-export const HOST = envText(process.env.PI_MLX_MODELS_HOST) ?? "127.0.0.1";
-const URL_HOST = HOST.includes(":") && !HOST.startsWith("[") ? `[${HOST}]` : HOST;
-const explicitBaseUrl = envText(process.env.PI_MLX_MODELS_BASE_URL);
-// Callers append "/models" and "/chat/completions", so a trailing slash would yield "//models".
-export const BASE_URL = explicitBaseUrl?.replace(/\/+$/, "") || `http://${URL_HOST}:${PORT}/v1`;
-export const DEFAULT_MODEL = envText(process.env.PI_MLX_MODELS_DEFAULT_MODEL) ?? "mlx-community/Qwen3-4B-Instruct-2507-4bit";
-
-/** Warnings found while reading configuration; index.ts surfaces each once. config.ts never prints. */
-const baseUrlMismatch = baseUrlWarning({ baseUrl: explicitBaseUrl, host: HOST, port: PORT });
-export const CONFIG_WARNINGS: readonly string[] = [
-  ...(portResult.warning ? [portResult.warning] : []),
-  ...(baseUrlMismatch ? [baseUrlMismatch] : []),
-];
-
+/** The project-level config file, relative to the working directory of the command (never searched for in parents). */
+export const PROJECT_CONFIG_RELPATH = join(".pi", "pi-mlx-models.json");
 export const PROVIDER_ID = "pi-mlx-models";
 export const DATA_DIR = join(
   resolveAgentDir({
@@ -123,6 +136,8 @@ export const DATA_DIR = join(
   }),
   "pi-mlx-models",
 );
+/** The user-level config file. Read on every /mlx-start; never created by the extension. */
+export const GLOBAL_CONFIG_PATH = join(DATA_DIR, "config.json");
 export const VENV_DIR = join(DATA_DIR, "venv");
 export const VENV_PYTHON = join(VENV_DIR, "bin", "python3");
 export const HF_HOME = join(DATA_DIR, "models");

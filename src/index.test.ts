@@ -1,56 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
-import { createExtension, type PiHost } from "./index.js";
+import { createExtension } from "./index.js";
+import type { ProbeResult } from "./flagprobe.js";
 import { MODEL_PRESETS } from "./presets.js";
-import type { MlxServer, ServerEvent } from "./server.js";
+import { SETTINGS } from "./settings.js";
+import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
+import { makeCtx, makeFakePi, type CtxOptions } from "./testkit.js";
 
-type Handler = (args: string, ctx: any) => Promise<void>;
 type ProviderCall = { name: string; config: any };
 type Note = { message: string; type: string };
-
-/** A fake pi that records what the extension registers, so tests can drive the handlers directly. */
-function makeFakePi() {
-  const commands = new Map<string, Handler>();
-  const handlers = new Map<string, () => Promise<void> | void>();
-  const providerCalls: ProviderCall[] = [];
-  const pi: PiHost = {
-    registerCommand(name, options) {
-      commands.set(name, options.handler);
-    },
-    registerProvider(name, config) {
-      providerCalls.push({ name, config });
-    },
-    on(event, handler) {
-      handlers.set(event, handler);
-    },
-  };
-  return { pi, commands, handlers, providerCalls };
-}
-
-/** A fake ctx.ui; `select` decides what the picker returns (default: the first option). */
-function makeCtx(select: (options: string[]) => string | undefined = (options) => options[0]) {
-  const notes: Note[] = [];
-  const statuses: Array<{ key: string; text: string | undefined }> = [];
-  const widgets: Array<{ id: string; lines: string[] | undefined }> = [];
-  const ctx = {
-    ui: {
-      notify(message: string, type: string) {
-        notes.push({ message, type });
-      },
-      async select(_title: string, options: string[]) {
-        return select(options);
-      },
-      setStatus(key: string, text: string | undefined) {
-        statuses.push({ key, text });
-      },
-      setWidget(id: string, lines: string[] | undefined) {
-        widgets.push({ id, lines });
-      },
-    },
-  };
-  return { ctx, notes, statuses, widgets };
-}
 
 interface FakeServerOptions {
   /** Replaces the default start (which emits launched, loading, warming, ready and resolves). */
@@ -61,17 +23,21 @@ interface FakeServerOptions {
 
 function makeFakeServer(options: FakeServerOptions = {}) {
   const startCalls: string[] = [];
+  /** The LaunchSpec of each start, parallel to `startCalls`. */
+  const launches: Array<LaunchSpec | undefined> = [];
   let stopCalls = 0;
-  const server: MlxServer & { startCalls: string[]; readonly stopCalls: number } = {
+  const server: MlxServer & { startCalls: string[]; launches: Array<LaunchSpec | undefined>; readonly stopCalls: number } = {
     get running() {
       return startCalls.length > 0;
     },
     startCalls,
+    launches,
     get stopCalls() {
       return stopCalls;
     },
-    async start(model, onEvent) {
+    async start(model, onEvent, launch) {
       startCalls.push(model);
+      launches.push(launch);
       if (options.start) return options.start(model, onEvent);
       for (const type of ["launched", "loading", "warming", "ready"] as const) onEvent?.({ type });
     },
@@ -96,8 +62,7 @@ test("mlx-start with a preset key starts that preset's model and reports ready",
     server,
     ensureInstalled: async () => {},
     discoverModelIds: async () => [preset.modelId],
-    baseUrl: "http://127.0.0.1:1/v1",
-    configWarnings: [],
+    settings: freshSettings({}),
   });
   await extension(pi);
 
@@ -127,6 +92,19 @@ function deferred<T = void>() {
 /** Lets already-queued promise continuations run, without any timer. */
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+/** Settings that read no real file: the global config path points into an empty temporary directory. */
+function freshSettings(env: Record<string, string | undefined>) {
+  const dir = mkdtempSync(join(tmpdir(), "pi-mlx-settings-"));
+  return { env, globalConfigPath: join(dir, "config.json"), home: dir };
+}
+
+/** A probe result for an install that lists every flag the schema can pass. */
+const ALL_SUPPORTED: ProbeResult = {
+  ok: true,
+  version: "0.32.2",
+  flags: new Set(SETTINGS.flatMap((row) => (row.mlxFlag === undefined ? [] : [row.mlxFlag]))),
+};
+
 /** An extension over a fresh fake pi, with a counting installer that succeeds unless told otherwise. */
 async function setup(
   options: {
@@ -134,14 +112,22 @@ async function setup(
     ensureInstalled?: (opts?: any) => Promise<void>;
     discovered?: string[];
     select?: (options: string[]) => string | undefined;
-    configWarnings?: readonly string[];
+    env?: Record<string, string | undefined>;
+    /** Settings sources to use instead of a fresh empty one, e.g. to write the global file from the test. */
+    settings?: ReturnType<typeof freshSettings>;
     sleep?: (ms: number) => Promise<void>;
+    /** Options of the fake ctx: the working directory, whether a UI is attached, the answer dialogs give. */
+    ctx?: CtxOptions;
+    /** What the flag probe answers; default: an install that lists every flag of the schema. */
+    probe?: () => Promise<ProbeResult>;
   } = {},
 ) {
   const server = makeFakeServer(options.server);
   const installCalls: any[] = [];
+  /** How many times the extension asked which flags the install supports. */
+  let probeCalls = 0;
   const fakePi = makeFakePi();
-  const fakeCtx = makeCtx(options.select);
+  const fakeCtx = makeCtx(options.select, options.ctx);
   const extension = createExtension({
     server,
     ensureInstalled: (async (opts?: any) => {
@@ -149,12 +135,23 @@ async function setup(
       await options.ensureInstalled?.(opts);
     }) as any,
     discoverModelIds: async () => options.discovered ?? [],
-    baseUrl: "http://127.0.0.1:1/v1",
-    configWarnings: options.configWarnings ?? [],
+    settings: options.settings ?? freshSettings(options.env ?? {}),
+    probeFlags: async () => {
+      probeCalls += 1;
+      return options.probe ? options.probe() : ALL_SUPPORTED;
+    },
     ...(options.sleep ? { sleep: options.sleep } : {}),
   });
   await extension(fakePi.pi);
-  return { server, installCalls, ...fakePi, ...fakeCtx };
+  return {
+    server,
+    installCalls,
+    ...fakePi,
+    ...fakeCtx,
+    get probeCalls() {
+      return probeCalls;
+    },
+  };
 }
 
 const errors = (notes: Note[]) => notes.filter((n) => n.type === "error").map((n) => n.message);
@@ -166,7 +163,7 @@ test("the extension registers mlx-init, mlx-start and mlx-stop, a session_shutdo
   assert.ok(handlers.has("session_shutdown"));
   assert.equal(providerCalls.length, 1);
   assert.equal(providerCalls[0].name, PROVIDER_ID);
-  assert.equal(providerCalls[0].config.baseUrl, "http://127.0.0.1:1/v1");
+  assert.equal(providerCalls[0].config.baseUrl, "http://127.0.0.1:8080/v1");
   assert.deepEqual(providerCalls[0].config.models, []);
 });
 
@@ -430,37 +427,36 @@ test("a stop that rejects does not prevent the provider re-registration at shutd
   assert.equal(providerCalls.length, providerCallsBefore + 1);
 });
 
-test("config warnings are shown once, in order, on the first mlx-start only", async () => {
-  const { commands, ctx, notes } = await setup({ configWarnings: ["w1", "w2"] });
+test("an invalid PI_MLX_MODELS_PORT is warned about once, on the first mlx-start only", async () => {
+  const { commands, ctx, notes } = await setup({ env: { PI_MLX_MODELS_PORT: "abc" } });
   const warnings = () => notes.filter((n) => n.type === "warning");
 
   await commands.get("mlx-start")!("qwen3_4b", ctx);
 
-  assert.deepEqual(warnings(), [
-    { message: "w1", type: "warning" },
-    { message: "w2", type: "warning" },
-  ]);
-  assert.deepEqual(notes.slice(0, 2).map((n) => n.type), ["warning", "warning"]);
+  assert.equal(warnings().length, 1);
+  assert.match(warnings()[0].message, /PI_MLX_MODELS_PORT/);
+  assert.equal(notes[0].type, "warning");
 
   await commands.get("mlx-start")!("qwen3_4b", ctx);
 
-  assert.equal(warnings().length, 2);
+  assert.equal(warnings().length, 1);
 });
 
-test("without config warnings no warning notification is shown", async () => {
-  const { commands, ctx, notes } = await setup({ configWarnings: [] });
+test("without config problems no warning notification is shown", async () => {
+  const { commands, ctx, notes } = await setup({ env: {} });
 
   await commands.get("mlx-start")!("qwen3_4b", ctx);
 
   assert.deepEqual(notes.filter((n) => n.type === "warning"), []);
 });
 
-test("a rejected first mlx-start still surfaces the config warnings once", async () => {
-  const { commands, ctx, notes } = await setup({ configWarnings: ["w1"] });
+test("a rejected first mlx-start still surfaces the config warning once", async () => {
+  const { commands, ctx, notes } = await setup({ env: { PI_MLX_MODELS_PORT: "abc" } });
   const warnings = () => notes.filter((n) => n.type === "warning");
 
   await commands.get("mlx-start")!("9", ctx);
-  assert.deepEqual(warnings(), [{ message: "w1", type: "warning" }]);
+  assert.equal(warnings().length, 1);
+  assert.match(warnings()[0].message, /PI_MLX_MODELS_PORT/);
 
   await commands.get("mlx-start")!("9", ctx);
   assert.equal(warnings().length, 1);
@@ -645,4 +641,1343 @@ test("a discovered model id with control characters is cleaned in the display na
   assert.equal(model.id, hostile, "the id is what the server expects and stays as discovered");
   assert.doesNotMatch(model.name, /[\u0000-\u001f\u007f-\u009f]/);
   assert.match(model.name, /^org\/model/);
+});
+
+// ---- a refused start has no side effects, and the corrected file is read on the next start (D-05, D-06) ----
+
+const warnings = (notes: Note[]) => notes.filter((n) => n.type === "warning").map((n) => n.message);
+
+test("a global file with several problems is refused with one report and nothing else happens", async () => {
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, '{"server":{"port":99999,"logLevel":"debug","hots":"x"}}');
+  const { server, installCalls, commands, providerCalls, ctx, notes, statuses, widgets } = await setup({ settings });
+  const providersBefore = providerCalls.length;
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(notes, [
+    {
+      type: "error",
+      message: [
+        "mlx-start failed: invalid configuration",
+        "  server.port (global config.json): 99999 is not an integer from 1 to 65535 (flag --port)",
+        '  server.logLevel (global config.json): "debug" must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL (flag --log-level)',
+        "  server.hots (global config.json): unknown key (did you mean server.host?)",
+      ].join("\n"),
+    },
+  ]);
+  assert.equal(installCalls.length, 0, "the runtime installer was not called");
+  assert.deepEqual(server.startCalls, [], "no server was started");
+  assert.equal(providerCalls.length, providersBefore, "no provider was registered");
+  assert.deepEqual(widgets, [], "no progress widget was shown");
+  assert.deepEqual(statuses, [], "no status was set");
+});
+
+test("a global file that is not valid JSON is refused with one error naming the file", async () => {
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, "{ nope");
+  const { server, installCalls, commands, ctx, notes } = await setup({ settings });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  const found = errors(notes);
+  assert.equal(found.length, 1);
+  assert.ok(
+    found[0].startsWith("mlx-start failed: invalid configuration\n  global config.json: is not valid JSON ("),
+    found[0],
+  );
+  assert.equal(notes.length, 1, "nothing but the error was shown");
+  assert.equal(installCalls.length, 0);
+  assert.deepEqual(server.startCalls, []);
+});
+
+test("nothing about a refused start is remembered: the corrected file is used by the next start", async () => {
+  const preset = MODEL_PRESETS.find((p) => p.key === "qwen3_4b")!;
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, '{"server":{"port":"9000"}}');
+  const { server, commands, ctx, notes, statuses } = await setup({ settings });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+  assert.equal(errors(notes).length, 1);
+  assert.deepEqual(server.startCalls, []);
+
+  writeFileSync(settings.globalConfigPath, '{"server":{"logLevel":"INFO"}}');
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.equal(errors(notes).length, 1, "no further error");
+  assert.deepEqual(server.startCalls, [preset.modelId]);
+  assert.equal(lastStatus(statuses), `mlx: running (${preset.modelId})`);
+});
+
+test("a missing global file is no error and nothing is created at its path", async () => {
+  const settings = freshSettings({});
+  const { server, commands, ctx, notes } = await setup({ settings });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(errors(notes), []);
+  assert.equal(server.startCalls.length, 1);
+  assert.equal(existsSync(settings.globalConfigPath), false);
+});
+
+test("an environment warning comes before the config error, and a second refused start does not repeat it", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_PORT: "abc" });
+  writeFileSync(settings.globalConfigPath, '{"server":{"port":0}}');
+  const { commands, ctx, notes } = await setup({ settings });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(
+    notes.map((n) => n.type),
+    ["warning", "error"],
+  );
+  assert.match(notes[0].message, /PI_MLX_MODELS_PORT/);
+  assert.ok(notes[1].message.startsWith("mlx-start failed: invalid configuration\n  server.port (global config.json): 0 is not an integer"));
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.equal(warnings(notes).length, 1, "the warning is shown once");
+  assert.equal(errors(notes).length, 2, "the refusal is shown on every refused start");
+});
+
+// ---- per-launch flags on /mlx-start and the pi flags (D-08 to D-12) ----
+
+const QWEN = MODEL_PRESETS.find((p) => p.key === "qwen3_4b")!;
+const startingNotes = (notes: Note[]) => notes.filter((n) => n.message.startsWith("Starting MLX server with")).map((n) => n.message);
+const PI_FLAG_NAMES = ["mlx-model", "mlx-port", "mlx-host", "mlx-log-level"];
+
+/** What a refused start must leave behind: no install, no spawn, and no provider beyond the initial one. */
+function assertNothingHappened(h: Awaited<ReturnType<typeof setup>>) {
+  assert.equal(h.installCalls.length, 0, "the runtime installer was not called");
+  assert.deepEqual(h.server.startCalls, [], "no server was started");
+  assert.equal(h.providerCalls.length, 1, "no provider beyond the initial one");
+  assert.deepEqual(h.widgets, [], "no progress widget was shown");
+}
+
+test("the factory registers the four pi flags as string flags with no default, before its first await, and reads none", async () => {
+  const fakePi = makeFakePi();
+  const extension = createExtension({
+    server: makeFakeServer(),
+    ensureInstalled: async () => {},
+    discoverModelIds: async () => [],
+    settings: freshSettings({}),
+  });
+
+  const running = extension(fakePi.pi);
+  assert.deepEqual(
+    fakePi.flags.map((flag) => flag.name),
+    PI_FLAG_NAMES,
+    "registered synchronously, before the factory's first await",
+  );
+  await running;
+
+  for (const flag of fakePi.flags) {
+    assert.equal(flag.options.type, "string", flag.name);
+    assert.ok(!("default" in flag.options), `${flag.name} must not carry a default`);
+    assert.ok((flag.options.description ?? "").length > 10, `${flag.name} needs a description`);
+  }
+  assert.equal(fakePi.getFlagCalls(), 0, "no flag value is read while the factory runs");
+});
+
+test("mlx-start with a model and flags launches that model on those flags, and the message and provider agree", async () => {
+  const { server, commands, ctx, notes, providerCalls } = await setup();
+
+  await commands.get("mlx-start")!("qwen3_4b --port 9000 --log-level DEBUG", ctx);
+
+  assert.deepEqual(server.startCalls, [QWEN.modelId]);
+  assert.deepEqual(server.launches, [
+    { address: { host: "127.0.0.1", port: 9000 }, baseUrl: "http://127.0.0.1:9000/v1", extraArgs: ["--log-level=DEBUG"] },
+  ]);
+  assert.deepEqual(startingNotes(notes), [
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --port 9000 (/mlx-start), --log-level DEBUG (/mlx-start)`,
+  ]);
+  assert.ok(providerCalls.length > 1);
+  assert.deepEqual(
+    providerCalls.slice(1).map((call) => call.config.baseUrl),
+    providerCalls.slice(1).map(() => "http://127.0.0.1:9000/v1"),
+  );
+});
+
+test("mlx-start accepts --host and --allowed-origins as typed, in the flag spelling of mlx-lm", async () => {
+  const { server, commands, ctx } = await setup();
+
+  await commands.get("mlx-start")!("--allowed-origins=http://a.test,http://b.test --host localhost org/some-model", ctx);
+
+  assert.deepEqual(server.startCalls, ["org/some-model"]);
+  assert.deepEqual(server.launches[0]?.address, { host: "localhost", port: 8080 });
+  assert.deepEqual(server.launches[0]?.extraArgs, ["--allowed-origins=http://a.test,http://b.test"]);
+});
+
+test("pi flags are read on every start and sit between the command line and the environment", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_PORT: "9200" });
+  writeFileSync(settings.globalConfigPath, '{"server":{"port":9300}}');
+  const h = await setup({ settings });
+  const start = (input: string) => h.commands.get("mlx-start")!(input, h.ctx);
+  const lastPort = () => h.server.launches.at(-1)?.address.port;
+  const lastFlagsLine = () => startingNotes(h.notes).at(-1)?.split("\n")[1];
+
+  h.setFlag("mlx-port", "9100");
+  await start("qwen3_4b");
+  assert.equal(lastPort(), 9100);
+  assert.equal(lastFlagsLine(), "flags: --port 9100 (pi flag --mlx-port)");
+
+  await start("qwen3_4b --port 9000");
+  assert.equal(lastPort(), 9000, "the command line beats the pi flag");
+  assert.equal(lastFlagsLine(), "flags: --port 9000 (/mlx-start)");
+
+  h.setFlag("mlx-port", undefined);
+  await start("qwen3_4b");
+  assert.equal(lastPort(), 9200, "without the pi flag the environment wins");
+  assert.equal(lastFlagsLine(), "flags: --port 9200 (env PI_MLX_MODELS_PORT)");
+
+  delete settings.env.PI_MLX_MODELS_PORT;
+  await start("qwen3_4b");
+  assert.equal(lastPort(), 9300, "without the environment the file wins");
+  assert.equal(lastFlagsLine(), "flags: --port 9300 (global file)");
+  assert.ok(h.getFlagCalls() >= 5, "every start reads the flags again");
+});
+
+test("the pi flags for host and log level reach the launch", async () => {
+  const { server, commands, ctx, notes, setFlag } = await setup();
+  setFlag("mlx-host", "localhost");
+  setFlag("mlx-log-level", "WARNING");
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(server.launches[0]?.address, { host: "localhost", port: 8080 });
+  assert.deepEqual(server.launches[0]?.extraArgs, ["--log-level=WARNING"]);
+  assert.match(startingNotes(notes)[0], /\nflags: --host localhost \(pi flag --mlx-host\), --log-level WARNING \(pi flag --mlx-log-level\)$/);
+});
+
+test("a pi flag that has no text, or is not text, is ignored", async () => {
+  const { server, commands, ctx, setFlag } = await setup();
+  setFlag("mlx-port", "   ");
+  setFlag("mlx-host", true);
+  setFlag("mlx-log-level", "");
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(server.launches, [{ address: { host: "127.0.0.1", port: 8080 }, baseUrl: "http://127.0.0.1:8080/v1", extraArgs: [] }]);
+});
+
+test("a bare mlx-start with --mlx-model set opens no picker and launches that model", async () => {
+  let picks = 0;
+  const { server, commands, ctx, notes, setFlag } = await setup({
+    select: (options) => {
+      picks += 1;
+      return options[0];
+    },
+  });
+  setFlag("mlx-model", "qwen3_4b");
+
+  await commands.get("mlx-start")!("", ctx);
+
+  assert.equal(picks, 0, "the picker must not open");
+  assert.deepEqual(server.startCalls, [QWEN.modelId]);
+  assert.match(startingNotes(notes)[0], /^Starting MLX server with .* \(preset: qwen3_4b\)\.\.\.$/);
+});
+
+test("a model typed on the command line beats --mlx-model", async () => {
+  const { server, commands, ctx, setFlag } = await setup();
+  setFlag("mlx-model", "qwen3_4b");
+
+  await commands.get("mlx-start")!("smollm3_3b --log-level DEBUG", ctx);
+
+  assert.deepEqual(server.startCalls, [MODEL_PRESETS.find((p) => p.key === "smollm3_3b")!.modelId]);
+});
+
+test("--mlx-model with a bad value ends with the usual error and starts nothing", async () => {
+  const h = await setup();
+  h.setFlag("mlx-model", "9");
+
+  await h.commands.get("mlx-start")!("", h.ctx);
+
+  const [message] = errors(h.notes);
+  assert.ok(message?.startsWith("mlx-start failed:"), message);
+  assert.match(message, /out of range/);
+  assertNothingHappened(h);
+});
+
+test("--mlx-model alone never starts anything, not even when pi runs the factory with it already set", async () => {
+  const server = makeFakeServer();
+  const installCalls: unknown[] = [];
+  const fakePi = makeFakePi();
+  fakePi.setFlag("mlx-model", "qwen3_4b");
+  const extension = createExtension({
+    server,
+    ensureInstalled: (async (opts?: unknown) => {
+      installCalls.push(opts);
+    }) as any,
+    discoverModelIds: async () => [],
+    settings: freshSettings({}),
+  });
+
+  await extension(fakePi.pi);
+
+  assert.deepEqual(server.startCalls, []);
+  assert.equal(installCalls.length, 0);
+  assert.equal(fakePi.getFlagCalls(), 0);
+});
+
+test("a blank --mlx-model is the same as none: the picker opens", async () => {
+  let picks = 0;
+  const { server, commands, ctx, setFlag } = await setup({
+    select: (options) => {
+      picks += 1;
+      return options[3];
+    },
+  });
+  setFlag("mlx-model", "   ");
+
+  await commands.get("mlx-start")!("", ctx);
+
+  assert.equal(picks, 1);
+  assert.deepEqual(server.startCalls, [QWEN.modelId]);
+});
+
+test("mlx-start with only flags opens the picker and launches the picked preset on those flags", async () => {
+  let picks = 0;
+  const { server, commands, ctx } = await setup({
+    select: (options) => {
+      picks += 1;
+      return options[3];
+    },
+  });
+
+  await commands.get("mlx-start")!("--log-level DEBUG", ctx);
+
+  assert.equal(picks, 1);
+  assert.deepEqual(server.startCalls, [QWEN.modelId]);
+  assert.deepEqual(server.launches[0]?.extraArgs, ["--log-level=DEBUG"]);
+});
+
+test("a configured default model does not skip the picker", async () => {
+  let picks = 0;
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, '{"defaultModel":"smollm3_3b"}');
+  const { server, commands, ctx } = await setup({
+    settings,
+    select: (options) => {
+      picks += 1;
+      return options[3];
+    },
+  });
+
+  await commands.get("mlx-start")!("--log-level DEBUG", ctx);
+
+  assert.equal(picks, 1, "the picker still opens");
+  assert.deepEqual(server.startCalls, [QWEN.modelId]);
+});
+
+test("a cancelled picker with flags typed notifies and starts nothing", async () => {
+  const h = await setup({ select: () => undefined });
+
+  await h.commands.get("mlx-start")!("--port 9000", h.ctx);
+
+  assert.deepEqual(h.notes, [{ message: "Preset selection cancelled.", type: "info" }]);
+  assertNothingHappened(h);
+});
+
+test("overrides apply to that launch only: the next start has the defaults and no flags line", async () => {
+  const { server, commands, ctx, notes, setFlag } = await setup();
+
+  await commands.get("mlx-start")!("qwen3_4b --port 9000 --log-level DEBUG", ctx);
+  assert.equal(server.launches[0]?.address.port, 9000, "premise: the first launch used the typed flags");
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(server.launches.at(-1), { address: { host: "127.0.0.1", port: 8080 }, baseUrl: "http://127.0.0.1:8080/v1", extraArgs: [] });
+  assert.equal(startingNotes(notes).at(-1), `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...`);
+
+  // A pi flag is read live: once it is cleared, nothing about it is remembered either.
+  setFlag("mlx-port", "9100");
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+  setFlag("mlx-port", undefined);
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+  assert.equal(server.launches.at(-1)?.address.port, 8080);
+});
+
+test("mlx-start with an unknown flag is refused, with the valid flags listed, and nothing happens", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!("--bogus 1", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
+  ]);
+  assert.equal(h.notes.length, 1);
+  assertNothingHappened(h);
+});
+
+test("mlx-start with a flag that has no value is refused and nothing happens", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!("--port", h.ctx);
+
+  assert.deepEqual(errors(h.notes), ["mlx-start failed: --port needs a value"]);
+  assertNothingHappened(h);
+});
+
+test("mlx-start with a second model, or a repeated flag, is refused and nothing happens", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!("qwen3_4b other", h.ctx);
+  await h.commands.get("mlx-start")!("--port 1 --port 2", h.ctx);
+  await h.commands.get("mlx-start")!("--port 'unterminated", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    "mlx-start failed: unexpected extra argument other (only one model is accepted)",
+    "mlx-start failed: --port was given twice",
+    "mlx-start failed: unterminated quote in the /mlx-start arguments",
+  ]);
+  assertNothingHappened(h);
+});
+
+test("a pi flag spelling typed on the command line is an unknown flag, not a way to set a pi flag", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!("qwen3_4b --mlx-port 9", h.ctx);
+
+  assert.match(errors(h.notes)[0], /^mlx-start failed: unknown flag --mlx-port /);
+  assertNothingHappened(h);
+});
+
+test("a bad value on the command line is refused with the report, labelled with the flag", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!("qwen3_4b --port abc", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    'mlx-start failed: invalid configuration\n  server.port (/mlx-start --port): "abc" is not an integer from 1 to 65535',
+  ]);
+  assertNothingHappened(h);
+});
+
+test("a bad pi flag value is refused with the report, labelled with the pi flag", async () => {
+  const h = await setup();
+  h.setFlag("mlx-port", "abc");
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    'mlx-start failed: invalid configuration\n  server.port (pi flag --mlx-port): "abc" is not an integer from 1 to 65535',
+  ]);
+  assertNothingHappened(h);
+});
+
+test("problems from the command line, a pi flag and the file are all in the one report", async () => {
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, '{"server":{"logLevel":"loud"}}');
+  const h = await setup({ settings });
+  h.setFlag("mlx-host", "-x");
+
+  await h.commands.get("mlx-start")!("qwen3_4b --port 0", h.ctx);
+
+  assert.equal(errors(h.notes).length, 1);
+  const lines = errors(h.notes)[0].split("\n");
+  assert.equal(lines.length, 4, errors(h.notes)[0]);
+  assert.ok(lines[1].startsWith("  server.port (/mlx-start --port)"), lines[1]);
+  assert.ok(lines[2].startsWith("  server.host (pi flag --mlx-host)"), lines[2]);
+  assert.ok(lines[3].startsWith("  server.logLevel (global config.json)"), lines[3]);
+  assertNothingHappened(h);
+});
+
+test("a syntax error in the arguments is reported alone; any other refusal still shows config warnings first", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_PORT: "abc" });
+  const h = await setup({ settings });
+
+  await h.commands.get("mlx-start")!("--bogus", h.ctx);
+  assert.deepEqual(
+    h.notes.map((n) => n.type),
+    ["error"],
+    "no configuration warning for a start that was refused on its arguments",
+  );
+
+  await h.commands.get("mlx-start")!("qwen3_4b --port abc", h.ctx);
+  assert.deepEqual(
+    h.notes.map((n) => n.type),
+    ["error", "warning", "error"],
+  );
+  assert.match(h.notes[1].message, /PI_MLX_MODELS_PORT/);
+});
+
+test("arguments longer than 8192 characters are refused before anything else", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!(`qwen3_4b ${"x".repeat(9000)}`, h.ctx);
+
+  assert.deepEqual(errors(h.notes), ["mlx-start failed: the /mlx-start arguments are longer than 8192 characters"]);
+  assertNothingHappened(h);
+});
+
+// ---- the project file layer and the trust gate (plan 02-05: CFG-01, CFG-06) ----
+
+type Harness = Awaited<ReturnType<typeof setup>>;
+
+const newCwd = () => mkdtempSync(join(tmpdir(), "pi-mlx-cwd-"));
+const writeProject = (cwd: string, content: unknown) => {
+  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "pi-mlx-models.json"), typeof content === "string" ? content : JSON.stringify(content));
+};
+const writeGlobal = (settings: ReturnType<typeof freshSettings>, content: unknown) =>
+  writeFileSync(settings.globalConfigPath, JSON.stringify(content));
+const infos = (notes: Note[]) => notes.filter((n) => n.type === "info").map((n) => n.message);
+
+/** Replace the answers the fake confirm gives, one per dialog in order; a dialog beyond the list is declined. */
+function scriptConfirms(h: Harness, answers: Array<boolean | Promise<boolean>>) {
+  h.ctx.ui.confirm = async (title: string, message: string) => {
+    h.confirms.push({ title, message });
+    return (await answers.shift()) ?? false;
+  };
+}
+
+const TRUST_TITLE = "Allow remote code from the model repository?";
+const HOST_TITLE = "Listen on a non-loopback address?";
+const URL_TITLE = "Send prompts to a non-loopback address?";
+const refusalText = (settings: ReturnType<typeof freshSettings>, lines: string[]) =>
+  [
+    "mlx-start failed: .pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+    ...lines,
+    `Move them to ${settings.globalConfigPath}; starting then asks for confirmation.`,
+  ].join("\n");
+
+test("the project file is read from the working directory only: a file in a parent directory is ignored", async () => {
+  const parent = newCwd();
+  writeProject(parent, { server: { logLevel: "DEBUG" } });
+  const cwd = join(parent, "child");
+  mkdirSync(cwd);
+  const h = await setup({ ctx: { cwd } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, []);
+  assert.deepEqual(startingNotes(h.notes), [`Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...`]);
+});
+
+test("the project file in the working directory is read on every start and labelled as such", async () => {
+  const cwd = newCwd();
+  const h = await setup({ ctx: { cwd } });
+  const start = () => h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  await start();
+  assert.deepEqual(h.server.launches[0]?.extraArgs, [], "no file yet: absent is not an error");
+  writeProject(cwd, { server: { logLevel: "DEBUG" } });
+  await start();
+
+  assert.deepEqual(h.server.launches[1]?.extraArgs, ["--log-level=DEBUG"]);
+  assert.equal(startingNotes(h.notes)[1].split("\n")[1], "flags: --log-level DEBUG (project file)");
+  assert.deepEqual(errors(h.notes), []);
+});
+
+test("the project value beats the global file and loses to the environment, a pi flag and a /mlx-start flag", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { port: 9301, logLevel: "DEBUG" } });
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { port: 9400, logLevel: "INFO" } });
+  const h = await setup({ settings, ctx: { cwd } });
+  const start = (input: string) => h.commands.get("mlx-start")!(input, h.ctx);
+  const last = () => h.server.launches.at(-1)!;
+
+  await start("qwen3_4b");
+  assert.equal(last().address.port, 9301, "project beats global");
+  assert.deepEqual(last().extraArgs, ["--log-level=DEBUG"]);
+
+  h.setFlag("mlx-log-level", "ERROR");
+  await start("qwen3_4b");
+  assert.deepEqual(last().extraArgs, ["--log-level=ERROR"], "a pi flag beats the project file");
+
+  await start("qwen3_4b --log-level WARNING --port 9500");
+  assert.deepEqual(last().extraArgs, ["--log-level=WARNING"], "a /mlx-start flag beats a pi flag");
+  assert.equal(last().address.port, 9500);
+});
+
+test("the environment beats the project file", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { port: 9301 } });
+  const h = await setup({ env: { PI_MLX_MODELS_PORT: "9200" }, ctx: { cwd } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.equal(h.server.launches[0]?.address.port, 9200);
+});
+
+test("a project baseUrl that does not match the launch address warns and names the project file", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { baseUrl: "http://localhost:9999/v1" });
+  const h = await setup({ ctx: { cwd } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  const [warning] = warnings(h.notes);
+  assert.ok(warning?.startsWith("baseUrl in project .pi/pi-mlx-models.json points at localhost:9999"), warning);
+  assert.equal(h.server.startCalls.length, 1, "a mismatch warns and does not refuse");
+  assert.equal(h.confirms.length, 0, "a loopback project base URL needs no confirm");
+});
+
+test("an invalid project file is refused with the usual report naming it, and nothing happens", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { port: 99999 } });
+  const h = await setup({ ctx: { cwd } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    "mlx-start failed: invalid configuration\n  server.port (project .pi/pi-mlx-models.json): 99999 is not an integer from 1 to 65535 (flag --port)",
+  ]);
+  assertNothingHappened(h);
+});
+
+const REFUSED_PROJECTS: Array<[string, unknown, string[]]> = [
+  ["trustRemoteCode", { server: { trustRemoteCode: true } }, ["  server.trustRemoteCode: lets the model repository run Python code"]],
+  ["host 0.0.0.0", { server: { host: "0.0.0.0" } }, ["  server.host (0.0.0.0): listens on a non-loopback address"]],
+  ["host ::", { server: { host: "::" } }, ["  server.host (::): listens on a non-loopback address"]],
+  ["host example.test", { server: { host: "example.test" } }, ["  server.host (example.test): listens on a non-loopback address"]],
+  [
+    "a remote baseUrl",
+    { baseUrl: "http://example.test:8080/v1" },
+    ["  baseUrl (http://example.test:8080/v1): sends prompts to a non-loopback address"],
+  ],
+  [
+    "all three at once",
+    { baseUrl: "http://example.test/v1", server: { host: "0.0.0.0", trustRemoteCode: true } },
+    [
+      "  server.trustRemoteCode: lets the model repository run Python code",
+      "  server.host (0.0.0.0): listens on a non-loopback address",
+      "  baseUrl (http://example.test/v1): sends prompts to a non-loopback address",
+    ],
+  ],
+];
+
+for (const [name, project, lines] of REFUSED_PROJECTS) {
+  test(`a project file with ${name} is refused with one message and no side effect, and no dialog is offered`, async () => {
+    const cwd = newCwd();
+    writeProject(cwd, project);
+    const settings = freshSettings({});
+    const h = await setup({ settings, ctx: { cwd } });
+
+    await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+    assert.deepEqual(
+      h.notes.filter((n) => n.type !== "warning"),
+      [{ type: "error", message: refusalText(settings, lines) }],
+    );
+    assert.equal(h.confirms.length, 0, "no prompt can override a project file");
+    assertNothingHappened(h);
+    assert.deepEqual(h.statuses, []);
+  });
+}
+
+test("a project file asking for something risky is refused even for a start that names a model, a picker choice or flags", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { trustRemoteCode: true } });
+  const h = await setup({ ctx: { cwd } });
+
+  await h.commands.get("mlx-start")!("org/some-model --port 9000", h.ctx);
+  await h.commands.get("mlx-start")!("", h.ctx);
+
+  assert.equal(errors(h.notes).length, 2, "the picker is never even opened for the second");
+  assert.equal(h.confirms.length, 0);
+  assertNothingHappened(h);
+});
+
+test("an environment override of a risky project value does not launder it", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { host: "0.0.0.0" } });
+  const settings = freshSettings({ PI_MLX_MODELS_HOST: "127.0.0.1" });
+  const h = await setup({ settings, ctx: { cwd } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(h.notes, [{ type: "error", message: refusalText(settings, ["  server.host (0.0.0.0): listens on a non-loopback address"]) }]);
+  assertNothingHappened(h);
+});
+
+test("a flag on /mlx-start does not launder a risky project value either", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { trustRemoteCode: true } });
+  const h = await setup({ ctx: { cwd } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b --trust-remote-code", h.ctx);
+
+  assert.equal(errors(h.notes).length, 1);
+  assert.ok(errors(h.notes)[0].includes("server.trustRemoteCode: lets the model repository run Python code"));
+  assert.equal(h.confirms.length, 0);
+  assertNothingHappened(h);
+});
+
+test("loopback project values and trustRemoteCode false launch normally with no dialog", async () => {
+  for (const project of [
+    { server: { host: "localhost" } },
+    { server: { host: "127.0.0.1" } },
+    { server: { host: "::1" } },
+    { server: { trustRemoteCode: false } },
+    { baseUrl: "http://localhost:8080/v1" },
+  ]) {
+    const cwd = newCwd();
+    writeProject(cwd, project);
+    const h = await setup({ ctx: { cwd } });
+
+    await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+    assert.equal(h.server.startCalls.length, 1, JSON.stringify(project));
+    assert.deepEqual(errors(h.notes), [], JSON.stringify(project));
+    assert.equal(h.confirms.length, 0, JSON.stringify(project));
+  }
+});
+
+test("trustRemoteCode in the global file asks once per start, names its source, and passes the bare flag on", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+  const start = () => h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  await start();
+
+  assert.deepEqual(h.confirms, [
+    {
+      title: TRUST_TITLE,
+      message:
+        "--trust-remote-code (from global file) lets the model repository run Python code on this machine. Only continue for repositories you trust.",
+    },
+  ]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--trust-remote-code"]);
+  assert.equal(startingNotes(h.notes)[0].split("\n")[1], "flags: --trust-remote-code (global file)");
+
+  await start();
+
+  assert.equal(h.confirms.length, 2, "nothing is remembered: the next start asks again");
+  assert.equal(h.server.launches.length, 2);
+});
+
+test("declining the dialog reports a cancel and installs, spawns and registers nothing", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings, ctx: { confirm: false } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(h.notes, [{ type: "info", message: "mlx-start cancelled: --trust-remote-code was not confirmed." }]);
+  assert.equal(h.confirms.length, 1);
+  assertNothingHappened(h);
+  assert.deepEqual(h.statuses, []);
+});
+
+test("a dialog that throws counts as declined", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+  h.ctx.ui.confirm = async () => {
+    throw new Error("ui went away");
+  };
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(h.notes, [{ type: "info", message: "mlx-start cancelled: --trust-remote-code was not confirmed." }]);
+  assertNothingHappened(h);
+});
+
+test("without a UI a risky start is refused, the dialog is never asked, and there is no way around it", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_ALLOW_REMOTE: "1", PI_MLX_MODELS_TRUST_REMOTE_CODE: "true" });
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings, ctx: { hasUI: false } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(h.notes, [
+    {
+      type: "error",
+      message: "mlx-start failed: --trust-remote-code needs interactive confirmation; run /mlx-start in an interactive pi session",
+    },
+  ]);
+  assert.equal(h.confirms.length, 0);
+  assertNothingHappened(h);
+});
+
+test("without a UI two risks are named together and the verb is plural", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_HOST: "0.0.0.0" });
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings, ctx: { hasUI: false } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    "mlx-start failed: --trust-remote-code and listening on 0.0.0.0 need interactive confirmation; run /mlx-start in an interactive pi session",
+  ]);
+  assertNothingHappened(h);
+});
+
+test("three risks without a UI are joined with commas and one 'and'", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_HOST: "0.0.0.0" });
+  writeGlobal(settings, { baseUrl: "http://example.test/v1", server: { trustRemoteCode: true } });
+  const h = await setup({ settings, ctx: { hasUI: false } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    "mlx-start failed: --trust-remote-code, listening on 0.0.0.0 and sending prompts to http://example.test/v1 need interactive confirmation; run /mlx-start in an interactive pi session",
+  ]);
+});
+
+test("a start with no risk needs no UI", async () => {
+  const h = await setup({ ctx: { hasUI: false } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.equal(h.server.startCalls.length, 1);
+  assert.deepEqual(errors(h.notes), []);
+});
+
+const SOURCES: Array<[string, { env?: Record<string, string>; global?: unknown; input?: string; flag?: [string, string] }, string, string, string[]]> = [
+  ["env PI_MLX_MODELS_HOST=0.0.0.0", { env: { PI_MLX_MODELS_HOST: "0.0.0.0" } }, HOST_TITLE, "(from env PI_MLX_MODELS_HOST)", []],
+  ["/mlx-start --host 0.0.0.0", { input: "qwen3_4b --host 0.0.0.0" }, HOST_TITLE, "(from /mlx-start)", []],
+  ["/mlx-start --trust-remote-code", { input: "qwen3_4b --trust-remote-code" }, TRUST_TITLE, "(from /mlx-start)", ["--trust-remote-code"]],
+  ["pi flag --mlx-host ::", { flag: ["mlx-host", "::"] }, HOST_TITLE, "(from pi flag --mlx-host)", []],
+  ["a remote baseUrl in the global file", { global: { baseUrl: "http://example.test/v1" } }, URL_TITLE, "(from global file)", []],
+  [
+    "a remote PI_MLX_MODELS_BASE_URL",
+    { env: { PI_MLX_MODELS_BASE_URL: "https://example.test/v1" } },
+    URL_TITLE,
+    "(from env PI_MLX_MODELS_BASE_URL)",
+    [],
+  ],
+  ["a non-loopback host in the global file", { global: { server: { host: "example.test" } } }, HOST_TITLE, "(from global file)", []],
+];
+
+for (const [name, source, title, label, extra] of SOURCES) {
+  test(`${name} needs the same dialog, naming where it came from`, async () => {
+    const settings = freshSettings(source.env ?? {});
+    if (source.global !== undefined) writeGlobal(settings, source.global);
+    const h = await setup({ settings });
+    if (source.flag) h.setFlag(source.flag[0], source.flag[1]);
+
+    await h.commands.get("mlx-start")!(source.input ?? "qwen3_4b", h.ctx);
+
+    assert.equal(h.confirms.length, 1);
+    assert.equal(h.confirms[0].title, title);
+    assert.ok(h.confirms[0].message.includes(label), h.confirms[0].message);
+    assert.equal(h.server.startCalls.length, 1, "confirmed, so it launched");
+    assert.deepEqual(h.server.launches[0]?.extraArgs, extra);
+  });
+}
+
+test("declining a non-project risk from any source launches nothing", async () => {
+  const h = await setup({ env: { PI_MLX_MODELS_HOST: "0.0.0.0" }, ctx: { confirm: false } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(infos(h.notes), ["mlx-start cancelled: listening on 0.0.0.0 was not confirmed."]);
+  assertNothingHappened(h);
+});
+
+test("the host dialog shows an IPv6 address bracketed in front of the port, and the base URL dialog shows the URL", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_HOST: "::" });
+  writeGlobal(settings, { baseUrl: "http://example.test:8080/v1" });
+  const h = await setup({ settings, ctx: { confirm: false } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b --port 9000", h.ctx);
+
+  assert.deepEqual(h.confirms, [
+    {
+      title: HOST_TITLE,
+      message: "The MLX server will listen on [::]:9000 (from env PI_MLX_MODELS_HOST), reachable from your network. mlx_lm.server has no authentication.",
+    },
+  ]);
+});
+
+test("--trust-remote-code takes no value on /mlx-start", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!("qwen3_4b --trust-remote-code=true", h.ctx);
+
+  assert.deepEqual(errors(h.notes), ["mlx-start failed: --trust-remote-code takes no value"]);
+  assert.equal(h.confirms.length, 0);
+  assertNothingHappened(h);
+});
+
+test("two risks ask two dialogs in the order trust, host, base URL; declining the first never asks the second", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_HOST: "0.0.0.0" });
+  writeGlobal(settings, { baseUrl: "http://example.test:8080/v1", server: { trustRemoteCode: true } });
+  const accepted = await setup({ settings });
+  await accepted.commands.get("mlx-start")!("qwen3_4b", accepted.ctx);
+  assert.deepEqual(
+    accepted.confirms.map((c) => c.title),
+    [TRUST_TITLE, HOST_TITLE, URL_TITLE],
+  );
+  assert.equal(accepted.server.startCalls.length, 1);
+
+  const declinedFirst = await setup({ settings });
+  scriptConfirms(declinedFirst, [false, true, true]);
+  await declinedFirst.commands.get("mlx-start")!("qwen3_4b", declinedFirst.ctx);
+  assert.deepEqual(
+    declinedFirst.confirms.map((c) => c.title),
+    [TRUST_TITLE],
+  );
+  assert.deepEqual(infos(declinedFirst.notes), ["mlx-start cancelled: --trust-remote-code was not confirmed."]);
+  assertNothingHappened(declinedFirst);
+
+  const declinedSecond = await setup({ settings });
+  scriptConfirms(declinedSecond, [true, false, true]);
+  await declinedSecond.commands.get("mlx-start")!("qwen3_4b", declinedSecond.ctx);
+  assert.deepEqual(
+    declinedSecond.confirms.map((c) => c.title),
+    [TRUST_TITLE, HOST_TITLE],
+  );
+  assert.deepEqual(infos(declinedSecond.notes), ["mlx-start cancelled: listening on 0.0.0.0 was not confirmed."]);
+  assertNothingHappened(declinedSecond);
+});
+
+test("loopback values in every layer need no dialog at all", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_HOST: "127.0.0.1", PI_MLX_MODELS_BASE_URL: "http://localhost:8080/v1" });
+  writeGlobal(settings, { server: { host: "::1", trustRemoteCode: false } });
+  const h = await setup({ settings, ctx: { hasUI: false } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b --host localhost", h.ctx);
+
+  assert.equal(h.confirms.length, 0);
+  assert.equal(h.server.startCalls.length, 1);
+});
+
+test("the dialog comes after the model is chosen and before the install, the provider refresh and the spawn", async () => {
+  const order: string[] = [];
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({
+    settings,
+    select: (options) => {
+      order.push("select");
+      return options[0];
+    },
+    ensureInstalled: async () => {
+      order.push("install");
+    },
+  });
+  h.ctx.ui.confirm = async (title: string, message: string) => {
+    h.confirms.push({ title, message });
+    order.push(`confirm after ${h.providerCalls.length} provider call(s)`);
+    return true;
+  };
+
+  await h.commands.get("mlx-start")!("", h.ctx);
+
+  assert.deepEqual(order, ["select", "confirm after 1 provider call(s)", "install"]);
+});
+
+test("a bad model is reported before any dialog is asked", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+
+  await h.commands.get("mlx-start")!("9", h.ctx);
+
+  assert.equal(errors(h.notes).length, 1);
+  assert.equal(h.confirms.length, 0);
+  assertNothingHappened(h);
+});
+
+test("a /mlx-stop while a dialog is open abandons the pending start quietly", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+  const answer = deferred<boolean>();
+  scriptConfirms(h, [answer.promise]);
+
+  const starting = h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  await flush();
+  assert.equal(h.confirms.length, 1, "premise: the dialog is open");
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  const marks = () => [h.notes.length, h.statuses.length, h.widgets.length, h.providerCalls.length];
+  const before = marks();
+  answer.resolve(true);
+  await starting;
+
+  assert.deepEqual(marks(), before, "no UI write and no provider registration after the stop");
+  assert.deepEqual(h.server.startCalls, []);
+  assert.equal(h.installCalls.length, 0);
+});
+
+test("a declined answer that arrives after a /mlx-stop is quiet too", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+  const answer = deferred<boolean>();
+  scriptConfirms(h, [answer.promise]);
+
+  const starting = h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  await flush();
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  const notesBefore = h.notes.length;
+  answer.resolve(false);
+  await starting;
+
+  assert.equal(h.notes.length, notesBefore, "no cancel notice for a start that was already abandoned");
+});
+
+test("a newer start that finishes while an older one's dialog is open wins; the older one is abandoned", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+  const first = deferred<boolean>();
+  scriptConfirms(h, [first.promise, true]);
+
+  const older = h.commands.get("mlx-start")!("org/older", h.ctx);
+  await flush();
+  await h.commands.get("mlx-start")!("org/newer", h.ctx);
+  assert.deepEqual(h.server.startCalls, ["org/newer"]);
+  const before = [h.notes.length, h.statuses.length, h.providerCalls.length];
+  first.resolve(true);
+  await older;
+
+  assert.deepEqual(h.server.startCalls, ["org/newer"], "the older start never launched");
+  assert.deepEqual([h.notes.length, h.statuses.length, h.providerCalls.length], before);
+});
+
+test("a start that is refused or declined does not cancel a start already in flight", async () => {
+  const gate = deferred();
+  const settings = freshSettings({});
+  const h = await setup({ settings, ensureInstalled: () => gate.promise, ctx: { confirm: false } });
+
+  const inFlight = h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  await flush();
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const declined = h.commands.get("mlx-start")!("org/other", h.ctx);
+  await flush();
+  assert.deepEqual(
+    infos(h.notes).filter((m) => m.startsWith("mlx-start cancelled")),
+    ["mlx-start cancelled: --trust-remote-code was not confirmed."],
+  );
+  gate.resolve();
+  await Promise.all([inFlight, declined]);
+
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId], "the first start completed");
+  assert.equal(lastStatus(h.statuses), `mlx: running (${QWEN.modelId})`);
+});
+
+test("the provider registered when pi loads the extension comes from the environment and the global file only", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { baseUrl: "http://example.test/v1" });
+  const settings = freshSettings({});
+  writeGlobal(settings, { baseUrl: "http://localhost:9999/v1" });
+
+  const h = await setup({ settings, ctx: { cwd } });
+
+  assert.equal(h.providerCalls[0].config.baseUrl, "http://localhost:9999/v1");
+  assert.equal(h.confirms.length, 0);
+});
+
+// ---- the model options and the models block (plan 02-06: SRV-02, D-21, D-22, D-23) ----
+
+const startMlx = (h: Harness, input: string) => h.commands.get("mlx-start")!(input, h.ctx);
+const flagsLineOf = (notes: Note[], index: number) => startingNotes(notes)[index].split("\n")[1];
+
+test("a global draft model and a per-model token count reach each launch; another model gets only the shared block", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { model: { draftModel: "mlx-community/draft" }, models: { qwen3_4b: { numDraftTokens: 4 } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+  await startMlx(h, "llama3_2_3b");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(
+    h.server.launches.map((launch) => launch?.extraArgs),
+    [["--draft-model=mlx-community/draft", "--num-draft-tokens=4"], ["--draft-model=mlx-community/draft"]],
+  );
+  assert.equal(flagsLineOf(h.notes, 0), "flags: --draft-model mlx-community/draft (global file), --num-draft-tokens 4 (global file)");
+  assert.equal(flagsLineOf(h.notes, 1), "flags: --draft-model mlx-community/draft (global file)");
+});
+
+const WAYS_TO_CHOOSE_QWEN: Array<[string, { input: string; flag?: string; pick?: boolean }]> = [
+  ["its number", { input: "4" }],
+  ["its preset key", { input: "qwen3_4b" }],
+  ["its full model id", { input: QWEN.modelId }],
+  ["the picker", { input: "", pick: true }],
+  ["the mlx-model pi flag", { input: "", flag: "qwen3_4b" }],
+];
+
+for (const [way, choice] of WAYS_TO_CHOOSE_QWEN) {
+  test(`the entry for qwen3_4b applies when the model is chosen by ${way}`, async () => {
+    const settings = freshSettings({});
+    writeGlobal(settings, { models: { qwen3_4b: { numDraftTokens: 4 } }, model: { draftModel: "d" } });
+    const h = await setup({ settings, ...(choice.pick ? { select: (options: string[]) => options[3] } : {}) });
+    if (choice.flag !== undefined) h.setFlag("mlx-model", choice.flag);
+
+    await startMlx(h, choice.input);
+
+    assert.deepEqual(errors(h.notes), []);
+    assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+    assert.deepEqual(h.server.launches[0]?.extraArgs, ["--draft-model=d", "--num-draft-tokens=4"]);
+  });
+}
+
+test("an entry keyed by the full model id applies and beats the entry keyed by the preset key", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { qwen3_4b: { draftModel: "by-key", numDraftTokens: 3 }, [QWEN.modelId]: { draftModel: "by-id" } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--draft-model=by-id", "--num-draft-tokens=3"]);
+});
+
+test("a project model block beats a global entry for the same model, and the flags line names each layer", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { model: { numDraftTokens: 2 } });
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { qwen3_4b: { draftModel: "g", numDraftTokens: 3 } } });
+  const h = await setup({ settings, ctx: { cwd } });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--draft-model=g", "--num-draft-tokens=2"]);
+  assert.equal(flagsLineOf(h.notes, 0), "flags: --draft-model g (global file), --num-draft-tokens 2 (project file)");
+});
+
+test("/mlx-start with every model flag passes them in schema order, the template as text; relative paths are under the working directory", async () => {
+  const cwd = newCwd();
+  writeFileSync(join(cwd, "tpl.jinja"), "{{ messages }}\n");
+  const h = await setup({ ctx: { cwd } });
+
+  await startMlx(
+    h,
+    `qwen3_4b --chat-template-args '{"enable_thinking":false}' --use-default-chat-template --chat-template tpl.jinja --num-draft-tokens 4 --draft-model mlx-community/draft --adapter-path adapters/x`,
+  );
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, [
+    `--adapter-path=${join(cwd, "adapters", "x")}`,
+    "--draft-model=mlx-community/draft",
+    "--num-draft-tokens=4",
+    "--chat-template={{ messages }}\n",
+    "--use-default-chat-template",
+    '--chat-template-args={"enable_thinking":false}',
+  ]);
+  assert.equal(
+    flagsLineOf(h.notes, 0),
+    `flags: --adapter-path ${join(cwd, "adapters", "x")} (/mlx-start), --draft-model mlx-community/draft (/mlx-start), --num-draft-tokens 4 (/mlx-start), --chat-template ${join(cwd, "tpl.jinja")} (/mlx-start), --use-default-chat-template (/mlx-start), --chat-template-args {"enable_thinking":false} (/mlx-start)`,
+  );
+});
+
+test("a project file's relative chat template is read from the working directory, and ~ is the configured home directory", async () => {
+  const cwd = newCwd();
+  writeFileSync(join(cwd, "tpl.jinja"), "{{ project }}");
+  writeProject(cwd, { model: { chatTemplate: "tpl.jinja" } });
+  const settings = freshSettings({});
+  writeGlobal(settings, { model: { adapterPath: "~/adapters/a" } });
+  const h = await setup({ settings, ctx: { cwd } });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, [`--adapter-path=${join(settings.home, "adapters", "a")}`, "--chat-template={{ project }}"]);
+});
+
+test("a missing chat template is one invalid-configuration report before anything runs, and it comes before any trust dialog", async () => {
+  const settings = freshSettings({});
+  const missing = join(settings.home, "missing.jinja");
+  writeGlobal(settings, { server: { trustRemoteCode: true }, model: { chatTemplate: missing } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), [
+    `mlx-start failed: invalid configuration\n  model.chatTemplate (global config.json): cannot read ${missing}: cannot be read (ENOENT)`,
+  ]);
+  assert.equal(h.notes.length, 1);
+  assert.equal(h.confirms.length, 0, "the report comes before the dialog");
+  assertNothingHappened(h);
+});
+
+test("a broken template path in an entry for another model does not stop this launch", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { llama3_2_3b: { chatTemplate: join(settings.home, "missing.jinja") } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+
+  await startMlx(h, "llama3_2_3b");
+  assert.equal(errors(h.notes).length, 1, "the model that uses the broken path is refused");
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+});
+
+test("a trustRemoteCode key inside a models entry is reported as an unknown key and nothing runs", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { qwen3_4b: { trustRemoteCode: true } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), [
+    'mlx-start failed: invalid configuration\n  models["qwen3_4b"].trustRemoteCode (global config.json): unknown key (did you mean server.trustRemoteCode?)',
+  ]);
+  assert.equal(h.confirms.length, 0);
+  assertNothingHappened(h);
+});
+
+test("a bad chat-template-args text on /mlx-start is refused before anything runs", async () => {
+  const h = await setup();
+
+  await startMlx(h, "qwen3_4b --chat-template-args {bad");
+
+  assert.deepEqual(errors(h.notes), [
+    'mlx-start failed: invalid configuration\n  model.chatTemplateArgs (/mlx-start --chat-template-args): "{bad" is not valid JSON; give a JSON object',
+  ]);
+  assertNothingHappened(h);
+});
+
+test("merged chat template args across the global file, a models entry and the command line", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, {
+    model: { chatTemplateArgs: { enable_thinking: false, x: 1 } },
+    models: { qwen3_4b: { chatTemplateArgs: { x: 2, y: 3 } } },
+  });
+  const h = await setup({ settings });
+
+  await startMlx(h, `qwen3_4b --chat-template-args '{"z":4}'`);
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ['--chat-template-args={"enable_thinking":false,"x":2,"y":3,"z":4}']);
+});
+
+// ---- the flag probe: older mlx-lm degrades instead of crashing (plan 02-07: SRV-06, D-18, D-19, D-20) ----
+
+const flagSet = (...flags: string[]): ProbeResult => ({ ok: true, version: "0.24.0", flags: new Set(flags) });
+/** An mlx-lm 0.24.0 install: no --allowed-origins, no --num-draft-tokens. */
+const OLD_INSTALL = flagSet("--help", "--model", "--host", "--port", "--log-level", "--draft-model");
+const warningTexts = (notes: Note[]) => notes.filter((n) => n.type === "warning").map((n) => n.message);
+const PROBE_DETAIL = "Checking which server flags mlx-lm supports";
+
+test("a launch with only host and port never probes and shows no probe progress", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { host: "localhost", port: 9123 } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(h.server.startCalls.length, 1);
+  assert.equal(h.probeCalls, 0);
+  assert.ok(!h.widgets.some((w) => w.lines?.some((line) => line.includes(PROBE_DETAIL))));
+  assert.deepEqual(warningTexts(h.notes), []);
+});
+
+test("a default launch never probes", async () => {
+  const h = await setup();
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(h.server.startCalls.length, 1);
+  assert.equal(h.probeCalls, 0);
+});
+
+test("a launch with an optional flag probes exactly once, after the install and before the server starts", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { logLevel: "DEBUG" } });
+  const events: string[] = [];
+  const h = await setup({
+    settings,
+    ensureInstalled: async () => {
+      events.push("install");
+    },
+    probe: async () => {
+      events.push("probe");
+      return ALL_SUPPORTED;
+    },
+    server: {
+      start: async (_model, onEvent) => {
+        events.push("start");
+        for (const type of ["launched", "loading", "warming", "ready"] as const) onEvent?.({ type });
+      },
+    },
+  });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(h.probeCalls, 1);
+  assert.deepEqual(events, ["install", "probe", "start"]);
+  assert.ok(h.widgets.some((w) => w.lines?.some((line) => line.includes(PROBE_DETAIL))), "the pause is explained in the progress widget");
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--log-level=DEBUG"]);
+  assert.deepEqual(warningTexts(h.notes), []);
+});
+
+test("a flag the install does not list is skipped with one warning, the server still starts, and the flags line marks it", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"], logLevel: "DEBUG" } });
+  const h = await setup({ settings, probe: async () => OLD_INSTALL });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), ["Skipped --allowed-origins: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)"]);
+  assert.deepEqual(h.server.startCalls.length, 1);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--log-level=DEBUG"]);
+  assert.equal(
+    startingNotes(h.notes)[0].split("\n")[1],
+    "flags: --allowed-origins http://a.test (global file, skipped), --log-level DEBUG (global file)",
+  );
+  assert.ok(infos(h.notes).includes("MLX server is ready for prompts. Use /model and pick pi-mlx-models/..."));
+});
+
+test("two skipped flags make one warning naming both in row order, and a second start warns again", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"] }, model: { numDraftTokens: 4 } });
+  const h = await setup({ settings, probe: async () => OLD_INSTALL });
+
+  await startMlx(h, "qwen3_4b");
+  await startMlx(h, "qwen3_4b");
+
+  const expected = "Skipped --allowed-origins, --num-draft-tokens: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)";
+  assert.deepEqual(warningTexts(h.notes), [expected, expected], "skip notices are shown on every launch, not once");
+  assert.deepEqual(h.server.launches.map((l) => l?.extraArgs), [[], []]);
+});
+
+test("an install that lists every flag adds no warning and passes everything", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"], logLevel: "DEBUG" }, model: { numDraftTokens: 4 } });
+  const h = await setup({ settings, probe: async () => ALL_SUPPORTED });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, [
+    "--allowed-origins=http://a.test",
+    "--log-level=DEBUG",
+    "--num-draft-tokens=4",
+  ]);
+});
+
+test("a failed probe warns, passes every configured flag, and the start goes on", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"], logLevel: "DEBUG" } });
+  const h = await setup({ settings, probe: async () => ({ ok: false, reason: "boom" }) });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), ["Could not check which flags mlx-lm supports (boom); passing every configured flag."]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--allowed-origins=http://a.test", "--log-level=DEBUG"]);
+  assert.equal(h.server.startCalls.length, 1);
+  assert.equal(
+    startingNotes(h.notes)[0].split("\n")[1],
+    "flags: --allowed-origins http://a.test (global file), --log-level DEBUG (global file)",
+  );
+});
+
+test("a /mlx-stop while the probe is pending abandons the start: no server, no later UI writes", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"] } });
+  const gate = deferred<ProbeResult>();
+  const h = await setup({ settings, probe: () => gate.promise });
+
+  const starting = startMlx(h, "qwen3_4b");
+  for (let i = 0; i < 5; i += 1) await flush();
+  assert.equal(h.probeCalls, 1, "the start is waiting on the probe");
+
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  const before = { notes: h.notes.length, statuses: h.statuses.length, widgets: h.widgets.length };
+  gate.resolve(OLD_INSTALL);
+  await starting;
+
+  assert.deepEqual(h.server.startCalls, []);
+  assert.deepEqual(
+    { notes: h.notes.length, statuses: h.statuses.length, widgets: h.widgets.length },
+    before,
+    "nothing is written after the stop, not even the skip warning",
+  );
 });
