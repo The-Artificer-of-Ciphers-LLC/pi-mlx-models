@@ -88,24 +88,22 @@ type CheckResult = { ok: true; value: SettingValue } | { ok: false };
 export interface SettingDef {
   /** Dotted key in the config file: "server.port" is the `port` key of the `server` block; a top-level key has no dot (D-01). */
   path: string;
-  kind: "string" | "integer" | "enum";
+  kind: "string" | "integer" | "enum" | "list";
   /** The allowed values in words, used in every error and warning about this row. */
   expected: string;
   /** Strict check of a value read from a JSON file: no coercion (D-07). */
   check(value: unknown): CheckResult;
   /** The problem line for a value that failed `check`; `shown` is the value already cleaned and clipped. */
   problem(shown: string): string;
-  /** Check of a value that arrives as text (environment, later command flags); same range or enum as `check`. */
+  /** Check of a value that arrives as text (environment, command line, pi flag); same range or enum as `check`. */
   parseText(raw: string): CheckResult;
   /** Environment variable that sets this row. */
   env?: string;
   /** An empty-but-defined environment variable is an invalid value, not an unset one. */
   blankEnvInvalid?: boolean;
-  /** `/mlx-start` flag name (a later plan fills this in). */
-  arg?: string;
-  /** The flag spelling `/mlx-start` accepts for this row, for example `--port`. */
+  /** The flag spelling `/mlx-start` accepts for this row, for example `--port`; a row without one cannot be set there. */
   cli?: string;
-  /** pi flag name (a later plan fills this in). */
+  /** The pi flag that sets this row, without its dashes, for example `mlx-port`. */
   piFlag?: string;
   /** The mlx_lm.server flag this row becomes. */
   mlxFlag?: string;
@@ -158,6 +156,21 @@ function checkModel(value: unknown): CheckResult {
   return trimmed ? ok(trimmed) : bad;
 }
 
+/** One allowed origin: not empty, and no comma (the list separator) or whitespace, so it stays one list entry. */
+const isOrigin = (entry: unknown): entry is string => typeof entry === "string" && entry.length > 0 && !/[,\s]/.test(entry);
+
+/** A list in a file; it becomes the comma list the server flag takes. */
+function checkOrigins(value: unknown): CheckResult {
+  if (!Array.isArray(value) || value.length === 0 || !value.every(isOrigin)) return bad;
+  return ok(value.join(","));
+}
+
+/** A comma list typed on the command line. */
+function parseOrigins(raw: string): CheckResult {
+  const entries = raw.trim().split(",");
+  return entries.every(isOrigin) ? ok(entries.join(",")) : bad;
+}
+
 const valued = (flag: string) => (value: SettingValue) => [`${flag}=${value}`];
 
 /**
@@ -186,6 +199,8 @@ export const SETTINGS: readonly SettingDef[] = [
     problem: PHRASES.host,
     parseText: (raw) => checkHost(raw.trim()),
     env: "PI_MLX_MODELS_HOST",
+    cli: "--host",
+    piFlag: "mlx-host",
     mlxFlag: "--host",
     core: true,
     emit: valued("--host"),
@@ -203,10 +218,23 @@ export const SETTINGS: readonly SettingDef[] = [
     },
     env: "PI_MLX_MODELS_PORT",
     blankEnvInvalid: true,
+    cli: "--port",
+    piFlag: "mlx-port",
     mlxFlag: "--port",
     core: true,
     emit: valued("--port"),
     default: DEFAULT_PORT,
+  },
+  {
+    path: "server.allowedOrigins",
+    kind: "list",
+    expected: "a list of non-empty strings without commas or spaces",
+    check: checkOrigins,
+    problem: PHRASES.list,
+    parseText: parseOrigins,
+    cli: "--allowed-origins",
+    mlxFlag: "--allowed-origins",
+    emit: valued("--allowed-origins"),
   },
   {
     path: "server.logLevel",
@@ -215,6 +243,8 @@ export const SETTINGS: readonly SettingDef[] = [
     check: checkLogLevel,
     problem: PHRASES.oneOf(LOG_LEVELS),
     parseText: (raw) => checkLogLevel(raw.trim()),
+    cli: "--log-level",
+    piFlag: "mlx-log-level",
     mlxFlag: "--log-level",
     emit: valued("--log-level"),
   },
@@ -247,10 +277,20 @@ export interface PiFlagDef {
   path?: string;
 }
 
-export const PI_FLAGS: readonly PiFlagDef[] = [];
+/**
+ * The pi flags the extension registers. Each is a string flag with no default: pi would write a default
+ * into its flag values at registration, which would then outrank the environment and the files.
+ */
+export const PI_FLAGS: readonly PiFlagDef[] = [
+  { name: "mlx-model", description: "Model that a bare /mlx-start launches (preset number, preset key or model id); it never starts anything by itself" },
+  { name: "mlx-port", description: "Port the MLX server listens on (1 to 65535)", path: "server.port" },
+  { name: "mlx-host", description: "Host or address the MLX server listens on", path: "server.host" },
+  { name: "mlx-log-level", description: "MLX server log level: DEBUG, INFO, WARNING, ERROR or CRITICAL", path: "server.logLevel" },
+];
 
+/** The flags `/mlx-start` accepts, derived from the rows that declare one; every one takes a value. */
 export function cliFlagSpecs(): CliFlagSpec[] {
-  return [];
+  return SETTINGS.flatMap((row) => (row.cli === undefined ? [] : [{ flag: row.cli, path: row.path, takesValue: true }]));
 }
 
 const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
@@ -342,10 +382,15 @@ function displayLabel(layer: LayerName, row: SettingDef): string {
     case "args":
       return "/mlx-start";
     case "piFlags":
-      return `pi flag ${row.piFlag}`;
+      return `pi flag --${row.piFlag}`;
     case "env":
       return `env ${row.env}`;
   }
+}
+
+/** The layer as a problem line labels it. A command-line or pi flag label already names the flag. */
+function problemLabel(layer: "args" | "piFlags", row: SettingDef): string {
+  return layer === "args" ? `/mlx-start ${row.cli}` : displayLabel(layer, row);
 }
 
 /** What names the value in a base URL warning. */
@@ -355,9 +400,9 @@ function sourceName(layer: LayerName, row: SettingDef): string {
     case "project":
       return `${row.path} in ${FILE_LABEL[layer]}`;
     case "args":
-      return String(row.arg);
+      return String(row.cli);
     case "piFlags":
-      return String(row.piFlag);
+      return `--${row.piFlag}`;
     case "env":
       return String(row.env);
   }
@@ -468,18 +513,21 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
       }
       case "args":
       case "piFlags": {
-        const name = layer === "args" ? row.arg : row.piFlag;
-        if (name === undefined) return undefined;
-        const raw = layer === "args" ? input.args?.[name] : input.piFlags?.[name];
-        if (raw === undefined) return undefined;
-        const label = displayLabel(layer, row);
+        // Only a row that declares a flag for this layer can be set by it; anything else is never looked at.
+        let raw: string | true | undefined;
+        if (layer === "args") raw = row.cli === undefined ? undefined : input.args?.[row.path];
+        else raw = row.piFlag === undefined ? undefined : input.piFlags?.[row.piFlag];
+        // A pi flag that was given no text is the same as one that was not given.
+        if (raw === undefined || (raw !== true && layer === "piFlags" && raw.trim() === "")) return undefined;
+        // The label already shows the flag, so the " (flag --x)" suffix of a file line is left off.
+        const where = `${row.path} (${problemLabel(layer, row)})`;
         if (raw === true) {
-          problems[layer].push(`${name} (${label}): needs a value (${row.expected})${flagSuffix(row)}`);
+          problems[layer].push(`${where}: needs a value (${row.expected})`);
           return undefined;
         }
         const result = row.parseText(raw);
         if (result.ok) return result.value;
-        problems[layer].push(`${name} (${label}): ${row.problem(showValue(raw))}${flagSuffix(row)}`);
+        problems[layer].push(`${where}: ${row.problem(showValue(raw))}`);
         return undefined;
       }
     }
