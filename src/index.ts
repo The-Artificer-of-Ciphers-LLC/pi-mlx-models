@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { BASE_URL, CONFIG_WARNINGS, DEFAULT_MODEL, PROVIDER_ID } from "./config.js";
+import { cleanLabel } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
 import { createProgress, type Progress } from "./progress.js";
@@ -46,7 +47,8 @@ async function pickPreset(ctx: any): Promise<ModelPreset | undefined> {
 function asProviderModels(ids: string[]) {
   return ids.map((id) => ({
     id,
-    name: `${id} (Local)`,
+    // The id is what the server expects; only the display name is cleaned of terminal control characters.
+    name: `${cleanLabel(id)} (Local)`,
     reasoning: false,
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

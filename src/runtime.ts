@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { VENV_DIR, VENV_PYTHON } from "./config.js";
+import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 
 export type RuntimeEvent = {
   phase: "python" | "venv" | "pip" | "mlx-lm";
@@ -93,7 +94,8 @@ export function run(cmd: string, args: string[], onLine?: (line: string) => void
     const handle = (chunk: Buffer) => {
       if (!onLine) return;
       for (const line of chunk.toString().split(/\r?\n/)) {
-        const t = line.trim();
+        // pip output is untrusted text that ends up in the UI.
+        const t = cleanLabel(line).trim();
         if (t) onLine(t);
       }
     };
@@ -103,7 +105,7 @@ export function run(cmd: string, args: string[], onLine?: (line: string) => void
       handle(d);
     });
     // `close`, not `exit`: exit can fire before the last stderr chunk has been read.
-    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-800) || `${cmd} failed with exit ${code}`))));
+    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(clipDiagnostic(err, 800) || `${cmd} failed with exit ${code}`))));
     p.on("error", reject);
   });
 }
@@ -157,11 +159,12 @@ export async function ensureInstalled(options: {
 
   emit({ phase: "venv", state: "active", detail: "Checking virtual environment" });
   if (!host.exists(VENV_PYTHON)) {
-    await host.run(py, ["-m", "venv", VENV_DIR], (line) => emit({ phase: "venv", state: "active", detail: line }));
+    await host.run(py, ["-m", "venv", VENV_DIR], (line) => emit({ phase: "venv", state: "active", detail: cleanLabel(line) }));
   }
   emit({ phase: "venv", state: "done", detail: "Virtual environment ready" });
 
-  const pipStep = (phase: "pip" | "mlx-lm") => (line: string) => {
+  const pipStep = (phase: "pip" | "mlx-lm") => (rawLine: string) => {
+    const line = cleanLabel(rawLine);
     const m = line.match(/(\d+)%/);
     emit({ phase, state: "active", detail: line.slice(0, 120), progress: m ? Number(m[1]) / 100 : undefined });
   };
