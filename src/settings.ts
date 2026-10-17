@@ -672,8 +672,14 @@ export interface ResolvedLaunch {
 
 export type BuildResult = { ok: true; launch: ResolvedLaunch } | { ok: false; errors: string[] };
 
+/** Where `~` and relative paths of the model options resolve: the home directory and the project directory (ctx.cwd). */
+export interface LaunchContext {
+  home: string;
+  cwd: string;
+}
+
 /** Pair the prepared settings with the model being started. Later plans add model-specific rows here. */
-export function buildLaunch(prepared: Prepared, model: { modelId: string; presetKey?: string }): BuildResult {
+export function buildLaunch(prepared: Prepared, model: { modelId: string; presetKey?: string }, _context?: LaunchContext): BuildResult {
   return {
     ok: true,
     launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: prepared.flags },

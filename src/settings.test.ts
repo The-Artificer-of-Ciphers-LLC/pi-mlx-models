@@ -37,9 +37,12 @@ function resolved(input: Partial<PrepareInput> = {}): { prepared: Prepared; warn
   return { prepared: result.prepared, warnings: result.warnings };
 }
 
+/** The home directory and working directory every launch in these tests is built with. */
+const LAUNCH_CTX = { home: "/home/u", cwd: "/work/project" };
+
 function flagsLine(input: Partial<PrepareInput>): string {
   const { prepared } = resolved(input);
-  const built = buildLaunch(prepared, { modelId: "org/model" });
+  const built = buildLaunch(prepared, { modelId: "org/model" }, LAUNCH_CTX);
   assert.ok(built.ok);
   return describeFlags(built.launch);
 }
@@ -440,7 +443,7 @@ test("describeFlags clips a very long valid host to the display bound", () => {
 
 test("toLaunchSpec carries the address and base URL, and only the optional flags as extra argv", () => {
   const { prepared } = resolved({ global: ok({ server: { host: "localhost", port: 9100, logLevel: "WARNING" } }) });
-  const built = buildLaunch(prepared, { modelId: "org/model" });
+  const built = buildLaunch(prepared, { modelId: "org/model" }, LAUNCH_CTX);
   assert.ok(built.ok);
   assert.deepEqual(toLaunchSpec(built.launch), {
     address: { host: "localhost", port: 9100 },
@@ -843,13 +846,19 @@ test("a single problem over the cap is described in the singular", () => {
 
 // ---- command-line flags and pi flags (plan 02-04) ----
 
-test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order; only --trust-remote-code takes no value", () => {
+test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order; only the bare flags take no value", () => {
   assert.deepEqual(cliFlagSpecs(), [
     { flag: "--host", path: "server.host", takesValue: true },
     { flag: "--port", path: "server.port", takesValue: true },
     { flag: "--allowed-origins", path: "server.allowedOrigins", takesValue: true },
     { flag: "--log-level", path: "server.logLevel", takesValue: true },
     { flag: "--trust-remote-code", path: "server.trustRemoteCode", takesValue: false },
+    { flag: "--adapter-path", path: "model.adapterPath", takesValue: true },
+    { flag: "--draft-model", path: "model.draftModel", takesValue: true },
+    { flag: "--num-draft-tokens", path: "model.numDraftTokens", takesValue: true },
+    { flag: "--chat-template", path: "model.chatTemplate", takesValue: true },
+    { flag: "--use-default-chat-template", path: "model.useDefaultChatTemplate", takesValue: false },
+    { flag: "--chat-template-args", path: "model.chatTemplateArgs", takesValue: true },
   ]);
 });
 
@@ -965,7 +974,7 @@ test("text from a flag is trimmed like text from the environment", () => {
 });
 
 function buildOk(prepared: Prepared) {
-  const built = buildLaunch(prepared, { modelId: "org/model" });
+  const built = buildLaunch(prepared, { modelId: "org/model" }, LAUNCH_CTX);
   assert.ok(built.ok);
   return built.launch;
 }
@@ -1127,7 +1136,7 @@ test("server.trustRemoteCode is accepted on /mlx-start as a flag that takes no v
     specs.find((spec) => spec.flag === TRUST_FLAG),
     { flag: TRUST_FLAG, path: "server.trustRemoteCode", takesValue: false },
   );
-  for (const spec of specs) if (spec.flag !== TRUST_FLAG) assert.equal(spec.takesValue, true, spec.flag);
+  for (const spec of specs) if (spec.flag !== TRUST_FLAG && spec.flag !== "--use-default-chat-template") assert.equal(spec.takesValue, true, spec.flag);
 });
 
 test("server.trustRemoteCode: the bare flag typed on /mlx-start turns it on and is labelled with the command", () => {
@@ -1385,4 +1394,699 @@ test("formatProjectRefusal strips control characters from echoed values and from
   );
   assert.ok(!CONTROL_CHARACTERS.test(text.replace(/\n/g, "")), JSON.stringify(text));
   assert.equal(text.split("\n").length, 3);
+});
+
+// ---- model options and the per-model block (plan 02-06: SRV-02, D-01, D-02, D-12, D-21, D-22, D-23) ----
+
+type ModelIdentity = { modelId: string; presetKey?: string };
+const QWEN: ModelIdentity = { modelId: "mlx-community/Qwen3-4B-Instruct-2507-4bit", presetKey: "qwen3_4b" };
+const LLAMA: ModelIdentity = { modelId: "mlx-community/Llama-3.2-3B-Instruct-4bit", presetKey: "llama3_2_3b" };
+
+/** Build the launch of `model` and require success. */
+function launchOf(input: Partial<PrepareInput>, model: ModelIdentity = QWEN, context = LAUNCH_CTX) {
+  const built = buildLaunch(resolved(input).prepared, model, context);
+  assert.ok(built.ok, `expected a launch, got ${JSON.stringify(built)}`);
+  return built.launch;
+}
+
+/** The optional argv of the launch: what the server gets after the connection flags. */
+function extraOf(input: Partial<PrepareInput>, model: ModelIdentity = QWEN, context = LAUNCH_CTX): readonly string[] {
+  return toLaunchSpec(launchOf(input, model, context)).extraArgs;
+}
+
+/** The report of a launch that must be refused at the second stage (the first stage accepted the layers). */
+function launchErrors(input: Partial<PrepareInput>, model: ModelIdentity = QWEN, context = LAUNCH_CTX): string[] {
+  const built = buildLaunch(resolved(input).prepared, model, context);
+  assert.equal(built.ok, false, "expected the launch to be refused");
+  assert.ok(!built.ok);
+  return built.errors;
+}
+
+/** A template file in a fresh temporary directory. */
+function writeTemplate(t: { after(fn: () => void): void }, content: string | Buffer, name = "template.jinja"): { dir: string; path: string } {
+  const dir = tempDir(t);
+  const path = join(dir, name);
+  writeFileSync(path, content);
+  return { dir, path };
+}
+
+const MODEL_FLAGS: Readonly<Record<string, string>> = {
+  adapterPath: "--adapter-path",
+  draftModel: "--draft-model",
+  numDraftTokens: "--num-draft-tokens",
+  chatTemplate: "--chat-template",
+  useDefaultChatTemplate: "--use-default-chat-template",
+  chatTemplateArgs: "--chat-template-args",
+};
+
+// -- the rows --
+
+const MODEL_BAD_VALUES: ReadonlyArray<[string, readonly unknown[], string]> = [
+  ["adapterPath", ["", "   ", 5, null, true, [], {}, "a\u0000b"], "must be a non-empty path"],
+  ["draftModel", ["", "  ", 5, null, [], "a\u0001b"], "must be a non-empty string"],
+  ["numDraftTokens", [0, 1.5, "4", -1, null, true, 1e21], "is not an integer of at least 1"],
+  ["chatTemplate", ["", "  ", 5, null, ["x"], "a\u0000b"], "must be a non-empty path"],
+  ["useDefaultChatTemplate", ["true", "false", 1, 0, null, []], "must be true or false"],
+  ["chatTemplateArgs", [[], null, "x", "{}", 5, true], "must be a JSON object"],
+];
+
+for (const [key, values, phrase] of MODEL_BAD_VALUES) {
+  for (const value of values) {
+    test(`model.${key} with ${JSON.stringify(value)} in a file reports: ${phrase}`, () => {
+      const lines = refused({ global: ok({ model: { [key]: value } }) });
+      assert.equal(lines.length, 1, JSON.stringify(lines));
+      assert.ok(lines[0].startsWith(`model.${key} (${GLOBAL}): `), lines[0]);
+      assert.ok(lines[0].includes(phrase), lines[0]);
+      assert.ok(lines[0].endsWith(`(flag ${MODEL_FLAGS[key]})`), lines[0]);
+    });
+  }
+}
+
+test("valid values of every model row are accepted in a file", () => {
+  const model = {
+    adapterPath: "/tmp/adapters/x",
+    draftModel: "mlx-community/draft",
+    numDraftTokens: 4,
+    chatTemplate: "/tmp/t.jinja",
+    useDefaultChatTemplate: false,
+    chatTemplateArgs: { enable_thinking: false, nested: { list: [1, "a", null, true] } },
+  };
+  assert.ok(resolve({ global: ok({ model }) }).ok);
+  assert.ok(resolve({ project: ok({ model }) }).ok);
+  assert.ok(resolve({ global: ok({ model: {} }) }).ok);
+});
+
+test("a model block that is not an object is one line and is not descended into", () => {
+  for (const block of [5, [], null, "x"]) {
+    assert.deepEqual(refused({ global: ok({ model: block }) }), [`model (${GLOBAL}): ${JSON.stringify(block)} must be a JSON object`]);
+  }
+});
+
+test("model.numDraftTokens on /mlx-start: digits only, at least 1, labelled with the flag", () => {
+  const { prepared } = resolved({ args: { "model.numDraftTokens": " 6 " } });
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--num-draft-tokens=6"]);
+  for (const text of ["0", "1.5", "-1", "x", "", "4x", "99999999999999999999"]) {
+    assert.deepEqual(refused({ args: { "model.numDraftTokens": text } }), [
+      `model.numDraftTokens (/mlx-start --num-draft-tokens): ${JSON.stringify(text)} is not an integer of at least 1`,
+    ]);
+  }
+});
+
+test("model.draftModel, adapterPath and chatTemplate on /mlx-start are checked like file values", () => {
+  for (const [path, flag] of [
+    ["model.draftModel", "--draft-model"],
+    ["model.adapterPath", "--adapter-path"],
+    ["model.chatTemplate", "--chat-template"],
+  ] as const) {
+    const lines = refused({ args: { [path]: "   " } });
+    assert.equal(lines.length, 1, path);
+    assert.ok(lines[0].startsWith(`${path} (/mlx-start ${flag}): `), lines[0]);
+  }
+});
+
+test("model.useDefaultChatTemplate on /mlx-start is a bare flag; text other than true is an error", () => {
+  assert.deepEqual(toLaunchSpec(buildOk(resolved({ args: { "model.useDefaultChatTemplate": true } }).prepared)).extraArgs, [
+    "--use-default-chat-template",
+  ]);
+  assert.deepEqual(toLaunchSpec(buildOk(resolved({ args: { "model.useDefaultChatTemplate": "true" } }).prepared)).extraArgs, [
+    "--use-default-chat-template",
+  ]);
+  assert.deepEqual(refused({ args: { "model.useDefaultChatTemplate": "yes" } }), [
+    `model.useDefaultChatTemplate (/mlx-start --use-default-chat-template): "yes" must be true or false`,
+  ]);
+});
+
+test("model.chatTemplateArgs on /mlx-start is mlx-lm's own form: a JSON string of an object", () => {
+  const { prepared } = resolved({ args: { "model.chatTemplateArgs": ' {"enable_thinking": false} ' } });
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ['--chat-template-args={"enable_thinking":false}']);
+  assert.deepEqual(refused({ args: { "model.chatTemplateArgs": "{bad" } }), [
+    `model.chatTemplateArgs (/mlx-start --chat-template-args): "{bad" is not valid JSON; give a JSON object`,
+  ]);
+  for (const text of ["[1]", "5", "null", '"x"', "true"]) {
+    assert.deepEqual(refused({ args: { "model.chatTemplateArgs": text } }), [
+      `model.chatTemplateArgs (/mlx-start --chat-template-args): ${JSON.stringify(text)} must be a JSON object`,
+    ]);
+  }
+});
+
+test("model options have no environment variable and no pi flag", () => {
+  for (const row of SETTINGS.filter((setting) => setting.path.startsWith("model."))) {
+    assert.equal(row.env, undefined, row.path);
+    assert.equal(row.piFlag, undefined, row.path);
+  }
+  const env = { PI_MLX_MODELS_ADAPTER_PATH: "/x", PI_MLX_MODELS_DRAFT_MODEL: "x" };
+  assert.deepEqual(extraOf({ env, piFlags: { "mlx-draft-model": "x" } }), []);
+});
+
+test("the six model rows come after server.trustRemoteCode, in the order of the flags", () => {
+  const paths = SETTINGS.map((row) => row.path);
+  assert.deepEqual(paths.slice(paths.indexOf("server.trustRemoteCode") + 1, paths.indexOf("server.trustRemoteCode") + 7), [
+    "model.adapterPath",
+    "model.draftModel",
+    "model.numDraftTokens",
+    "model.chatTemplate",
+    "model.useDefaultChatTemplate",
+    "model.chatTemplateArgs",
+  ]);
+});
+
+// -- chatTemplateArgs: hostile keys, size, depth (T-02-20, T-02-21) --
+
+for (const key of ["__proto__", "constructor", "prototype"]) {
+  test(`chatTemplateArgs rejects a ${key} key at the top, nested and inside an array, from a file and from the command line`, () => {
+    const texts = [`{"${key}": {"polluted": true}}`, `{"a": {"b": {"${key}": 1}}}`, `{"a": [{"${key}": {"polluted": true}}]}`];
+    for (const text of texts) {
+      const fromFile = refused({ global: ok({ model: { chatTemplateArgs: JSON.parse(text) } }) });
+      assert.equal(fromFile.length, 1, text);
+      assert.ok(fromFile[0].startsWith(`model.chatTemplateArgs (${GLOBAL}): `), fromFile[0]);
+      assert.ok(fromFile[0].includes(`contains the key ${key}, which is not allowed`), fromFile[0]);
+      const fromEntry = refused({ project: ok({ models: { qwen3_4b: { chatTemplateArgs: JSON.parse(text) } } }) });
+      assert.ok(fromEntry[0].startsWith(`models["qwen3_4b"].chatTemplateArgs (${PROJECT}): `), fromEntry[0]);
+      assert.ok(fromEntry[0].includes(`contains the key ${key}, which is not allowed`), fromEntry[0]);
+      const fromArgs = refused({ args: { "model.chatTemplateArgs": text } });
+      assert.ok(fromArgs[0].includes(`contains the key ${key}, which is not allowed`), fromArgs[0]);
+    }
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "polluted"), false);
+  });
+}
+
+test("chatTemplateArgs larger than 16 KiB is an error, whether it comes from a file or from text", () => {
+  const big = { text: "x".repeat(20000) };
+  const fromFile = refused({ global: ok({ model: { chatTemplateArgs: big } }) });
+  assert.equal(fromFile.length, 1);
+  assert.ok(fromFile[0].includes("is larger than 16 KiB"), fromFile[0]);
+  const fromArgs = refused({ args: { "model.chatTemplateArgs": JSON.stringify(big) } });
+  assert.ok(fromArgs[0].includes("is larger than 16 KiB"), fromArgs[0]);
+  assert.ok(fromArgs[0].length < 300, "the echoed value is clipped");
+  const small = { text: "x".repeat(16000) };
+  assert.ok(resolve({ global: ok({ model: { chatTemplateArgs: small } }) }).ok);
+});
+
+test("chatTemplateArgs whose merge across layers exceeds 16 KiB is refused when the launch is built", () => {
+  const input = {
+    global: ok({ model: { chatTemplateArgs: { a: "x".repeat(9000) } } }),
+    project: ok({ model: { chatTemplateArgs: { b: "y".repeat(9000) } } }),
+  };
+  assert.deepEqual(launchErrors(input), [`model.chatTemplateArgs (${PROJECT}): the merged value is larger than 16 KiB`]);
+});
+
+test("chatTemplateArgs nested deeper than the limit is an error, never a crash", () => {
+  let deep: unknown = 1;
+  for (let i = 0; i < 100; i += 1) deep = { a: deep };
+  const lines = refused({ global: ok({ model: { chatTemplateArgs: deep } }) });
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].includes("is nested too deeply"), lines[0]);
+});
+
+test("an absurdly deep value from a parsed file is reported, not thrown", () => {
+  const depth = 50000;
+  const data = JSON.parse(`{"model": {"chatTemplateArgs": ${'{"a":'.repeat(depth)}1${"}".repeat(depth)}}}`);
+  const lines = refused({ global: ok(data) });
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].startsWith(`model.chatTemplateArgs (${GLOBAL}): `), lines[0].slice(0, 100));
+});
+
+// -- the models map: shape and validation (D-21) --
+
+test("models that is not an object is one line; so is an entry that is not an object", () => {
+  for (const value of [5, [], null, "x"]) {
+    assert.deepEqual(refused({ global: ok({ models: value }) }), [`models (${GLOBAL}): ${JSON.stringify(value)} must be a JSON object`]);
+  }
+  for (const entry of [5, [], null, "x"]) {
+    assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: entry } }) }), [
+      `models["qwen3_4b"] (${GLOBAL}): ${JSON.stringify(entry)} must be a JSON object`,
+    ]);
+  }
+});
+
+test("empty models and empty entries are accepted", () => {
+  assert.ok(resolve({ global: ok({ models: {} }) }).ok);
+  assert.ok(resolve({ global: ok({ models: { qwen3_4b: {} } }) }).ok);
+});
+
+test("an unknown key in an entry names the entry and suggests among the model keys", () => {
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { draftmodel: "x" } } }) }), [
+    `models["qwen3_4b"].draftmodel (${GLOBAL}): unknown key (did you mean model.draftModel?)`,
+  ]);
+  assert.deepEqual(refused({ project: ok({ models: { "org/m": { numDraftToken: 4 } } }) }), [
+    `models["org/m"].numDraftToken (${PROJECT}): unknown key (did you mean model.numDraftTokens?)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { zzzzzzzz: 1 } } }) }), [
+    `models["qwen3_4b"].zzzzzzzz (${GLOBAL}): unknown key`,
+  ]);
+});
+
+test("server keys inside an entry are unknown keys with a hint to the server block", () => {
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { trustRemoteCode: true } } }) }), [
+    `models["qwen3_4b"].trustRemoteCode (${GLOBAL}): unknown key (did you mean server.trustRemoteCode?)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { host: "0.0.0.0" } } }) }), [
+    `models["qwen3_4b"].host (${GLOBAL}): unknown key (did you mean server.host?)`,
+  ]);
+});
+
+test("a trustRemoteCode key inside a project models entry is an unknown key, not a violation and not an enabled setting", () => {
+  const result = resolve({ project: ok({ models: { qwen3_4b: { trustRemoteCode: true } } }) });
+  assert.ok(!result.ok);
+  assert.equal(result.errors.length, 1);
+});
+
+test("an unknown key in the model block suggests a model key", () => {
+  assert.deepEqual(refused({ global: ok({ model: { draftmodel: "x" } }) }), [
+    `model.draftmodel (${GLOBAL}): unknown key (did you mean model.draftModel?)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ model: { host: "x" } }) }), [`model.host (${GLOBAL}): unknown key (did you mean server.host?)`]);
+});
+
+test("top-level typos of the new blocks are suggested", () => {
+  assert.equal(unknownLine({ modles: {} }), `modles (${GLOBAL}): unknown key (did you mean models?)`);
+  assert.equal(unknownLine({ modle: {} }), `modle (${GLOBAL}): unknown key (did you mean model?)`);
+});
+
+test("a bad value in an entry for a model that is not being launched is still an error: the whole file is validated", () => {
+  assert.deepEqual(refused({ global: ok({ models: { llama3_2_3b: { numDraftTokens: 0 } } }) }), [
+    `models["llama3_2_3b"].numDraftTokens (${GLOBAL}): 0 is not an integer of at least 1 (flag --num-draft-tokens)`,
+  ]);
+});
+
+test("entry problems and block problems of one file are all in the one report, in file order", () => {
+  const lines = refused({
+    global: ok({
+      models: { a: { numDraftTokens: 0 }, b: { draftmodel: "x" } },
+      server: { port: 0 },
+      model: { adapterPath: "" },
+    }),
+  });
+  assert.deepEqual(
+    lines.map((line) => line.split(" ")[0]),
+    ['models["a"].numDraftTokens', 'models["b"].draftmodel', "server.port", "model.adapterPath"],
+  );
+});
+
+test("an entry id is cleaned of control characters and clipped in the error path", () => {
+  const id = `${"i".repeat(200)}\u001b[31m`;
+  const lines = refused({ global: ok({ models: { [id]: { numDraftTokens: 0 }, "a\u0007b\u001b[0m": { numDraftTokens: 0 } } }) });
+  assert.equal(lines.length, 2);
+  for (const line of lines) assert.ok(!CONTROL_CHARACTERS.test(line), JSON.stringify(line));
+  assert.ok(lines[0].startsWith(`models["${"i".repeat(80)}"].numDraftTokens `), lines[0]);
+  assert.ok(!lines[0].includes("i".repeat(81)));
+});
+
+test("an entry named like a prototype key is just a model id and pollutes nothing", () => {
+  const data = JSON.parse('{"models": {"__proto__": {"draftModel": "polluted"}, "constructor": {"draftModel": "also"}}}');
+  const { prepared } = resolved({ global: ok(data) });
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, []);
+  assert.equal(({} as Record<string, unknown>).draftModel, undefined);
+  assert.deepEqual(extraOf({ global: ok(data) }, { modelId: "__proto__" }), ["--draft-model=polluted"]);
+  assert.deepEqual(extraOf({ global: ok(data) }, { modelId: "constructor" }), ["--draft-model=also"]);
+});
+
+test("model keys do not touch prepared.flags and are no project violation: they are decided per model", () => {
+  const model = { draftModel: "x", numDraftTokens: 3, useDefaultChatTemplate: true };
+  const { prepared } = resolved({ project: ok({ model, models: { qwen3_4b: { adapterPath: "/a" } } }) });
+  assert.deepEqual(prepared.flags, []);
+  assert.deepEqual(prepared.projectViolations, []);
+});
+
+// -- emission, in schema order --
+
+test("every model option reaches the argv as specified, in schema order, whatever order the file lists them", (t) => {
+  const { path } = writeTemplate(t, "{{ messages }}\n");
+  const model = {
+    chatTemplateArgs: { enable_thinking: false },
+    useDefaultChatTemplate: true,
+    chatTemplate: path,
+    numDraftTokens: 4,
+    draftModel: "mlx-community/draft",
+    adapterPath: "~/adapters/x",
+  };
+  assert.deepEqual(extraOf({ global: ok({ model }) }), [
+    "--adapter-path=/home/u/adapters/x",
+    "--draft-model=mlx-community/draft",
+    "--num-draft-tokens=4",
+    "--chat-template={{ messages }}\n",
+    "--use-default-chat-template",
+    '--chat-template-args={"enable_thinking":false}',
+  ]);
+});
+
+test("model flags come after the server flags; each valued flag is one element", () => {
+  const global = ok({
+    model: { draftModel: "d", numDraftTokens: 2 },
+    server: { logLevel: "DEBUG", allowedOrigins: ["http://a.test"], trustRemoteCode: true },
+  });
+  assert.deepEqual(extraOf({ global }), [
+    "--allowed-origins=http://a.test",
+    "--log-level=DEBUG",
+    "--trust-remote-code",
+    "--draft-model=d",
+    "--num-draft-tokens=2",
+  ]);
+});
+
+test("a false useDefaultChatTemplate is never emitted or listed, and a higher layer can switch it off", () => {
+  assert.deepEqual(extraOf({ global: ok({ model: { useDefaultChatTemplate: false } }) }), []);
+  assert.equal(describeFlags(launchOf({ global: ok({ model: { useDefaultChatTemplate: false } }) })), "");
+  const layers = { global: ok({ model: { useDefaultChatTemplate: true } }), project: ok({ model: { useDefaultChatTemplate: false } }) };
+  assert.deepEqual(extraOf(layers), []);
+  assert.deepEqual(extraOf({ ...layers, args: { "model.useDefaultChatTemplate": true } }), ["--use-default-chat-template"]);
+});
+
+test("a value that contains an equals sign or starts with a dash stays one element", () => {
+  assert.deepEqual(extraOf({ global: ok({ model: { draftModel: "org/a=b", adapterPath: "-weird" } }) }), [
+    "--adapter-path=/work/project/-weird",
+    "--draft-model=org/a=b",
+  ]);
+});
+
+test("the launch keeps the model identity and the connection of the prepared settings", () => {
+  const launch = launchOf({ global: ok({ server: { port: 9100 }, model: { draftModel: "d" } }) });
+  assert.deepEqual(launch.model, QWEN);
+  assert.deepEqual(launch.address, { host: "127.0.0.1", port: 9100 });
+  assert.equal(launch.baseUrl, "http://127.0.0.1:9100/v1");
+});
+
+// -- paths (D-23, assumption A8) --
+
+test("adapterPath: ~ is the home directory, a relative path is under the working directory, an absolute path is unchanged", () => {
+  const cases: ReadonlyArray<[string, string]> = [
+    ["~/adapters/x", "/home/u/adapters/x"],
+    ["~", "/home/u"],
+    ["rel/path", "/work/project/rel/path"],
+    ["./a", "/work/project/a"],
+    ["../b", "/work/b"],
+    ["~user/x", "/work/project/~user/x"],
+    ["/abs/p", "/abs/p"],
+  ];
+  for (const [value, expected] of cases) {
+    assert.deepEqual(extraOf({ global: ok({ model: { adapterPath: value } }) }), [`--adapter-path=${expected}`], value);
+  }
+});
+
+test("adapterPath resolves against the project directory for every layer, including the global file and a typed flag", () => {
+  const context = { home: "/home/u", cwd: "/work/other" };
+  for (const input of [
+    { global: ok({ model: { adapterPath: "ad" } }) },
+    { project: ok({ model: { adapterPath: "ad" } }) },
+    { args: { "model.adapterPath": "ad" } },
+    { global: ok({ models: { qwen3_4b: { adapterPath: "ad" } } }) },
+  ] as Partial<PrepareInput>[]) {
+    assert.deepEqual(extraOf(input, QWEN, context), ["--adapter-path=/work/other/ad"], JSON.stringify(input));
+  }
+});
+
+test("the existence of the adapter directory is not checked", () => {
+  assert.deepEqual(extraOf({ global: ok({ model: { adapterPath: "/definitely/not/there" } }) }), ["--adapter-path=/definitely/not/there"]);
+});
+
+// -- the chat template file (D-23, T-02-19, T-02-21) --
+
+test("chatTemplate is read at launch time and its text, newlines included, is the value", (t) => {
+  const text = "{% for m in messages %}\n{{ m.content }}\n{% endfor %}\né中";
+  const { path } = writeTemplate(t, text);
+  const input = { global: ok({ model: { chatTemplate: path } }) };
+  assert.doesNotThrow(() => resolved(input), "preparing never reads the file");
+  assert.deepEqual(extraOf(input), [`--chat-template=${text}`]);
+});
+
+test("preparing settings never reads the template: a missing path only fails the launch of the model that uses it", () => {
+  const input = { global: ok({ model: { chatTemplate: "/definitely/missing.jinja" } }) };
+  assert.ok(resolve(input).ok);
+  assert.equal(buildLaunch(resolved(input).prepared, QWEN, LAUNCH_CTX).ok, false);
+});
+
+test("chatTemplate: a relative path resolves against the project directory, ~ against the home directory", (t) => {
+  const { dir } = writeTemplate(t, "{{ a }}", "rel.jinja");
+  assert.deepEqual(extraOf({ project: ok({ model: { chatTemplate: "rel.jinja" } }) }, QWEN, { home: "/nowhere", cwd: dir }), [
+    "--chat-template={{ a }}",
+  ]);
+  assert.deepEqual(extraOf({ global: ok({ model: { chatTemplate: "rel.jinja" } }) }, QWEN, { home: "/nowhere", cwd: dir }), [
+    "--chat-template={{ a }}",
+  ]);
+  assert.deepEqual(extraOf({ global: ok({ model: { chatTemplate: "~/rel.jinja" } }) }, QWEN, { home: dir, cwd: "/nowhere" }), [
+    "--chat-template={{ a }}",
+  ]);
+});
+
+test("chatTemplate: a file of exactly 64 KiB is accepted", (t) => {
+  const text = "a".repeat(64 * 1024);
+  const { path } = writeTemplate(t, text);
+  assert.deepEqual(extraOf({ global: ok({ model: { chatTemplate: path } }) }), [`--chat-template=${text}`]);
+});
+
+/** Make the broken template of one case; returns the path the configuration points at. */
+const TEMPLATE_FAILURES: ReadonlyArray<[string, (dir: string, path: string) => string, string]> = [
+  ["a missing file", (_dir, path) => path, "cannot be read (ENOENT)"],
+  ["a directory", (dir) => dir, "is not a regular file"],
+  [
+    "an empty file",
+    (_dir, path) => {
+      writeFileSync(path, "");
+      return path;
+    },
+    "is empty",
+  ],
+  [
+    "a file of only whitespace",
+    (_dir, path) => {
+      writeFileSync(path, " \n\t\n");
+      return path;
+    },
+    "is empty",
+  ],
+  [
+    "a file over 64 KiB",
+    (_dir, path) => {
+      writeFileSync(path, "a".repeat(64 * 1024 + 1));
+      return path;
+    },
+    "is larger than 64 KiB",
+  ],
+  [
+    "a file that is not UTF-8",
+    (_dir, path) => {
+      writeFileSync(path, Buffer.from([0x41, 0xff, 0xfe, 0x42]));
+      return path;
+    },
+    "is not valid UTF-8 text",
+  ],
+  [
+    "a file with a NUL byte",
+    (_dir, path) => {
+      writeFileSync(path, "secret\u0000text");
+      return path;
+    },
+    "is not text (contains a NUL character)",
+  ],
+];
+
+for (const [name, make, reason] of TEMPLATE_FAILURES) {
+  test(`chatTemplate: ${name} fails the launch with one line, ${reason}`, (t) => {
+    const dir = tempDir(t);
+    const target = make(dir, join(dir, "t.jinja"));
+    const expected = [`model.chatTemplate (${GLOBAL}): cannot read ${target}: ${reason}`];
+    assert.deepEqual(launchErrors({ global: ok({ model: { chatTemplate: target } }) }), expected);
+    assert.ok(!expected[0].includes("secret"), "the file content is never echoed");
+  });
+}
+
+test("a template error is labelled with the layer that supplied the path", (t) => {
+  const dir = tempDir(t);
+  const missing = join(dir, "missing.jinja");
+  const line = (label: string) => `model.chatTemplate (${label}): cannot read ${missing}: cannot be read (ENOENT)`;
+  assert.deepEqual(launchErrors({ project: ok({ model: { chatTemplate: missing } }) }), [line(PROJECT)]);
+  assert.deepEqual(launchErrors({ global: ok({ models: { qwen3_4b: { chatTemplate: missing } } }) }), [line(GLOBAL)]);
+  assert.deepEqual(launchErrors({ args: { "model.chatTemplate": missing } }), [line("/mlx-start --chat-template")]);
+});
+
+test("a broken template path in an entry for another model does not fail this launch, and does fail that model's", (t) => {
+  const dir = tempDir(t);
+  const missing = join(dir, "missing.jinja");
+  const input = { global: ok({ models: { llama3_2_3b: { chatTemplate: missing } } }) };
+  assert.deepEqual(extraOf(input, QWEN), []);
+  assert.equal(launchErrors(input, LLAMA).length, 1);
+});
+
+test("only the winning template path is read: a broken path in a lower layer is never touched", (t) => {
+  const { path } = writeTemplate(t, "{{ ok }}");
+  const input = {
+    global: ok({ model: { chatTemplate: "/definitely/missing.jinja" } }),
+    project: ok({ model: { chatTemplate: path } }),
+  };
+  assert.deepEqual(extraOf(input), ["--chat-template={{ ok }}"]);
+});
+
+// -- the override per model (D-21) --
+
+test("the top-level model block applies to every model, with or without a preset", () => {
+  const input = { global: ok({ model: { draftModel: "base" } }) };
+  for (const model of [QWEN, LLAMA, { modelId: "org/custom" }]) assert.deepEqual(extraOf(input, model), ["--draft-model=base"]);
+});
+
+test("models[preset key] merges over the model block; an entry for another model changes nothing", () => {
+  const input = {
+    global: ok({
+      model: { draftModel: "base", numDraftTokens: 2 },
+      models: { qwen3_4b: { numDraftTokens: 4 }, llama3_2_3b: { draftModel: "other" } },
+    }),
+  };
+  assert.deepEqual(extraOf(input, QWEN), ["--draft-model=base", "--num-draft-tokens=4"]);
+  assert.deepEqual(extraOf(input, LLAMA), ["--draft-model=other", "--num-draft-tokens=2"]);
+  assert.deepEqual(extraOf(input, { modelId: "org/custom" }), ["--draft-model=base", "--num-draft-tokens=2"]);
+});
+
+test("models[model id] matches the resolved id and beats models[preset key]", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { draftModel: "by-key", numDraftTokens: 3 }, [QWEN.modelId]: { draftModel: "by-id" } } }),
+  };
+  assert.deepEqual(extraOf(input, QWEN), ["--draft-model=by-id", "--num-draft-tokens=3"]);
+  assert.deepEqual(extraOf({ global: ok({ models: { "org/custom": { draftModel: "c" } } }) }, { modelId: "org/custom" }), ["--draft-model=c"]);
+});
+
+test("a launch that carries no preset key does not match a key entry; the id entry still matches", () => {
+  const input = { global: ok({ models: { qwen3_4b: { draftModel: "by-key" }, [QWEN.modelId]: { numDraftTokens: 5 } } }) };
+  assert.deepEqual(extraOf(input, { modelId: QWEN.modelId }), ["--num-draft-tokens=5"]);
+});
+
+test("a project model block beats a global models entry (assumption A4)", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { draftModel: "g", numDraftTokens: 3 } } }),
+    project: ok({ model: { draftModel: "p" } }),
+  };
+  assert.deepEqual(extraOf(input), ["--draft-model=p", "--num-draft-tokens=3"]);
+  assert.deepEqual(
+    launchOf(input).flags.map((flag) => [flag.flag, flag.label]),
+    [
+      ["--draft-model", "project file"],
+      ["--num-draft-tokens", "global file"],
+    ],
+  );
+});
+
+test("a project key entry beats a global id entry, and a project id entry beats a project key entry", () => {
+  const global = ok({ models: { [QWEN.modelId]: { draftModel: "g-id" } } });
+  assert.deepEqual(extraOf({ global, project: ok({ models: { qwen3_4b: { draftModel: "p-key" } } }) }), ["--draft-model=p-key"]);
+  const project = ok({ models: { qwen3_4b: { draftModel: "p-key" }, [QWEN.modelId]: { draftModel: "p-id" } } });
+  assert.deepEqual(extraOf({ global, project }), ["--draft-model=p-id"]);
+});
+
+test("a /mlx-start flag beats the project and global layers and their entries", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { draftModel: "g" } } }),
+    project: ok({ model: { draftModel: "p" }, models: { qwen3_4b: { draftModel: "pe" } } }),
+    args: { "model.draftModel": "typed" },
+  };
+  assert.deepEqual(extraOf(input), ["--draft-model=typed"]);
+  assert.deepEqual(launchOf(input).flags.map((flag) => flag.label), ["/mlx-start"]);
+});
+
+test("arrays and scalars replace across layers and entries", () => {
+  const input = {
+    global: ok({ model: { chatTemplateArgs: { list: [1, 2], s: "a", keep: 1 } } }),
+    project: ok({ models: { qwen3_4b: { chatTemplateArgs: { list: [3], s: "b" } } } }),
+  };
+  assert.deepEqual(extraOf(input), ['--chat-template-args={"list":[3],"s":"b","keep":1}']);
+});
+
+test("chatTemplateArgs objects merge key by key across layers, entries and the command line", () => {
+  const input = {
+    global: ok({ model: { chatTemplateArgs: { enable_thinking: false, x: 1, nested: { a: 1 } } } }),
+    project: ok({ models: { qwen3_4b: { chatTemplateArgs: { x: 2, nested: { b: 2 }, y: 3 } } } }),
+  };
+  assert.deepEqual(extraOf(input), ['--chat-template-args={"enable_thinking":false,"x":2,"nested":{"a":1,"b":2},"y":3}']);
+  assert.deepEqual(extraOf({ ...input, args: { "model.chatTemplateArgs": '{"y": 9, "z": {"q": 1}}' } }), [
+    '--chat-template-args={"enable_thinking":false,"x":2,"nested":{"a":1,"b":2},"y":9,"z":{"q":1}}',
+  ]);
+  // the entry is for qwen3_4b only
+  assert.deepEqual(extraOf(input, LLAMA), ['--chat-template-args={"enable_thinking":false,"x":1,"nested":{"a":1}}']);
+});
+
+test("merging never changes the parsed layer data or anything shared, and a launch can be built twice with the same result", () => {
+  const globalData = { model: { chatTemplateArgs: { x: 1, nested: { a: 1 } } } };
+  const projectData = { models: { qwen3_4b: { chatTemplateArgs: { x: 2, nested: { b: 2 } } } } };
+  const before = JSON.stringify([globalData, projectData]);
+  const { prepared } = resolved({ global: ok(globalData), project: ok(projectData) });
+  const first = toLaunchSpec(buildOk2(prepared)).extraArgs;
+  const second = toLaunchSpec(buildOk2(prepared)).extraArgs;
+  assert.deepEqual(first, second);
+  assert.equal(JSON.stringify([globalData, projectData]), before);
+  assert.equal(Object.getOwnPropertyNames(Object.prototype).includes("nested"), false);
+});
+
+function buildOk2(prepared: Prepared) {
+  const built = buildLaunch(prepared, QWEN, LAUNCH_CTX);
+  assert.ok(built.ok);
+  return built.launch;
+}
+
+// -- provenance and the flags line (D-11) --
+
+test("describeFlags shows model options with their layer; the template is shown as a path, never as text", (t) => {
+  const { path } = writeTemplate(t, "SECRET TEMPLATE TEXT");
+  const line = describeFlags(
+    launchOf({
+      global: ok({ model: { numDraftTokens: 4, useDefaultChatTemplate: true, chatTemplateArgs: { a: 1 } } }),
+      project: ok({ model: { chatTemplate: path } }),
+    }),
+  );
+  assert.equal(
+    line,
+    `flags: --num-draft-tokens 4 (global file), --chat-template ${path} (project file), --use-default-chat-template (global file), --chat-template-args {"a":1} (global file)`,
+  );
+  assert.ok(!line.includes("SECRET"));
+});
+
+test("a value from a models entry carries the label of the layer that holds the entry; a typed value is labelled /mlx-start", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { draftModel: "g" } } }),
+    project: ok({ models: { qwen3_4b: { numDraftTokens: 2 } } }),
+    args: { "model.adapterPath": "/a" },
+  };
+  assert.equal(
+    describeFlags(launchOf(input)),
+    "flags: --adapter-path /a (/mlx-start), --draft-model g (global file), --num-draft-tokens 2 (project file)",
+  );
+});
+
+test("a long adapter path is shown with up to 200 characters, cleaned of control characters", () => {
+  const path = `/${"d".repeat(150)}/adapter`;
+  const line = describeFlags(launchOf({ global: ok({ model: { adapterPath: path } }) }));
+  assert.ok(line.includes(path), line);
+  assert.ok(!CONTROL_CHARACTERS.test(line));
+});
+
+test("the flags merged from models entries differ per model in the flags line", () => {
+  const input = { global: ok({ model: { draftModel: "d" }, models: { qwen3_4b: { numDraftTokens: 4 } } }) };
+  assert.equal(describeFlags(launchOf(input, QWEN)), "flags: --draft-model d (global file), --num-draft-tokens 4 (global file)");
+  assert.equal(describeFlags(launchOf(input, LLAMA)), "flags: --draft-model d (global file)");
+});
+
+// -- roadmap success criterion 1 --
+
+test("every connection and model key in the global file produces exactly those flags, in schema order", (t) => {
+  const { path } = writeTemplate(t, "{{ messages }}\n");
+  const global = ok({
+    server: { host: "localhost", port: 9100, allowedOrigins: ["http://a.test", "http://b.test"], logLevel: "DEBUG" },
+    model: {
+      adapterPath: "/tmp/adapters/x",
+      draftModel: "mlx-community/draft",
+      numDraftTokens: 4,
+      chatTemplate: path,
+      useDefaultChatTemplate: true,
+      chatTemplateArgs: { enable_thinking: false },
+    },
+  });
+  const spec = toLaunchSpec(launchOf({ global }));
+  assert.deepEqual(spec.address, { host: "localhost", port: 9100 });
+  assert.deepEqual(spec.extraArgs, [
+    "--allowed-origins=http://a.test,http://b.test",
+    "--log-level=DEBUG",
+    "--adapter-path=/tmp/adapters/x",
+    "--draft-model=mlx-community/draft",
+    "--num-draft-tokens=4",
+    "--chat-template={{ messages }}\n",
+    "--use-default-chat-template",
+    '--chat-template-args={"enable_thinking":false}',
+  ]);
 });
