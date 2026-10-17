@@ -16,6 +16,8 @@ export interface ServerProcess {
   stdout?: { on(event: "data", listener: (chunk: Buffer | string) => void): unknown } | null;
   stderr?: { on(event: "data", listener: (chunk: Buffer | string) => void): unknown } | null;
   on(event: "exit", listener: (code: number | null) => void): unknown;
+  /** Fires after `exit` once stdio is fully read; the death diagnostics wait for it. */
+  on(event: "close", listener: (code: number | null) => void): unknown;
   kill(signal?: NodeJS.Signals): unknown;
 }
 
@@ -130,6 +132,8 @@ export function createMlxServer(
     /** Rolling tail of the child's stdout. Drained so the pipe never fills; only surfaced in diagnostics. */
     stdoutTail: string;
     onExit: Promise<void>;
+    /** Resolves on `close`, when the child's stdio has been fully read (`exit` can fire first). */
+    onClose: Promise<void>;
     /** Set when stderr reported an address-in-use bind failure; the process is then being terminated. */
     fatal?: string;
   };
@@ -142,6 +146,9 @@ export function createMlxServer(
    */
   const BIND_FAILURE = /Address already in use|Errno (?:48|98)\b/;
 
+  /** The child died on its own; the message is built after the stdio drain so it carries the final output. */
+  class ProcessDied extends Error {}
+
   const describeDeath = (c: Current) => {
     const stderr = clipDiagnostic(c.stderrTail, 400);
     const stdout = clipDiagnostic(c.stdoutTail, 200);
@@ -151,7 +158,7 @@ export function createMlxServer(
   /** Throws when `c` failed to bind, died, or was replaced/stopped while a start was waiting on it. */
   const assertAlive = (c: Current) => {
     if (c.fatal) throw new Error(c.fatal);
-    if (c.exited) throw new Error(describeDeath(c));
+    if (c.exited) throw new ProcessDied(describeDeath(c));
     if (current !== c) throw new Error("MLX server start was cancelled");
   };
 
@@ -301,6 +308,7 @@ export function createMlxServer(
 
       const proc = host.spawn(model, address);
       let resolveExit!: () => void;
+      let resolveClose!: () => void;
       const c: Current = {
         proc,
         exited: false,
@@ -308,6 +316,7 @@ export function createMlxServer(
         stderrTail: "",
         stdoutTail: "",
         onExit: new Promise<void>((r) => (resolveExit = r)),
+        onClose: new Promise<void>((r) => (resolveClose = r)),
       };
       current = c;
 
@@ -338,6 +347,8 @@ export function createMlxServer(
         }
       });
 
+      proc.on("close", () => resolveClose());
+
       emit({ type: "launched" });
       try {
         await waitForServer(c);
@@ -346,6 +357,11 @@ export function createMlxServer(
         await waitForInferenceReady(c, model);
         emit({ type: "ready" });
       } catch (error) {
+        if (error instanceof ProcessDied) {
+          // `exit` can precede the last stdout/stderr chunks; wait for `close` (bounded) before describing the death.
+          await Promise.race([c.onClose, host.sleep(killWaitMs)]);
+          throw new Error(describeDeath(c));
+        }
         // A bind failure leaves the real server alive; make sure it is gone (and has said so) before reporting.
         if (c.fatal && !c.exited) await awaitExit(c);
         // Any other failure (fatal warm-up status, health or warm-up timeout) must not leave the
