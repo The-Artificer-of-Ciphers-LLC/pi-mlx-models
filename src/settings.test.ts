@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DEFAULT_MODEL_ID } from "./config.js";
 import {
   buildLaunch,
   describeFlags,
   prepareSettings,
+  readLayerFile,
   toLaunchSpec,
   type LayerFile,
   type PrepareInput,
@@ -436,4 +440,164 @@ test("toLaunchSpec carries the address and base URL, and only the optional flags
     baseUrl: "http://localhost:9100/v1",
     extraArgs: ["--log-level=WARNING"],
   });
+});
+
+// ---- reading a config file (D-06, T-02-07, T-02-09): real files, never a throw ----
+
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** A fresh temporary directory, removed when the test ends. */
+function tempDir(t: { after(fn: () => void): void }): string {
+  const dir = mkdtempSync(join(tmpdir(), "pi-mlx-layer-"));
+  t.after(() => {
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      // already gone
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return dir;
+}
+
+function unusableReason(path: string): string {
+  const file = readLayerFile(path);
+  assert.equal(file.state, "unusable", JSON.stringify(file));
+  assert.ok(file.state === "unusable");
+  return file.reason;
+}
+
+test("a file that does not exist is absent and nothing is created at that path", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  assert.deepEqual(readLayerFile(path), { state: "absent" });
+  assert.equal(existsSync(path), false);
+  assert.deepEqual(readLayerFile(join(dir, "missing-dir", "config.json")), { state: "absent" });
+  assert.equal(existsSync(join(dir, "missing-dir")), false);
+});
+
+test("a path under a parent that is a regular file is absent (ENOTDIR) and nothing is created", (t) => {
+  const dir = tempDir(t);
+  const parent = join(dir, "not-a-directory");
+  writeFileSync(parent, "{}");
+  assert.deepEqual(readLayerFile(join(parent, "config.json")), { state: "absent" });
+  assert.equal(existsSync(join(parent, "config.json")), false);
+});
+
+test("a directory at the path is unusable: it is not a regular file", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  mkdirSync(path);
+  assert.equal(unusableReason(path), "is not a regular file");
+});
+
+test("a file larger than 256 KiB is unusable and is not parsed", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  // Valid JSON, one byte over the cap: only the size can be the reason it is refused.
+  const head = '{"defaultModel":"';
+  const tail = '"}';
+  writeFileSync(path, head + "x".repeat(256 * 1024 + 1 - head.length - tail.length) + tail);
+  assert.equal(unusableReason(path), "is larger than 256 KiB");
+});
+
+test("a file of exactly 256 KiB is still read", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  const head = '{"defaultModel":"';
+  const tail = '"}';
+  writeFileSync(path, head + "x".repeat(256 * 1024 - head.length - tail.length) + tail);
+  assert.equal(readLayerFile(path).state, "ok");
+});
+
+for (const [name, content] of [
+  ["an empty file", ""],
+  ["a whitespace-only file", " \n\t \r\n"],
+  ["a file holding only a byte order mark", "\uFEFF"],
+] as const) {
+  test(`${name} is unusable: it is empty`, (t) => {
+    const path = join(tempDir(t), "config.json");
+    writeFileSync(path, content);
+    assert.equal(unusableReason(path), "is empty");
+  });
+}
+
+test("a UTF-8 byte order mark before valid JSON is ignored", (t) => {
+  const path = join(tempDir(t), "config.json");
+  writeFileSync(path, '\uFEFF{"server":{"port":9000}}');
+  assert.deepEqual(readLayerFile(path), { state: "ok", data: { server: { port: 9000 } } });
+});
+
+test("a valid file is returned unchanged", (t) => {
+  const path = join(tempDir(t), "config.json");
+  const data = { server: { host: "localhost", port: 9000, logLevel: "INFO" }, baseUrl: "http://localhost:9000/v1", extra: [1, null] };
+  writeFileSync(path, JSON.stringify(data, null, 2));
+  assert.deepEqual(readLayerFile(path), { state: "ok", data });
+});
+
+test("a symbolic link to a regular file is followed", { skip: process.platform === "win32" ? "symbolic links need privileges on win32" : false }, (t) => {
+  const dir = tempDir(t);
+  writeFileSync(join(dir, "real.json"), '{"server":{"port":9001}}');
+  symlinkSync(join(dir, "real.json"), join(dir, "config.json"));
+  assert.deepEqual(readLayerFile(join(dir, "config.json")), { state: "ok", data: { server: { port: 9001 } } });
+});
+
+test("invalid JSON is unusable with a bounded, cleaned parser message", (t) => {
+  const path = join(tempDir(t), "config.json");
+  writeFileSync(path, "{ nope");
+  const reason = unusableReason(path);
+  assert.ok(reason.startsWith("is not valid JSON ("), reason);
+  assert.ok(reason.endsWith(")"), reason);
+  assert.ok(!reason.includes(path), "the reason never contains the file path");
+});
+
+test("a very long parser message is clipped to 120 characters and holds no control characters", (t) => {
+  const path = join(tempDir(t), "config.json");
+  // The parser echoes part of the text it choked on; make that text long and hostile.
+  writeFileSync(path, `{"a": "\u001b[31m${"y".repeat(500)}\u009b\n`);
+  const reason = unusableReason(path);
+  assert.ok(reason.startsWith("is not valid JSON ("), reason);
+  assert.ok(reason.length <= "is not valid JSON ()".length + 120, `reason is ${reason.length} characters`);
+  assert.ok(!CONTROL_CHARACTERS.test(reason), JSON.stringify(reason));
+});
+
+for (const [name, content] of [
+  ["an array", "[]"],
+  ["null", "null"],
+  ["a number", "42"],
+  ["a string", '"text"'],
+  ["a boolean", "true"],
+] as const) {
+  test(`a top level that is ${name} is unusable`, (t) => {
+    const path = join(tempDir(t), "config.json");
+    writeFileSync(path, content);
+    assert.equal(unusableReason(path), "must contain a JSON object at the top level");
+  });
+}
+
+const cannotRead =
+  process.platform === "win32"
+    ? "file modes are not enforced on win32"
+    : process.getuid?.() === 0
+      ? "running as root: mode 000 does not stop root from reading"
+      : false;
+
+test("an unreadable file is unusable and the reason names the error code", { skip: cannotRead }, (t) => {
+  const path = join(tempDir(t), "config.json");
+  writeFileSync(path, "{}");
+  chmodSync(path, 0o000);
+  const reason = unusableReason(path);
+  assert.ok(reason.startsWith("cannot be read ("), reason);
+  assert.ok(reason.includes("EACCES"), reason);
+  assert.ok(!CONTROL_CHARACTERS.test(reason));
+});
+
+test("an unreadable parent directory is unusable, not absent", { skip: cannotRead }, (t) => {
+  const dir = tempDir(t);
+  const sub = join(dir, "locked");
+  mkdirSync(sub);
+  writeFileSync(join(sub, "config.json"), "{}");
+  chmodSync(sub, 0o000);
+  const reason = unusableReason(join(sub, "config.json"));
+  assert.ok(reason.startsWith("cannot be read ("), reason);
 });
