@@ -2,6 +2,12 @@
 
 All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.2.0 were published as `pi-mlx-models`; see the [tags](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/tags) for their code.
 
+## Unreleased
+
+### Project
+
+- A release is now one manual run of the Release workflow: it bumps the version, updates this changelog, builds and tests, stages the release on npm and tags it. Pushing a tag no longer publishes anything.
+
 ## 0.2.2 - 2026-10-17
 
 ### Project

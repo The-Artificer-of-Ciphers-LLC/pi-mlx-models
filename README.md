@@ -83,7 +83,7 @@ Create `~/.pi/agent/pi-mlx-models/config.json` to set a port, allowed origins or
 
 - [About layered configuration and trust](./docs/explanation/layered-configuration-and-trust.md)
 
-See the [changelog](./CHANGELOG.md) for what changed in each release.
+See the [changelog](./CHANGELOG.md) for what changed in each release. Maintainers: [How to release a new version](./docs/how-to/release-a-new-version.md).
 
 ## Development
 
