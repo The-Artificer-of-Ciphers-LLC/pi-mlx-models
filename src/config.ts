@@ -1,5 +1,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
+// Namespace import so a pi build without the getAgentDir export yields undefined instead of a load-time failure.
+import * as pi from "@mariozechner/pi-coding-agent";
 
 export const DEFAULT_PORT = 8080;
 
@@ -26,6 +28,33 @@ export function parsePort(raw: string | undefined, fallback: number = DEFAULT_PO
   };
 }
 
+export interface AgentDirDeps {
+  getAgentDir?: () => string;
+  env: NodeJS.ProcessEnv;
+  home: string;
+}
+
+/**
+ * Resolve pi's agent directory: pi's own getAgentDir() when the host exports it,
+ * else PI_CODING_AGENT_DIR (with ~ expansion), else ~/.pi/agent.
+ */
+export function resolveAgentDir({ getAgentDir, env, home }: AgentDirDeps): string {
+  if (typeof getAgentDir === "function") {
+    try {
+      return getAgentDir();
+    } catch {
+      // fall through to the env/home rules rather than failing the import
+    }
+  }
+  const fromEnv = env.PI_CODING_AGENT_DIR;
+  if (fromEnv) {
+    if (fromEnv === "~") return home;
+    if (fromEnv.startsWith("~/")) return join(home, fromEnv.slice(2));
+    return fromEnv;
+  }
+  return join(home, ".pi", "agent");
+}
+
 const portResult = parsePort(process.env.PI_MLX_MODELS_PORT);
 
 export const PORT = portResult.port;
@@ -37,7 +66,14 @@ export const DEFAULT_MODEL = process.env.PI_MLX_MODELS_DEFAULT_MODEL ?? "mlx-com
 export const CONFIG_WARNINGS: readonly string[] = [...(portResult.warning ? [portResult.warning] : [])];
 
 export const PROVIDER_ID = "pi-mlx-models";
-export const DATA_DIR = join(homedir(), ".pi", "agent", "pi-mlx-models");
+export const DATA_DIR = join(
+  resolveAgentDir({
+    getAgentDir: (pi as { getAgentDir?: () => string }).getAgentDir,
+    env: process.env,
+    home: homedir(),
+  }),
+  "pi-mlx-models",
+);
 export const VENV_DIR = join(DATA_DIR, "venv");
 export const VENV_PYTHON = join(VENV_DIR, "bin", "python3");
 export const HF_HOME = join(DATA_DIR, "models");
