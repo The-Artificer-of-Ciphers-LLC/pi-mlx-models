@@ -251,6 +251,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       // /mlx-stop or a newer /mlx-start took over; their UI state wins.
       if (isStale()) return;
       progress.stop();
+      // stop() only halts the animation; replace the last frame it drew so it cannot linger.
+      ctx.ui.setStatus(PROVIDER_ID, "mlx: failed");
       progress.fail(step, errorMessage(e));
       ctx.ui.notify(`mlx-start failed: ${errorMessage(e)}`, "error");
     }
