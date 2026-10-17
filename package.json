@@ -3,6 +3,9 @@
   "version": "0.1.4",
   "description": "Local MLX model launcher extension for Pi",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "main": "dist/index.js",
   "files": [
     "dist",
@@ -12,7 +15,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -w -p tsconfig.json",
-    "test": "tsc -p tsconfig.test.json && node --test .test-dist/",
+    "test": "rm -rf .test-dist && tsc -p tsconfig.test.json && node --test --test-reporter=tap \".test-dist/**/*.test.js\"",
     "prepack": "npm run build"
   },
   "keywords": [
@@ -42,6 +45,7 @@
     "@mariozechner/pi-coding-agent": "*"
   },
   "devDependencies": {
+    "@types/node": "^25.6.0",
     "typescript": "^5.9.3"
   }
 }

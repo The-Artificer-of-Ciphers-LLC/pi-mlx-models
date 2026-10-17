@@ -123,6 +123,8 @@ export function createProgress(
           spinnerIndex = (spinnerIndex + 1) % SPINNER_WIDTH;
           renderStatus();
         }, SPINNER_INTERVAL_MS);
+        // The spinner must never keep a process alive; a flow that forgets stop() would otherwise hang an exit.
+        timer.unref?.();
       }
       renderStatus();
     },
