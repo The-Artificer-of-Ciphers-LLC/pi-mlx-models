@@ -2,6 +2,12 @@
 
 All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.2.0 were published as `pi-mlx-models`; see the [tags](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/tags) for their code.
 
+## 0.2.1 - 2026-10-17
+
+### Project
+
+- First release published from GitHub Actions through npm trusted publishing, with a provenance statement linking the package to the build. There are no code changes since 0.2.0.
+
 ## 0.2.0 - 2026-10-17
 
 ### Added
