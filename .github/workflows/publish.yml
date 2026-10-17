@@ -2,6 +2,11 @@ name: Publish
 
 # Publishes @taoc/pi-mlx-models to npm when a version tag is pushed (npm version creates v<version>).
 # Run it by hand with dry-run left on to check the setup without publishing anything.
+#
+# Authentication is npm trusted publishing (OIDC): there is no npm token and no NPM_TOKEN secret. On npmjs.com the
+# package's trusted publisher must name this repository and this exact file name (publish.yml); every field is
+# case-sensitive. A package has to exist before a trusted publisher can be added, so the very first version is
+# published by hand. Do not set NODE_AUTH_TOKEN anywhere in this job: even an empty value stops npm falling back to OIDC.
 on:
   push:
     tags: ["v*"]
@@ -20,10 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # A named environment lets you require a reviewer before the publish step runs (Settings > Environments).
+    # If the trusted publisher on npmjs.com names an environment, it must be this one.
     environment: npm-publish
     permissions:
       contents: read
-      # Lets npm sign a provenance statement linking the tarball to this workflow run.
+      # Lets npm exchange this run's OIDC identity for a short-lived publish credential, and sign provenance.
       id-token: write
     steps:
       - uses: actions/checkout@v7
@@ -60,6 +66,12 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
 
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 ships an older npm.
+      - name: Use an npm that supports trusted publishing
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+
       - name: Install
         run: npm ci
 
@@ -79,7 +91,6 @@ jobs:
       - name: Publish
         shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
         run: |
           set -euo pipefail
