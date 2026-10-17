@@ -465,3 +465,95 @@ test("a rejected first mlx-start still surfaces the config warnings once", async
   await commands.get("mlx-start")!("9", ctx);
   assert.equal(warnings().length, 1);
 });
+
+// CR-02: /mlx-stop and a newer /mlx-start cancel an in-flight install.
+test("mlx-stop while the runtime installs: no late server start, no late UI writes, status stays stopped", async () => {
+  const gate = deferred();
+  let emit: ((event: any) => void) | undefined;
+  const { server, commands, ctx, notes, statuses, widgets } = await setup({
+    ensureInstalled: async (opts) => {
+      emit = opts.onEvent;
+      await gate.promise;
+    },
+  });
+
+  const starting = commands.get("mlx-start")!("qwen3_4b", ctx);
+  await flush();
+  await commands.get("mlx-stop")!("", ctx);
+  const statusesAfterStop = statuses.length;
+  const widgetsAfterStop = widgets.length;
+
+  emit?.({ phase: "pip", state: "active", detail: "late pip line" });
+  gate.resolve();
+  await starting;
+
+  assert.deepEqual(server.startCalls, [], "a stopped start must not start the server");
+  assert.equal(statuses.length, statusesAfterStop, "no status write after the stop");
+  assert.equal(widgets.length, widgetsAfterStop, "no widget write after the stop");
+  assert.equal(lastStatus(statuses), "mlx: stopped");
+  assert.ok(!notes.some((n) => n.message.startsWith("Starting MLX server")));
+  assert.deepEqual(errors(notes), []);
+});
+
+test("two quick mlx-start calls share one install and only the newer one starts the server", async () => {
+  const gate = deferred();
+  const { server, installCalls, commands, ctx, notes, statuses } = await setup({
+    ensureInstalled: () => gate.promise,
+  });
+
+  const first = commands.get("mlx-start")!("1", ctx);
+  await flush();
+  const second = commands.get("mlx-start")!("2", ctx);
+  await flush();
+  gate.resolve();
+  await Promise.all([first, second]);
+
+  assert.equal(installCalls.length, 1, "concurrent starts must not run two installs in one venv");
+  assert.deepEqual(server.startCalls, [MODEL_PRESETS[1].modelId]);
+  assert.equal(lastStatus(statuses), `mlx: running (${MODEL_PRESETS[1].modelId})`);
+  assert.deepEqual(errors(notes), []);
+});
+
+test("an mlx-init during an mlx-start install never runs two installs at once", async () => {
+  const gates = [deferred(), deferred()];
+  let running = 0;
+  let maxRunning = 0;
+  let call = 0;
+  const { commands, ctx } = await setup({
+    ensureInstalled: async () => {
+      const gate = gates[call++];
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      await gate?.promise;
+      running -= 1;
+    },
+  });
+
+  const starting = commands.get("mlx-start")!("qwen3_4b", ctx);
+  await flush();
+  const initing = commands.get("mlx-init")!("", ctx);
+  await flush();
+  gates[0].resolve();
+  await flush();
+  gates[1].resolve();
+  await Promise.all([starting, initing]);
+
+  assert.equal(maxRunning, 1);
+  assert.equal(call, 2, "an upgrade install is not satisfied by a plain one");
+});
+
+test("session_shutdown while the runtime installs: the server is never started afterwards", async () => {
+  const gate = deferred();
+  const { server, handlers, commands, ctx } = await setup({
+    ensureInstalled: () => gate.promise,
+    sleep: never,
+  });
+
+  const starting = commands.get("mlx-start")!("qwen3_4b", ctx);
+  await flush();
+  await handlers.get("session_shutdown")!();
+  gate.resolve();
+  await starting;
+
+  assert.deepEqual(server.startCalls, []);
+});
