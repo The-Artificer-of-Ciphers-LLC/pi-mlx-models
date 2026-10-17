@@ -32,7 +32,7 @@ test("upgrade always runs the pip steps, in phase order", async () => {
   const { host, calls } = fakeHost({ venv: true });
   const events: RuntimeEvent[] = [];
   await ensureInstalled({ host, upgrade: true, onEvent: (e) => events.push(e) });
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3, "the venv version probe plus the two pip steps");
   assert.deepEqual(
     [...new Set(events.map((e) => e.phase))],
     ["python", "venv", "pip", "mlx-lm"],
@@ -50,7 +50,7 @@ test("a broken venv falls through to reinstall without upgrade", async () => {
     },
   });
   await ensureInstalled({ host });
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4, "import check, venv version probe and the two pip steps");
 });
 
 test("missing venv is created with the discovered python", async () => {

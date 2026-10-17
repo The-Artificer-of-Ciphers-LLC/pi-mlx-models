@@ -117,6 +117,20 @@ export const systemHost: RuntimeHost = {
   run,
 };
 
+/** Minor version of the venv's own interpreter, or null when it cannot be run or its output is not a Python 3 version. */
+async function venvPythonMinor(host: RuntimeHost): Promise<number | null> {
+  let minor: number | null = null;
+  try {
+    await host.run(VENV_PYTHON, ["--version"], (line) => {
+      const m = line.match(/Python\s+3\.(\d+)/);
+      if (m && minor === null) minor = Number(m[1]);
+    });
+  } catch {
+    return null;
+  }
+  return minor;
+}
+
 /**
  * Make sure the venv with mlx-lm exists.
  * Without `upgrade`, an already-working install is left untouched (no network);
@@ -158,8 +172,20 @@ export async function ensureInstalled(options: {
   emit({ phase: "python", state: "done", detail: "Compatible Python found" });
 
   emit({ phase: "venv", state: "active", detail: "Checking virtual environment" });
+  const onVenvLine = (line: string) => emit({ phase: "venv", state: "active", detail: cleanLabel(line) });
   if (!host.exists(VENV_PYTHON)) {
-    await host.run(py, ["-m", "venv", VENV_DIR], (line) => emit({ phase: "venv", state: "active", detail: cleanLabel(line) }));
+    await host.run(py, ["-m", "venv", VENV_DIR], onVenvLine);
+  } else {
+    // A venv built by an older interpreter keeps that interpreter; mlx-lm cannot be installed into it.
+    const minor = await venvPythonMinor(host);
+    if (minor !== null && minor < MIN_PYTHON_MINOR) {
+      emit({
+        phase: "venv",
+        state: "active",
+        detail: `Virtual environment uses Python 3.${minor}, older than 3.${MIN_PYTHON_MINOR}; recreating it`,
+      });
+      await host.run(py, ["-m", "venv", "--clear", VENV_DIR], onVenvLine);
+    }
   }
   emit({ phase: "venv", state: "done", detail: "Virtual environment ready" });
 
