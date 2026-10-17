@@ -85,6 +85,39 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   let activeProgress: Progress | null = null;
   let configWarningsShown = false;
 
+  /**
+   * Bumped by every /mlx-start, /mlx-init, /mlx-stop and session_shutdown. A flow compares its own value
+   * after each await: if it moved, the flow was stopped or superseded and must not touch the server or UI.
+   */
+  let epoch = 0;
+
+  /** The one runtime install that may touch the venv at a time. */
+  let installing: { promise: Promise<void>; upgrade: boolean; listeners: Set<(event: RuntimeEvent) => void> } | null = null;
+
+  /**
+   * Run (or join) the runtime install. Concurrent callers never run two installs in one venv: a caller
+   * that a running install already satisfies shares it (and its progress events); an upgrade request
+   * waits for a plain install to finish and then runs its own.
+   */
+  async function install(options: { upgrade: boolean; onEvent: (event: RuntimeEvent) => void }): Promise<void> {
+    while (installing && options.upgrade && !installing.upgrade) await installing.promise.catch(() => {});
+    if (installing) {
+      installing.listeners.add(options.onEvent);
+      return installing.promise;
+    }
+    const listeners = new Set([options.onEvent]);
+    const promise: Promise<void> = deps
+      .ensureInstalled({
+        ...(options.upgrade ? { upgrade: true } : {}),
+        onEvent: (event) => listeners.forEach((listener) => listener(event)),
+      })
+      .finally(() => {
+        if (installing?.promise === promise) installing = null;
+      });
+    installing = { promise, upgrade: options.upgrade, listeners };
+    return promise;
+  }
+
   async function registerProvider(pi: PiHost, options?: { includeFallback?: boolean }) {
     const discovered = await deps.discoverModelIds();
     const includeFallback = options?.includeFallback ?? false;
@@ -107,6 +140,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   }
 
   async function stopServer(ctx: any) {
+    epoch += 1; // cancels an in-flight start or init, including one still waiting on the installer
     activeProgress?.clear();
     activeProgress = null;
     await server.stop();
@@ -122,8 +156,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       return;
     }
     const model = selected.modelId;
+    const mine = (epoch += 1);
+    const isStale = () => epoch !== mine;
     currentModel = model;
     await registerProvider(pi, { includeFallback: false });
+    if (isStale()) return;
 
     const progress = newProgress(ctx, `MLX start progress (${model})`, [
       "Ensure runtime is installed",
@@ -143,7 +180,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
     try {
       activate(0, "Checking runtime");
-      await deps.ensureInstalled({ onEvent: (e) => progress.update(0, { state: "active", detail: e.detail }) });
+      await install({
+        upgrade: false,
+        onEvent: (e) => {
+          if (!isStale()) progress.update(0, { state: "active", detail: e.detail });
+        },
+      });
+      if (isStale()) return; // stopped or superseded while installing
       progress.done(0, "Runtime ready");
 
       ctx.ui.notify(
@@ -154,6 +197,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       activate(1, "Launching mlx_lm.server");
 
       await server.start(model, (event) => {
+        if (isStale()) return;
         switch (event.type) {
           case "launched":
             progress.done(1, "Server process started");
@@ -193,8 +237,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         }
       });
 
+      if (isStale()) return;
       activate(5, "Refreshing provider model list");
       await registerProvider(pi, { includeFallback: true });
+      if (isStale()) return;
       progress.done(5, "Provider ready");
 
       progress.clear();
@@ -203,7 +249,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       ctx.ui.notify("MLX server is ready for prompts. Use /model and pick pi-mlx-models/...", "info");
     } catch (e) {
       // /mlx-stop or a newer /mlx-start took over; their UI state wins.
-      if (activeProgress !== progress) return;
+      if (isStale()) return;
       progress.stop();
       progress.fail(step, errorMessage(e));
       ctx.ui.notify(`mlx-start failed: ${errorMessage(e)}`, "error");
@@ -217,6 +263,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       description: "Initialize local MLX runtime (python venv + mlx-lm)",
       handler: async (_args, ctx) => {
         ctx.ui.setWidget(PICKER_WIDGET, undefined);
+        const mine = (epoch += 1);
+        const isStale = () => epoch !== mine;
         const progress = newProgress(ctx, "MLX init progress", [
           "Find compatible Python",
           "Create virtual environment",
@@ -226,18 +274,21 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         let step = 0;
         try {
           ctx.ui.notify("Installing local MLX runtime...", "info");
-          await deps.ensureInstalled({
+          await install({
             upgrade: true,
             onEvent: (e) => {
+              if (isStale()) return;
               step = INIT_STEPS[e.phase];
               if (e.state === "done") return progress.done(step, e.detail);
               progress.activate(step, e.detail);
               if (e.progress != null) progress.update(step, { progress: e.progress });
             },
           });
+          if (isStale()) return;
           ctx.ui.notify("MLX runtime installed.", "info");
           progress.clear();
         } catch (e) {
+          if (isStale()) return;
           progress.fail(step, errorMessage(e));
           ctx.ui.notify(`mlx-init failed: ${errorMessage(e)}`, "error");
         }
@@ -278,6 +329,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     });
 
     pi.on("session_shutdown", async () => {
+      epoch += 1; // a start still waiting on the installer must not launch a server after shutdown
       activeProgress?.stop();
       // Wait for the child to exit so a quitting pi does not leave it holding the port, but never
       // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.
