@@ -1133,6 +1133,8 @@ function scriptConfirms(h: Harness, answers: Array<boolean | Promise<boolean>>) 
 const TRUST_TITLE = "Allow remote code from the model repository?";
 const HOST_TITLE = "Listen on a non-loopback address?";
 const URL_TITLE = "Send prompts to a non-loopback address?";
+/** Spelled out here, not imported, so changing the production sentence is a deliberate edit of two places. */
+const SAFE_CHOICE_NOTE = "Yes allows this. No or Esc cancels. Check which option is highlighted before pressing Enter.";
 const refusalText = (settings: ReturnType<typeof freshSettings>, lines: string[]) =>
   [
     "mlx-start failed: .pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
@@ -1374,7 +1376,8 @@ test("trustRemoteCode in the global file asks once per start, names its source, 
     {
       title: TRUST_TITLE,
       message:
-        "--trust-remote-code (from global file) lets the model repository run Python code on this machine. Only continue for repositories you trust.",
+        "--trust-remote-code (from global file) lets the model repository run Python code on this machine. Only continue for repositories you trust." +
+        `\n\n${SAFE_CHOICE_NOTE}`,
     },
   ]);
   assert.deepEqual(h.server.launches[0]?.extraArgs, ["--trust-remote-code"]);
@@ -1492,6 +1495,7 @@ for (const [name, source, title, label, extra] of SOURCES) {
     assert.equal(h.confirms.length, 1);
     assert.equal(h.confirms[0].title, title);
     assert.ok(h.confirms[0].message.includes(label), h.confirms[0].message);
+    assert.ok(h.confirms[0].message.endsWith(`\n\n${SAFE_CHOICE_NOTE}`), h.confirms[0].message);
     assert.equal(h.server.startCalls.length, 1, "confirmed, so it launched");
     assert.deepEqual(h.server.launches[0]?.extraArgs, extra);
   });
@@ -1516,9 +1520,43 @@ test("the host dialog shows an IPv6 address bracketed in front of the port, and 
   assert.deepEqual(h.confirms, [
     {
       title: HOST_TITLE,
-      message: "The MLX server will listen on [::]:9000 (from env PI_MLX_MODELS_HOST), reachable from your network. mlx_lm.server has no authentication.",
+      message: "The MLX server will listen on [::]:9000 (from env PI_MLX_MODELS_HOST), reachable from your network. mlx_lm.server has no authentication." +
+        `\n\n${SAFE_CHOICE_NOTE}`,
     },
   ]);
+});
+
+test("every trust dialog ends with the safe-choice sentence, exactly once", async () => {
+  const settings = freshSettings({ PI_MLX_MODELS_HOST: "0.0.0.0" });
+  writeGlobal(settings, { baseUrl: "http://example.test:8080/v1", server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(
+    h.confirms.map((c) => c.title),
+    [TRUST_TITLE, HOST_TITLE, URL_TITLE],
+  );
+  for (const { message } of h.confirms) {
+    assert.ok(message.endsWith(`\n\n${SAFE_CHOICE_NOTE}`), message);
+    assert.equal(message.split(SAFE_CHOICE_NOTE).length - 1, 1, message);
+  }
+});
+
+test("a trust dialog is asked with exactly a title and a message: no options, timeout or signal", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { trustRemoteCode: true } });
+  const h = await setup({ settings });
+  const argCounts: number[] = [];
+  h.ctx.ui.confirm = async (...args: unknown[]) => {
+    argCounts.push(args.length);
+    return true;
+  };
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(argCounts, [2]);
+  assert.equal(h.server.startCalls.length, 1, "confirmed, so it launched");
 });
 
 test("--trust-remote-code takes no value on /mlx-start", async () => {

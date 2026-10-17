@@ -312,6 +312,10 @@ test("trustRemoteCode in the global file asks on every start and reaches the pro
   assert.equal(h.confirms.length, 1);
   assert.equal(h.confirms[0].title, "Allow remote code from the model repository?");
   assert.ok(h.confirms[0].message.startsWith("--trust-remote-code (from global file) lets the model repository run Python code"));
+  assert.ok(
+    h.confirms[0].message.endsWith("\n\nYes allows this. No or Esc cancels. Check which option is highlighted before pressing Enter."),
+    h.confirms[0].message,
+  );
   assert.match(startNotes(h.notes)[0].message, /\nflags: .*--trust-remote-code \(global file\)$/);
 
   await h.start();
