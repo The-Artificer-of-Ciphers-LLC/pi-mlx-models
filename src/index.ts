@@ -8,7 +8,9 @@ import { createProgress, type Progress } from "./progress.js";
 import { ensureInstalled, type RuntimeEvent } from "./runtime.js";
 import { createMlxServer, type MlxServer } from "./server.js";
 import {
+  PI_FLAGS,
   buildLaunch,
+  cliFlagSpecs,
   describeFlags,
   formatConfigErrors,
   prepareSettings,
@@ -18,6 +20,7 @@ import {
   type ResolvedLaunch,
   type SettingsSource,
 } from "./settings.js";
+import { parseStartArgs } from "./startargs.js";
 
 const PROGRESS_WIDGET = "mlx-progress";
 
@@ -315,6 +318,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   }
 
   return async function extension(pi: PiHost) {
+    // Registered before the first await. String flags with no default: pi writes a default into its flag values
+    // at registration, which would make the flag outrank the environment and the files (D-09).
+    for (const flag of PI_FLAGS) pi.registerFlag(flag.name, { description: flag.description, type: "string" });
+
     const ambient = ambientSettings();
     activeBaseUrl = ambient.baseUrl;
     currentModel = ambient.defaultModel;
@@ -361,12 +368,31 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     });
 
     pi.registerCommand("mlx-start", {
-      description: "Start local MLX server. Usage: /mlx-start [preset-number|preset-key|hf-model-id]",
+      description: "Start local MLX server. Usage: /mlx-start [preset-number|preset-key|hf-model-id] [--flag value ...]",
       handler: async (args, ctx) => {
+        // Syntax errors in the arguments are reported before anything else: no unknown flag is ever passed on (D-08).
+        const parsed = parseStartArgs(args ?? "", cliFlagSpecs());
+        if (!parsed.ok) {
+          ctx.ui.notify(`mlx-start failed: ${parsed.error}`, "error");
+          return;
+        }
+        // Everything below is read from this call alone and kept nowhere: overrides apply to this launch only (D-10).
+        // The pi flags are read here and not in the factory, because pi fills their values in after it ran (D-09).
+        const piFlags: Record<string, string> = {};
+        for (const flag of PI_FLAGS) {
+          const value = flag.path === undefined ? undefined : pi.getFlag(flag.name);
+          if (typeof value === "string") piFlags[flag.name] = value;
+        }
+        const modelFlag = pi.getFlag("mlx-model");
+        const typed: Record<string, string | true> = {};
+        for (const flag of parsed.flags) typed[flag.path] = flag.raw;
+
         // The global file is read on every start, so an edit needs no reload (D-05).
         const result = prepareSettings({
           global: readLayerFile(deps.settings.globalConfigPath),
           env: deps.settings.env,
+          piFlags,
+          args: typed,
         });
         for (const warning of result.warnings) {
           if (shownWarnings.has(warning)) continue;
@@ -380,8 +406,12 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         }
         const { prepared } = result;
 
-        const normalizedArgs = (args || "").trim();
-        if (!normalizedArgs) {
+        // A model typed on the command line beats --mlx-model; with neither, the picker opens even when a default
+        // model is configured (the default only fills in for a start that names no model at all).
+        const typedModel = (parsed.model ?? "").trim();
+        const flagModel = typeof modelFlag === "string" ? modelFlag.trim() : "";
+        const modelInput = typedModel || flagModel;
+        if (!modelInput) {
           const preset = await pickPreset(ctx);
           if (!preset) {
             ctx.ui.notify("Preset selection cancelled.", "info");
@@ -391,7 +421,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           return;
         }
 
-        await startModelFromInput(pi, ctx, normalizedArgs, prepared);
+        await startModelFromInput(pi, ctx, modelInput, prepared);
       },
     });
 

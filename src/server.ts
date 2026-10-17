@@ -110,6 +110,10 @@ export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
 
 const systemHost = createSystemHost();
 
+/** The ways to pick another port, nearest first: this launch, then the files, then the environment. */
+const PORT_ADVICE = "set a different port with --port on /mlx-start, server.port in config.json, or PI_MLX_MODELS_PORT";
+const PORT_ADVICE_SENTENCE = `S${PORT_ADVICE.slice(1)}`;
+
 export function createMlxServer(
   options: {
     host?: ServerHost;
@@ -334,8 +338,8 @@ export function createMlxServer(
       if (inUse) {
         throw new Error(
           hadPrevious
-            ? `Port ${address.port} is still in use after stopping the previous MLX server. Retry in a moment, or set PI_MLX_MODELS_PORT (or server.port in config.json) to use a different port.`
-            : `Port ${address.port} on ${address.host} is already in use by another process. Set PI_MLX_MODELS_PORT (or server.port in config.json) to a free port, or find what holds it with: lsof -nP -iTCP:${address.port} -sTCP:LISTEN`,
+            ? `Port ${address.port} is still in use after stopping the previous MLX server. Retry in a moment, or ${PORT_ADVICE}.`
+            : `Port ${address.port} on ${address.host} is already in use by another process. ${PORT_ADVICE_SENTENCE}, or find what holds it with: lsof -nP -iTCP:${address.port} -sTCP:LISTEN`,
         );
       }
 
@@ -366,7 +370,7 @@ export function createMlxServer(
         c.stderrTail = (c.stderrTail + text).slice(-800);
         if (current === c && !c.fatal && BIND_FAILURE.test(c.stderrTail)) {
           // The message deliberately omits the raw stderr text.
-          c.fatal = `Port ${address.port} on ${address.host} is already in use, so the MLX server could not bind it. Set PI_MLX_MODELS_PORT (or server.port in config.json) to use a different port.`;
+          c.fatal = `Port ${address.port} on ${address.host} is already in use, so the MLX server could not bind it. ${PORT_ADVICE_SENTENCE}.`;
           c.proc.kill("SIGTERM");
         }
         if (current === c) parseStderr(text, emit);
