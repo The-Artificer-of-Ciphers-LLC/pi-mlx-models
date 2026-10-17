@@ -13,6 +13,7 @@ export type ServerEvent =
   | { type: "exited" };
 
 export interface ServerProcess {
+  stdout?: { on(event: "data", listener: (chunk: Buffer | string) => void): unknown } | null;
   stderr?: { on(event: "data", listener: (chunk: Buffer | string) => void): unknown } | null;
   on(event: "exit", listener: (code: number | null) => void): unknown;
   kill(signal?: NodeJS.Signals): unknown;
@@ -79,6 +80,16 @@ export function createSystemHost(options: SystemHostOptions = {}): ServerHost {
 
 const systemHost = createSystemHost();
 
+/**
+ * Untrusted text (child output, response bodies) is shown in pi's UI, so it is clipped and has
+ * C0 control characters other than newline and tab, and DEL, replaced by a space so a terminal
+ * escape sequence cannot be injected. `from` picks which end survives the clip.
+ */
+const clipDiagnostic = (text: string, max: number, from: "start" | "end" = "end"): string => {
+  const clean = text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ").trim();
+  return from === "end" ? clean.slice(-max) : clean.slice(0, max);
+};
+
 export function createMlxServer(
   options: {
     host?: ServerHost;
@@ -110,6 +121,8 @@ export function createMlxServer(
     exited: boolean;
     exitCode: number | null;
     stderrTail: string;
+    /** Rolling tail of the child's stdout. Drained so the pipe never fills; only surfaced in diagnostics. */
+    stdoutTail: string;
     onExit: Promise<void>;
     /** Set when stderr reported an address-in-use bind failure; the process is then being terminated. */
     fatal?: string;
@@ -123,8 +136,11 @@ export function createMlxServer(
    */
   const BIND_FAILURE = /Address already in use|Errno (?:48|98)\b/;
 
-  const describeDeath = (c: Current) =>
-    `MLX server exited (code ${c.exitCode ?? "unknown"})${c.stderrTail.trim() ? `: ${c.stderrTail.trim().slice(-400)}` : ""}`;
+  const describeDeath = (c: Current) => {
+    const stderr = clipDiagnostic(c.stderrTail, 400);
+    const stdout = clipDiagnostic(c.stdoutTail, 200);
+    return `MLX server exited (code ${c.exitCode ?? "unknown"})${stderr ? `: ${stderr}` : ""}${stdout ? ` | stdout: ${stdout}` : ""}`;
+  };
 
   /** Throws when `c` failed to bind, died, or was replaced/stopped while a start was waiting on it. */
   const assertAlive = (c: Current) => {
@@ -279,9 +295,16 @@ export function createMlxServer(
         exited: false,
         exitCode: null,
         stderrTail: "",
+        stdoutTail: "",
         onExit: new Promise<void>((r) => (resolveExit = r)),
       };
       current = c;
+
+      // Always drain stdout: a child that fills an unread pipe blocks forever (REL-01). Only a
+      // bounded tail is kept, never parsed and never forwarded.
+      proc.stdout?.on("data", (chunk) => {
+        c.stdoutTail = (c.stdoutTail + chunk.toString()).slice(-800);
+      });
 
       proc.stderr?.on("data", (chunk) => {
         const text = chunk.toString();
