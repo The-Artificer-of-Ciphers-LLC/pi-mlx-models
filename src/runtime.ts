@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { VENV_DIR, VENV_PYTHON } from "./config.js";
 
 export type RuntimeEvent = {
@@ -21,6 +22,8 @@ const PYPI_INDEX = ["--index-url", "https://pypi.org/simple/"];
 
 /** mlx-lm 0.32 requires Python 3.11+. There is deliberately no ceiling. */
 const MIN_PYTHON_MINOR = 11;
+
+const PYTHON_OVERRIDE_ENV = "PI_MLX_MODELS_PYTHON";
 
 const PYTHON_CANDIDATES = [
   "/opt/homebrew/bin/python3.14",
@@ -48,12 +51,36 @@ function probePython(candidate: string): Probe {
   }
 }
 
-export function pythonCandidates(_env: NodeJS.ProcessEnv = process.env, fixed: string[] = PYTHON_CANDIDATES): string[] {
-  return [...fixed];
+/**
+ * Names searched on PATH, newest first. The named probes stop at 3.14: a brand-new
+ * interpreter may lack wheels for transitive dependencies, but a bare `python3` or an
+ * explicit PI_MLX_MODELS_PYTHON of any newer version is still accepted (no ceiling).
+ */
+const PATH_PYTHON_NAMES = ["python3.14", "python3.13", "python3.12", "python3.11", "python3"];
+
+/** Fixed candidates first, then PATH expanded name-major so the newest name anywhere wins. */
+export function pythonCandidates(env: NodeJS.ProcessEnv = process.env, fixed: string[] = PYTHON_CANDIDATES): string[] {
+  const dirs = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  const fromPath = PATH_PYTHON_NAMES.flatMap((name) => dirs.map((dir) => join(dir, name)));
+  return [...new Set([...fixed, ...fromPath])];
 }
 
+/**
+ * First acceptable Python 3.11+ interpreter, or null.
+ * PI_MLX_MODELS_PYTHON (env only, never a project file) is tried first; when it is set
+ * but unusable this throws by name rather than silently using another binary.
+ */
 export function findPython(options: { candidates?: string[]; env?: NodeJS.ProcessEnv } = {}): string | null {
-  for (const c of options.candidates ?? PYTHON_CANDIDATES) {
+  const env = options.env ?? process.env;
+  const override = env[PYTHON_OVERRIDE_ENV]?.trim();
+  if (override) {
+    const probe = probePython(override);
+    if (probe.ok) return override;
+    throw new Error(
+      `${PYTHON_OVERRIDE_ENV} is set to "${override}" but it is not a usable Python 3.${MIN_PYTHON_MINOR}+ interpreter (${probe.reason}).`,
+    );
+  }
+  for (const c of pythonCandidates(env, options.candidates ?? PYTHON_CANDIDATES)) {
     if (probePython(c).ok) return c;
   }
   return null;
@@ -82,7 +109,7 @@ function run(cmd: string, args: string[], onLine?: (line: string) => void): Prom
 
 export const systemHost: RuntimeHost = {
   findPython,
-  searched: () => [...PYTHON_CANDIDATES],
+  searched: () => [...PYTHON_CANDIDATES, `${PATH_PYTHON_NAMES.join(", ")} on PATH`],
   exists: existsSync,
   run,
 };
