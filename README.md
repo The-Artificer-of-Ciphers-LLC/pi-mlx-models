@@ -48,7 +48,7 @@ You can also start directly with a full model id:
 ## Commands
 
 - `/mlx-init` — initialize local MLX runtime
-- `/mlx-start [hf-model-id]` — open selector (no args) or start with full model id
+- `/mlx-start [preset-number|preset-key|hf-model-id]` — open selector (no args), or start a preset by its number (1-5) or key, or any full model id
 - `/mlx-stop` — stop server and clear active provider models
 
 ## Included presets
