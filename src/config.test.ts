@@ -202,3 +202,33 @@ test("an empty or blank PI_MLX_MODELS_DEFAULT_MODEL falls back to the built-in d
   assert.equal(loadConfig({ PI_MLX_MODELS_DEFAULT_MODEL: "   " }).DEFAULT_MODEL, builtIn);
   assert.equal(loadConfig({ PI_MLX_MODELS_DEFAULT_MODEL: " org/model " }).DEFAULT_MODEL, "org/model");
 });
+
+// WR-05: empty HOST / BASE_URL are unset, and a trailing slash in BASE_URL must not produce "//models".
+test("an empty or blank PI_MLX_MODELS_HOST is treated as unset", () => {
+  for (const value of ["", "   "]) {
+    const cfg = loadConfig({ PI_MLX_MODELS_HOST: value });
+    assert.equal(cfg.HOST, "127.0.0.1", JSON.stringify(value));
+    assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1");
+    assert.deepEqual(cfg.CONFIG_WARNINGS, []);
+  }
+});
+
+test("an empty or blank PI_MLX_MODELS_BASE_URL is treated as unset, without a warning", () => {
+  for (const value of ["", "   "]) {
+    const cfg = loadConfig({ PI_MLX_MODELS_BASE_URL: value });
+    assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1", JSON.stringify(value));
+    assert.deepEqual(cfg.CONFIG_WARNINGS, []);
+  }
+});
+
+test("trailing slashes are stripped from PI_MLX_MODELS_BASE_URL and the address still matches the launch address", () => {
+  const cfg = loadConfig({ PI_MLX_MODELS_BASE_URL: "http://127.0.0.1:8080/v1//" });
+  assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1");
+  assert.deepEqual(cfg.CONFIG_WARNINGS, []);
+});
+
+test("surrounding whitespace is trimmed from PI_MLX_MODELS_HOST and PI_MLX_MODELS_BASE_URL", () => {
+  const cfg = loadConfig({ PI_MLX_MODELS_HOST: " 127.0.0.1 ", PI_MLX_MODELS_BASE_URL: " http://127.0.0.1:8080/v1 " });
+  assert.equal(cfg.HOST, "127.0.0.1");
+  assert.equal(cfg.BASE_URL, "http://127.0.0.1:8080/v1");
+});
