@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_PORT, parsePort, resolveAgentDir } from "./config.js";
+import { DEFAULT_PORT, baseUrlWarning, parsePort, resolveAgentDir } from "./config.js";
 
 interface LoadedConfig {
   PORT: number;
@@ -127,4 +127,68 @@ test("PI_CODING_AGENT_DIR with a leading ~ expands against HOME", (t) => {
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const cfg = loadConfig({ HOME: home, PI_CODING_AGENT_DIR: "~/custom" });
   assert.equal(cfg.DATA_DIR, join(home, "custom", "pi-mlx-models"));
+});
+
+test("baseUrlWarning returns null when no explicit base URL is given", () => {
+  assert.equal(baseUrlWarning({ baseUrl: undefined, host: "127.0.0.1", port: 8080 }), null);
+});
+
+test("baseUrlWarning returns null when host and port match the launch address", () => {
+  assert.equal(baseUrlWarning({ baseUrl: "http://127.0.0.1:8080/v1", host: "127.0.0.1", port: 8080 }), null);
+});
+
+test("baseUrlWarning treats 127.0.0.1, localhost and ::1 as the same loopback host", () => {
+  for (const baseUrl of ["http://localhost:8080/v1", "http://127.0.0.1:8080/v1", "http://[::1]:8080/v1"]) {
+    for (const host of ["127.0.0.1", "localhost", "::1"]) {
+      assert.equal(baseUrlWarning({ baseUrl, host, port: 8080 }), null, `${baseUrl} vs ${host}`);
+    }
+  }
+});
+
+test("baseUrlWarning lets a wildcard launch host match a loopback URL", () => {
+  assert.equal(baseUrlWarning({ baseUrl: "http://127.0.0.1:8080/v1", host: "0.0.0.0", port: 8080 }), null);
+  assert.equal(baseUrlWarning({ baseUrl: "http://localhost:8080/v1", host: "::", port: 8080 }), null);
+});
+
+test("baseUrlWarning warns on a different port and names both addresses", () => {
+  const warning = baseUrlWarning({ baseUrl: "http://127.0.0.1:9999/v1", host: "127.0.0.1", port: 8080 });
+  assert.ok(warning);
+  assert.ok(warning.includes("9999"));
+  assert.ok(warning.includes("8080"));
+  assert.match(warning, /polling and registration/);
+});
+
+test("baseUrlWarning warns on a different machine", () => {
+  const warning = baseUrlWarning({ baseUrl: "http://example.test:8080/v1", host: "127.0.0.1", port: 8080 });
+  assert.ok(warning);
+  assert.ok(warning.includes("example.test"));
+});
+
+test("baseUrlWarning warns when the base URL is not a valid URL", () => {
+  const warning = baseUrlWarning({ baseUrl: "not a url", host: "127.0.0.1", port: 8080 });
+  assert.ok(warning);
+  assert.match(warning, /not a valid URL/);
+});
+
+test("baseUrlWarning reads an omitted port as 80 for http and 443 for https", () => {
+  assert.equal(baseUrlWarning({ baseUrl: "http://127.0.0.1/v1", host: "127.0.0.1", port: 80 }), null);
+  assert.equal(baseUrlWarning({ baseUrl: "https://127.0.0.1/v1", host: "127.0.0.1", port: 443 }), null);
+  assert.ok(baseUrlWarning({ baseUrl: "http://127.0.0.1/v1", host: "127.0.0.1", port: 8080 }));
+});
+
+test("a mismatching PI_MLX_MODELS_BASE_URL yields exactly one config warning", () => {
+  const cfg = loadConfig({ PI_MLX_MODELS_BASE_URL: "http://127.0.0.1:9999/v1" });
+  assert.equal(cfg.BASE_URL, "http://127.0.0.1:9999/v1");
+  assert.equal(cfg.CONFIG_WARNINGS.length, 1);
+});
+
+test("a loopback-alias PI_MLX_MODELS_BASE_URL yields no config warning", () => {
+  const cfg = loadConfig({ PI_MLX_MODELS_BASE_URL: "http://localhost:8080/v1" });
+  assert.deepEqual(cfg.CONFIG_WARNINGS, []);
+});
+
+test("an IPv6 launch host is bracketed in the derived BASE_URL", () => {
+  const cfg = loadConfig({ PI_MLX_MODELS_HOST: "::1" });
+  assert.equal(cfg.BASE_URL, "http://[::1]:8080/v1");
+  assert.deepEqual(cfg.CONFIG_WARNINGS, []);
 });
