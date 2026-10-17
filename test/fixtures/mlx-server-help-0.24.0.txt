@@ -1,0 +1,27 @@
+Calling `python -m mlx_lm.server...` directly is deprecated. Use `mlx_lm.server...` or `python -m mlx_lm server ...` instead.
+usage: server.py [-h] [--model MODEL] [--adapter-path ADAPTER_PATH]
+                 [--host HOST] [--port PORT] [--draft-model DRAFT_MODEL]
+                 [--trust-remote-code]
+                 [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}]
+                 [--chat-template CHAT_TEMPLATE] [--use-default-chat-template]
+
+MLX Http Server.
+
+options:
+  -h, --help            show this help message and exit
+  --model MODEL         The path to the MLX model weights, tokenizer, and
+                        config
+  --adapter-path ADAPTER_PATH
+                        Optional path for the trained adapter weights and
+                        config.
+  --host HOST           Host for the HTTP server (default: 127.0.0.1)
+  --port PORT           Port for the HTTP server (default: 8080)
+  --draft-model DRAFT_MODEL
+                        A model to be used for speculative decoding.
+  --trust-remote-code   Enable trusting remote code for tokenizer
+  --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
+                        Set the logging level (default: INFO)
+  --chat-template CHAT_TEMPLATE
+                        Specify a chat template for the tokenizer
+  --use-default-chat-template
+                        Use the default chat template
