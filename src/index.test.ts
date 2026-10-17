@@ -1638,3 +1638,177 @@ test("the provider registered when pi loads the extension comes from the environ
   assert.equal(h.providerCalls[0].config.baseUrl, "http://localhost:9999/v1");
   assert.equal(h.confirms.length, 0);
 });
+
+// ---- the model options and the models block (plan 02-06: SRV-02, D-21, D-22, D-23) ----
+
+const startMlx = (h: Harness, input: string) => h.commands.get("mlx-start")!(input, h.ctx);
+const flagsLineOf = (notes: Note[], index: number) => startingNotes(notes)[index].split("\n")[1];
+
+test("a global draft model and a per-model token count reach each launch; another model gets only the shared block", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { model: { draftModel: "mlx-community/draft" }, models: { qwen3_4b: { numDraftTokens: 4 } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+  await startMlx(h, "llama3_2_3b");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(
+    h.server.launches.map((launch) => launch?.extraArgs),
+    [["--draft-model=mlx-community/draft", "--num-draft-tokens=4"], ["--draft-model=mlx-community/draft"]],
+  );
+  assert.equal(flagsLineOf(h.notes, 0), "flags: --draft-model mlx-community/draft (global file), --num-draft-tokens 4 (global file)");
+  assert.equal(flagsLineOf(h.notes, 1), "flags: --draft-model mlx-community/draft (global file)");
+});
+
+const WAYS_TO_CHOOSE_QWEN: Array<[string, { input: string; flag?: string; pick?: boolean }]> = [
+  ["its number", { input: "4" }],
+  ["its preset key", { input: "qwen3_4b" }],
+  ["its full model id", { input: QWEN.modelId }],
+  ["the picker", { input: "", pick: true }],
+  ["the mlx-model pi flag", { input: "", flag: "qwen3_4b" }],
+];
+
+for (const [way, choice] of WAYS_TO_CHOOSE_QWEN) {
+  test(`the entry for qwen3_4b applies when the model is chosen by ${way}`, async () => {
+    const settings = freshSettings({});
+    writeGlobal(settings, { models: { qwen3_4b: { numDraftTokens: 4 } }, model: { draftModel: "d" } });
+    const h = await setup({ settings, ...(choice.pick ? { select: (options: string[]) => options[3] } : {}) });
+    if (choice.flag !== undefined) h.setFlag("mlx-model", choice.flag);
+
+    await startMlx(h, choice.input);
+
+    assert.deepEqual(errors(h.notes), []);
+    assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+    assert.deepEqual(h.server.launches[0]?.extraArgs, ["--draft-model=d", "--num-draft-tokens=4"]);
+  });
+}
+
+test("an entry keyed by the full model id applies and beats the entry keyed by the preset key", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { qwen3_4b: { draftModel: "by-key", numDraftTokens: 3 }, [QWEN.modelId]: { draftModel: "by-id" } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--draft-model=by-id", "--num-draft-tokens=3"]);
+});
+
+test("a project model block beats a global entry for the same model, and the flags line names each layer", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { model: { numDraftTokens: 2 } });
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { qwen3_4b: { draftModel: "g", numDraftTokens: 3 } } });
+  const h = await setup({ settings, ctx: { cwd } });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--draft-model=g", "--num-draft-tokens=2"]);
+  assert.equal(flagsLineOf(h.notes, 0), "flags: --draft-model g (global file), --num-draft-tokens 2 (project file)");
+});
+
+test("/mlx-start with every model flag passes them in schema order, the template as text; relative paths are under the working directory", async () => {
+  const cwd = newCwd();
+  writeFileSync(join(cwd, "tpl.jinja"), "{{ messages }}\n");
+  const h = await setup({ ctx: { cwd } });
+
+  await startMlx(
+    h,
+    `qwen3_4b --chat-template-args '{"enable_thinking":false}' --use-default-chat-template --chat-template tpl.jinja --num-draft-tokens 4 --draft-model mlx-community/draft --adapter-path adapters/x`,
+  );
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, [
+    `--adapter-path=${join(cwd, "adapters", "x")}`,
+    "--draft-model=mlx-community/draft",
+    "--num-draft-tokens=4",
+    "--chat-template={{ messages }}\n",
+    "--use-default-chat-template",
+    '--chat-template-args={"enable_thinking":false}',
+  ]);
+  assert.equal(
+    flagsLineOf(h.notes, 0),
+    `flags: --adapter-path ${join(cwd, "adapters", "x")} (/mlx-start), --draft-model mlx-community/draft (/mlx-start), --num-draft-tokens 4 (/mlx-start), --chat-template ${join(cwd, "tpl.jinja")} (/mlx-start), --use-default-chat-template (/mlx-start), --chat-template-args {"enable_thinking":false} (/mlx-start)`,
+  );
+});
+
+test("a project file's relative chat template is read from the working directory, and ~ is the configured home directory", async () => {
+  const cwd = newCwd();
+  writeFileSync(join(cwd, "tpl.jinja"), "{{ project }}");
+  writeProject(cwd, { model: { chatTemplate: "tpl.jinja" } });
+  const settings = freshSettings({});
+  writeGlobal(settings, { model: { adapterPath: "~/adapters/a" } });
+  const h = await setup({ settings, ctx: { cwd } });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, [`--adapter-path=${join(settings.home, "adapters", "a")}`, "--chat-template={{ project }}"]);
+});
+
+test("a missing chat template is one invalid-configuration report before anything runs, and it comes before any trust dialog", async () => {
+  const settings = freshSettings({});
+  const missing = join(settings.home, "missing.jinja");
+  writeGlobal(settings, { server: { trustRemoteCode: true }, model: { chatTemplate: missing } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), [
+    `mlx-start failed: invalid configuration\n  model.chatTemplate (global config.json): cannot read ${missing}: cannot be read (ENOENT)`,
+  ]);
+  assert.equal(h.notes.length, 1);
+  assert.equal(h.confirms.length, 0, "the report comes before the dialog");
+  assertNothingHappened(h);
+});
+
+test("a broken template path in an entry for another model does not stop this launch", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { llama3_2_3b: { chatTemplate: join(settings.home, "missing.jinja") } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+
+  await startMlx(h, "llama3_2_3b");
+  assert.equal(errors(h.notes).length, 1, "the model that uses the broken path is refused");
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+});
+
+test("a trustRemoteCode key inside a models entry is reported as an unknown key and nothing runs", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { qwen3_4b: { trustRemoteCode: true } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), [
+    'mlx-start failed: invalid configuration\n  models["qwen3_4b"].trustRemoteCode (global config.json): unknown key (did you mean server.trustRemoteCode?)',
+  ]);
+  assert.equal(h.confirms.length, 0);
+  assertNothingHappened(h);
+});
+
+test("a bad chat-template-args text on /mlx-start is refused before anything runs", async () => {
+  const h = await setup();
+
+  await startMlx(h, "qwen3_4b --chat-template-args {bad");
+
+  assert.deepEqual(errors(h.notes), [
+    'mlx-start failed: invalid configuration\n  model.chatTemplateArgs (/mlx-start --chat-template-args): "{bad" is not valid JSON; give a JSON object',
+  ]);
+  assertNothingHappened(h);
+});
+
+test("merged chat template args across the global file, a models entry and the command line", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, {
+    model: { chatTemplateArgs: { enable_thinking: false, x: 1 } },
+    models: { qwen3_4b: { chatTemplateArgs: { x: 2, y: 3 } } },
+  });
+  const h = await setup({ settings });
+
+  await startMlx(h, `qwen3_4b --chat-template-args '{"z":4}'`);
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ['--chat-template-args={"enable_thinking":false,"x":2,"y":3,"z":4}']);
+});

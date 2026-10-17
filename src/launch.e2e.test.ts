@@ -340,3 +340,107 @@ test("without a UI a risky start is refused and spawns nothing", { timeout: 30_0
   assert.equal(h.installCalls, 0);
   assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
 });
+
+// ---- the model options and the models block (plan 02-06: SRV-02, CFG-01) ----
+
+test("every connection and model key in the global file produces exactly those flags on the spawned process", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  const template = join(dirname(h.globalConfigPath), "template.jinja");
+  h.writeConfig({
+    server: { port, allowedOrigins: ["http://a.test", "http://b.test"], logLevel: "DEBUG" },
+    model: {
+      adapterPath: "/tmp/adapters/x",
+      draftModel: "mlx-community/draft",
+      numDraftTokens: 4,
+      chatTemplate: template,
+      useDefaultChatTemplate: true,
+      chatTemplateArgs: { enable_thinking: false },
+    },
+  });
+  writeFileSync(template, "{{ messages }}\n");
+
+  await h.start();
+
+  const expected = [
+    "--model",
+    QWEN.modelId,
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+    "--allowed-origins=http://a.test,http://b.test",
+    "--log-level=DEBUG",
+    "--adapter-path=/tmp/adapters/x",
+    "--draft-model=mlx-community/draft",
+    "--num-draft-tokens=4",
+    "--chat-template={{ messages }}\n",
+    "--use-default-chat-template",
+    '--chat-template-args={"enable_thinking":false}',
+  ];
+  assert.deepEqual(h.argv(), expected);
+  const flagsLine = startNotes(h.notes)[0].message.split("\n")[1];
+  assert.ok(flagsLine.includes(`--chat-template ${template} (global file)`), flagsLine);
+  assert.ok(!flagsLine.includes("{{ messages }}"), "the template text is not shown");
+
+  await h.stop();
+  assert.equal(await connectRefused(port), true);
+
+  // A project file's model option changes only its own element.
+  h.writeProject({ model: { numDraftTokens: 2 } });
+  await h.start();
+  assert.deepEqual(h.argv(), expected.map((arg) => (arg === "--num-draft-tokens=4" ? "--num-draft-tokens=2" : arg)));
+  await h.stop();
+
+  // A typed flag beats the project file.
+  await h.start("qwen3_4b --num-draft-tokens 6");
+  assert.deepEqual(h.argv(), expected.map((arg) => (arg === "--num-draft-tokens=4" ? "--num-draft-tokens=6" : arg)));
+  assert.match(startNotes(h.notes)[2].message, /--num-draft-tokens 6 \(\/mlx-start\)/);
+
+  await h.stop();
+  assert.equal(await connectRefused(port), true, "the stub is stopped");
+});
+
+test("a models entry reaches only its own model on a real spawn", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeConfig({ model: { numDraftTokens: 3 }, models: { qwen3_4b: { draftModel: "q-draft" } } });
+
+  await h.start("qwen3_4b");
+  assert.deepEqual(h.argv().slice(-2), ["--draft-model=q-draft", "--num-draft-tokens=3"]);
+  await h.stop();
+
+  await h.start("llama3_2_3b");
+  assert.deepEqual(h.argv().slice(-1), ["--num-draft-tokens=3"]);
+  assert.ok(!h.argv().some((arg) => arg.startsWith("--draft-model")));
+  assert.deepEqual(h.argv().slice(0, 2), ["--model", MODEL_PRESETS.find((p) => p.key === "llama3_2_3b")!.modelId]);
+});
+
+test("chat template arguments typed as a JSON string merge over the file and reach the process as one element", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeConfig({ model: { chatTemplateArgs: { enable_thinking: true, keep: 1 } } });
+
+  await h.start(`qwen3_4b --chat-template-args '{"enable_thinking": false}'`);
+
+  assert.equal(h.argv().at(-1), '--chat-template-args={"enable_thinking":false,"keep":1}');
+});
+
+test("a missing chat template file spawns nothing and installs nothing", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env);
+  const missing = join(dirname(h.globalConfigPath), "missing.jinja");
+  h.writeConfig({ model: { chatTemplate: missing } });
+
+  await h.start();
+
+  const failures = h.notes.filter((n) => n.type === "error");
+  assert.equal(failures.length, 1);
+  assert.equal(
+    failures[0].message,
+    `mlx-start failed: invalid configuration\n  model.chatTemplate (global config.json): cannot read ${missing}: cannot be read (ENOENT)`,
+  );
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+  assert.equal(h.providerCalls.length, 1, "only the initial provider registration");
+});
