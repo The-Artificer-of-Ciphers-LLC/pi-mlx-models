@@ -8,7 +8,6 @@ import { ensureInstalled, type RuntimeEvent } from "./runtime.js";
 import { createMlxServer, type MlxServer } from "./server.js";
 
 const PROGRESS_WIDGET = "mlx-progress";
-const PICKER_WIDGET = "mlx-preset-picker";
 
 /** The part of pi's ExtensionAPI this extension uses; tests supply a fake. */
 export interface PiHost {
@@ -147,7 +146,6 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     activeProgress = null;
     await server.stop();
     ctx.ui.setStatus(PROVIDER_ID, "mlx: stopped");
-    ctx.ui.setWidget(PICKER_WIDGET, undefined);
   }
 
   async function startModelFromInput(pi: PiHost, ctx: any, args: string | undefined) {
@@ -247,7 +245,6 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
       progress.clear();
       ctx.ui.setStatus(PROVIDER_ID, `mlx: running (${model})`);
-      ctx.ui.setWidget(PICKER_WIDGET, undefined);
       ctx.ui.notify("MLX server is ready for prompts. Use /model and pick pi-mlx-models/...", "info");
     } catch (e) {
       // /mlx-stop or a newer /mlx-start took over; their UI state wins.
@@ -266,7 +263,6 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     pi.registerCommand("mlx-init", {
       description: "Initialize local MLX runtime (python venv + mlx-lm)",
       handler: async (_args, ctx) => {
-        ctx.ui.setWidget(PICKER_WIDGET, undefined);
         const mine = (epoch += 1);
         const isStale = () => epoch !== mine;
         const progress = newProgress(ctx, "MLX init progress", [
@@ -318,7 +314,6 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           return;
         }
 
-        ctx.ui.setWidget(PICKER_WIDGET, undefined);
         await startModelFromInput(pi, ctx, normalizedArgs);
       },
     });
