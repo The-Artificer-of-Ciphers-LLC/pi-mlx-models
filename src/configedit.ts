@@ -1,6 +1,6 @@
 import { writeFileAtomic } from "./atomicfile.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
-import { formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
+import { formatConfigErrors, prepareSettings, readLayerFile, type SettingDef } from "./settings.js";
 
 /**
  * The pure editing core of /mlx-config (CMD-02, D-17, D-20). An edit reads the global config fresh, changes one key in a
@@ -134,4 +134,46 @@ export function editConfig(path: string, change: (draft: ConfigTree) => ConfigTr
     };
   }
   return { ok: true, created: file.state === "absent", changed: true };
+}
+
+/** The places a key can be edited: the global keys, the `model` block, one `models` entry or one profile of an entry. */
+export type ConfigScope = "global" | "modelBlock" | "modelEntry" | "profile";
+
+/** One key a scope offers: its table row, the row path and the dotted name shown to the user. */
+export interface EditableKey {
+  row: SettingDef;
+  path: string;
+  label: string;
+}
+
+export function editableKeys(_scope: ConfigScope): EditableKey[] {
+  throw new Error("not implemented");
+}
+
+export function segmentsFor(_scope: ConfigScope, _row: SettingDef, _target?: { model?: string; profile?: string }): string[] {
+  throw new Error("not implemented");
+}
+
+export function convertInput(_row: SettingDef, _text: string): { ok: true; value: unknown } | { ok: false; message: string } {
+  throw new Error("not implemented");
+}
+
+export function confirmationFor(_row: SettingDef, _value: unknown): { title: string; message: string } | undefined {
+  throw new Error("not implemented");
+}
+
+export function modelKeys(_tree: ConfigTree): string[] {
+  throw new Error("not implemented");
+}
+
+export function profileNames(_tree: ConfigTree, _model: string): string[] {
+  throw new Error("not implemented");
+}
+
+export function validateModelKey(_text: string): { ok: true; value: string } | { ok: false; message: string } {
+  throw new Error("not implemented");
+}
+
+export function validateProfileName(_text: string): { ok: true; value: string } | { ok: false; message: string } {
+  throw new Error("not implemented");
 }
