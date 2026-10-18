@@ -2956,13 +2956,58 @@ test("after a start whose server.start rejects the hook leaves every request unt
   assert.equal(await hook({ payload: hookPayload() }, hookCtx()), undefined);
 });
 
-test("a payload for another model id is left alone and shows no notice", async () => {
-  const { hook, hookNotes, hookCtx } = await hookSetup();
+test("a payload for another model id is left alone", async () => {
+  const { hook, hookCtx } = await hookSetup();
 
   const result = await hook({ payload: hookPayload({ model: "some/other-model" }) }, hookCtx());
 
   assert.equal(result, undefined);
+});
+
+test("a request for this provider whose model id is not the launched one shows one warning naming the launched id (WR-02)", async () => {
+  const { hook, hookNotes, hookCtx } = await hookSetup();
+  const payload = hookPayload({ model: "SECRET-MARKER-mismatch" });
+
+  assert.equal(await hook({ payload }, hookCtx()), undefined);
+  assert.equal(await hook({ payload: hookPayload({ model: "another/one" }) }, hookCtx()), undefined);
+
+  assert.equal(hookNotes.length, 1, "once per session, however many follow");
+  assert.equal(hookNotes[0].type, "warning");
+  const text = hookNotes[0].message;
+  assert.ok(text.startsWith("pi-mlx-models:"), text);
+  assert.ok(text.includes(QWEN.modelId), `names the launched id: ${text}`);
+  assert.ok(!text.includes("SECRET-MARKER-mismatch") && !text.includes("another/one"), `no payload text: ${text}`);
+  assert.equal(payload.model, "SECRET-MARKER-mismatch", "pi's object is not touched");
+});
+
+test("a model id mismatch is not reported for another provider, a matching request or a request with no model id (WR-02)", async () => {
+  const { hook, hookNotes, hookCtx } = await hookSetup();
+
+  await hook({ payload: hookPayload({ model: "some/other-model" }) }, hookCtx({ model: { provider: "openai", id: "x" } }));
+  await hook({ payload: hookPayload() }, hookCtx());
+  await hook({ payload: { messages: [] } }, hookCtx());
+  await hook({ payload: hookPayload({ model: 42 }) }, hookCtx());
+
   assert.deepEqual(hookNotes, []);
+});
+
+test("the mismatch warning cleans and clips a long launched model id and is still bounded (WR-02)", async () => {
+  const longId = `org/${"m".repeat(300)}\u001b[31mred`;
+  const { h, hook, hookNotes, hookCtx } = await hookSetup({}, {});
+  await startMlx(h, longId);
+  const result = await hook({ payload: hookPayload({ model: "some/other-model" }) }, hookCtx());
+
+  assert.equal(result, undefined);
+  assert.equal(hookNotes.length, 1);
+  const text = hookNotes[0].message;
+  assert.ok(text.length <= 300, `${text.length} characters`);
+  assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(text), "no control characters");
+});
+
+test("a mismatch with a ctx that has no ui does not throw (WR-02)", async () => {
+  const { hook, hookCtx } = await hookSetup();
+
+  assert.equal(await hook({ payload: hookPayload({ model: "some/other-model" }) }, { model: hookCtx().model }), undefined);
 });
 
 const throwing = (): never => {
