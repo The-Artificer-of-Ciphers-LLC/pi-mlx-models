@@ -107,13 +107,37 @@ export const CARRY_MAX_LINES = 6;
 export const CARRY_MAX_CHARS = 500;
 
 /**
- * A notice as the title of the next menu carries it: the first lines, cut to a length, with "..." when anything was left
- * out. The message was built from `shown(...)` parts, so it is already cleaned and has credentials hidden; it is not
- * redacted again, because redaction works by position over a whole text. clipDiagnostic still replaces control characters.
+ * Defense in depth for the carried copy: in every whitespace-separated token that holds "://", the text between "://" and
+ * the token's last at sign becomes "***", so "https://u:p@host/x" is carried as "https://***@host/x". Every other token and
+ * every separator is returned as it is, so the status word of a notice and text such as @scope/pkg, model@rev or a@b.com
+ * (no "://" in the token) are kept. `redactCredentials` is not used because it works by position and cuts a line at its last
+ * at sign, which would drop the status word, and the userinfo pattern inside it is private to src/diagnostic.ts and stops at
+ * a slash, so it would leak a password that holds one. The cost is one indexOf and one lastIndexOf per token (linear).
+ * Limits: a password that holds whitespace is not covered here (the primary layers, `shown` and the settings messages, still
+ * hide it), and a URL whose own path holds an at sign has the text between "://" and that last sign hidden, which errs toward
+ * hiding.
+ */
+function maskCredentialSpans(line: string): string {
+  return line
+    .split(/(\s+)/)
+    .map((token) => {
+      const scheme = token.indexOf("://");
+      if (scheme < 0) return token;
+      const at = token.lastIndexOf("@");
+      return at > scheme + 2 ? `${token.slice(0, scheme + 3)}***${token.slice(at)}` : token;
+    })
+    .join("");
+}
+
+/**
+ * A notice as the title of the next menu carries it: the first lines, each with the credential span of a URL masked, cut to
+ * a length, with "..." when anything was left out. The notice itself (ctx.ui.notify) is not changed. The message was built
+ * from `shown(...)` parts, but its other parts (settings messages, a write reason, a path) are composed elsewhere, so the
+ * copy does not rely on that. clipDiagnostic still replaces control characters.
  */
 export function carriedCopy(message: string): string {
   const lines = message.split("\n");
-  const kept = lines.slice(0, CARRY_MAX_LINES).join("\n");
+  const kept = lines.slice(0, CARRY_MAX_LINES).map(maskCredentialSpans).join("\n");
   const clipped = clipDiagnostic(kept, CARRY_MAX_CHARS, "start");
   const cut = lines.length > CARRY_MAX_LINES || kept.trim().length > CARRY_MAX_CHARS;
   return cut ? `${clipped}...` : clipped;
