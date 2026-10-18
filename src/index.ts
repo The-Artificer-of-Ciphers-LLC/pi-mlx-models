@@ -68,6 +68,15 @@ const failed = (command: LaunchCommand, text: string): string => `${command} fai
 /** The text of a launch of `command` the user declined. The only place a command name is joined to a cancel message. */
 const cancelled = (command: LaunchCommand, text: string): string => `${command} cancelled: ${text}`;
 
+/** What one launch needs to know about the command that asked for it. */
+interface LaunchRun {
+  command: LaunchCommand;
+  /** The profile selection handed to `buildLaunch`; absent means the model's own default applies. */
+  profile?: string;
+  /** Whether `profile` was typed in this command or kept from an earlier launch. Not read until a later plan. */
+  profileOrigin?: "typed" | "kept";
+}
+
 /**
  * Shown once per session when a request for this provider's launched model has a payload the rewrite cannot read (D-11).
  * A constant on purpose: no part of the payload is ever added to it (T-04-11).
@@ -470,13 +479,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
    * start without a word. The start epoch is not touched here, so a refused or declined start cannot cancel one that
    * is already running (T-02-18).
    */
-  async function confirmTrustRisks(ctx: any, prepared: Prepared): Promise<boolean> {
+  async function confirmTrustRisks(ctx: any, prepared: Prepared, command: LaunchCommand): Promise<boolean> {
     const risks = trustRisks(prepared);
     if (risks.length === 0) return true;
     const phrases = joinPhrases(risks.map((risk) => risk.phrase));
     if (!ctx.hasUI) {
       ctx.ui.notify(
-        `mlx-start failed: ${phrases} ${risks.length > 1 ? "need" : "needs"} interactive confirmation; run /mlx-start in an interactive pi session`,
+        failed(command, `${phrases} ${risks.length > 1 ? "need" : "needs"} interactive confirmation; run /${command} in an interactive pi session`),
         "error",
       );
       return false;
@@ -491,18 +500,18 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       }
       if (startEpoch !== seen) return false;
       if (!confirmed) {
-        ctx.ui.notify(`mlx-start cancelled: ${risk.phrase} was not confirmed.`, "info");
+        ctx.ui.notify(cancelled(command, `${risk.phrase} was not confirmed.`), "info");
         return false;
       }
     }
     return true;
   }
 
-  async function startModelFromInput(pi: PiHost, ctx: any, args: string | undefined, prepared: Prepared, profile?: string) {
-    const selected = resolveModel(args, prepared.defaultModel);
+  async function startModelFromInput(pi: PiHost, ctx: any, input: string | undefined, prepared: Prepared, run: LaunchRun) {
+    const selected = resolveModel(input, prepared.defaultModel);
     // Bad input is reported before anything runs: no provider refresh, no install, no spawn.
     if (selected.error !== undefined) {
-      ctx.ui.notify(`mlx-start failed: ${selected.error}`, "error");
+      ctx.ui.notify(failed(run.command, selected.error), "error");
       return;
     }
     // The model's own options (the `model` block and its `models` entries) are settled here; `~` and relative paths
@@ -511,18 +520,18 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       prepared,
       { modelId: selected.modelId, ...(selected.preset ? { presetKey: selected.preset.key } : {}) },
       { home: deps.settings.home, cwd: workingDirectory(ctx) },
-      profile === undefined ? {} : { profile },
+      run.profile === undefined ? {} : { profile: run.profile },
     );
     if (!built.ok) {
-      ctx.ui.notify(`mlx-start failed: ${formatConfigErrors(built.errors)}`, "error");
+      ctx.ui.notify(failed(run.command, formatConfigErrors(built.errors)), "error");
       return;
     }
-    if (!(await confirmTrustRisks(ctx, prepared))) return;
+    if (!(await confirmTrustRisks(ctx, prepared, run.command))) return;
     const mine = (startEpoch += 1);
     initEpoch += 1;
     startInFlight = mine;
     try {
-      await runStart(pi, ctx, built.launch, prepared.install, mine, prepared.listAllModels);
+      await runStart(pi, ctx, built.launch, prepared.install, mine, prepared.listAllModels, run);
     } finally {
       if (startInFlight === mine) startInFlight = null;
     }
@@ -557,6 +566,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     installSettings: InstallSettings,
     mine: number,
     listAll: boolean,
+    run: LaunchRun,
   ) {
     const isStale = () => startEpoch !== mine;
     // Read before the first await: a model picked in pi from here on stops the switch at the end.
@@ -744,7 +754,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       // stop() only halts the animation; replace the last frame it drew so it cannot linger.
       ctx.ui.setStatus(PROVIDER_ID, "mlx: failed");
       progress.fail(step, errorMessage(e));
-      ctx.ui.notify(`mlx-start failed: ${errorMessage(e)}`, "error");
+      ctx.ui.notify(failed(run.command, errorMessage(e)), "error");
     }
   }
 
@@ -844,6 +854,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         if (settings === undefined) return;
         const { prepared, profile, modelFlag } = settings;
 
+        const run: LaunchRun = { command: "mlx-start", ...(profile === undefined ? {} : { profile, profileOrigin: "typed" }) };
+
         // A model typed on the command line beats --mlx-model; with neither, the picker opens even when a default
         // model is configured (the default only fills in for a start that names no model at all).
         const typedModel = (parsed.model ?? "").trim();
@@ -855,11 +867,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             ctx.ui.notify("Preset selection cancelled.", "info");
             return;
           }
-          await startModelFromInput(pi, ctx, preset.key, prepared, profile);
+          await startModelFromInput(pi, ctx, preset.key, prepared, run);
           return;
         }
 
-        await startModelFromInput(pi, ctx, modelInput, prepared, profile);
+        await startModelFromInput(pi, ctx, modelInput, prepared, run);
       },
     });
 
