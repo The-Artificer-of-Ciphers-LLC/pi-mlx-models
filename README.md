@@ -34,7 +34,7 @@ Local MLX model launcher for [pi](https://pi.dev) on Apple Silicon.
 ## Requirements
 
 - macOS on Apple Silicon
-- Python 3.11 or newer
+- Python 3.11 or newer (to use another interpreter, see [How to use a different Python](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/configure-the-server.md#use-a-different-python))
 
 ## Install
 
@@ -84,7 +84,7 @@ Details, arguments and the preset list are in the [commands reference](https://g
 
 ## The default port
 
-The server listens on `127.0.0.1:8080` by default, not on 11434. Set `PI_MLX_MODELS_PORT` (or `server.port` in a config file) to change it.
+The server listens on `127.0.0.1:8080` by default, not on 11434. Set `PI_MLX_MODELS_PORT` (or `server.port` in a config file) to change it. The host, base URL and default model can be set the same way: see [How to set a connection value from the environment](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/configure-the-server.md#set-a-connection-value-from-the-environment).
 
 ## Configure it
 
@@ -93,6 +93,8 @@ Create `~/.pi/agent/pi-mlx-models/config.json` to set a port, allowed origins or
 ```json
 { "server": { "port": 8090, "logLevel": "INFO" } }
 ```
+
+Every setting is in the [configuration reference](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/configuration.md), with an [example file](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/configuration.md#file-layout); the [precedence order](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/configuration.md#sources-from-highest-precedence-to-lowest) says which source wins when two of them set the same value.
 
 ## Security
 

@@ -56,6 +56,7 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 - **Model ids with an `@`.** A model id or path such as `org/model@rev` or `/Users/a@b/models/x` is shown as it is in the ready message, the model mismatch notice and `/mlx-status`. Credentials in an id written as a URL are still hidden.
 - **`/mlx-status` during a restart.** When `/mlx-restart` or `/mlx-last` replaces the launch while the status is probing, the status describes the new launch instead of calling the old address a server this session did not start.
 - **Auto-start precheck.** The check that mlx-lm can be imported is stopped after 60 seconds, so a wedged import no longer leaves auto-start pending for good. The stop also ends anything the check started, and a check that timed out is reported as a timeout rather than as a runtime that is not installed.
+- **Package page links.** The README on npm and pi.dev now links to the documentation and shows its screenshots through absolute GitHub URLs. Its relative links resolved against the published package, which has no docs or assets folder, and returned 404 there.
 
 ## 0.2.3 - 2026-10-17
 
