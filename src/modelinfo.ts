@@ -5,6 +5,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { HF_HOME } from "./config.js";
+import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 
 /** The context window registered for a model whose `config.json` cannot be read or holds no usable value (D-03). */
 export const FALLBACK_CONTEXT_WINDOW = 32768;
@@ -250,6 +251,18 @@ export function deriveModelInfo(input: { id: string; config?: ModelConfigRead })
   return info;
 }
 
-export function describeModel(_info: ModelInfo): string {
-  return "";
+/** A source text as shown: single-line and free of control characters, with credentials hidden, clipped to 80 characters. */
+const shownSource = (text: string): string => clipDiagnostic(redactCredentials(cleanLabel(text)), 80, "start");
+
+/**
+ * The one line that tells the user what pi was told about the model and where each value came from (D-03, D-07). The
+ * numbers and flags are ours; the source texts are cleaned, then redacted, then clipped, in that order.
+ */
+export function describeModel(info: ModelInfo): string {
+  return (
+    `model: context ${info.contextWindow} (${shownSource(info.contextSource)}), ` +
+    `max output ${info.maxTokens} (${shownSource(info.maxTokensSource)}), ` +
+    `reasoning ${info.reasoning ? "yes" : "no"} (${shownSource(info.reasoningSource)}), ` +
+    `input ${info.input.join(" and ")} (${shownSource(info.inputSource)})`
+  );
 }
