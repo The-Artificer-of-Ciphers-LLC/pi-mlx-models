@@ -1,6 +1,6 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
+import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
 import type { CliFlagSpec } from "./startargs.js";
@@ -113,10 +113,20 @@ export interface SettingDef {
   env?: string;
   /** An empty-but-defined environment variable is an invalid value, not an unset one. */
   blankEnvInvalid?: boolean;
+  /** An invalid environment value refuses the command instead of being ignored: the next layer down is not what was asked for. */
+  failClosedEnv?: boolean;
   /** The flag spelling `/mlx-start` accepts for this row, for example `--port`; a row without one cannot be set there. */
   cli?: string;
+  /**
+   * The flag spelling `/mlx-init` accepts for this row, for example `--mlx-lm-version`. Kept separate from `cli` on
+   * purpose: `cliFlagSpecs()` derives the `/mlx-start` flags from `cli`, and the install settings must not become
+   * `/mlx-start` flags.
+   */
+  initCli?: string;
   /** The pi flag that sets this row, without its dashes, for example `mlx-port`. */
   piFlag?: string;
+  /** The project file never supplies this row's value; a valid project value is a project violation instead (D-01). */
+  userLevelOnly?: boolean;
   /** The mlx_lm.server flag this row becomes. */
   mlxFlag?: string;
   /** The `/mlx-start` flag takes no value: writing it turns the setting on. */
@@ -213,9 +223,80 @@ function checkOneLineText(value: unknown): CheckResult {
   return trimmed && trimmed.length <= MAX_TEXT_LENGTH && !CONTROL_CHARACTER.test(trimmed) ? ok(trimmed) : bad;
 }
 
-function checkDraftTokens(value: unknown): CheckResult {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? ok(value) : bad;
+/** A JSON number that is a safe integer of at least `min`: no text, no fraction, no coercion (D-07, D-17). */
+const checkIntegerAtLeast =
+  (min: number) =>
+  (value: unknown): CheckResult =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= min ? ok(value) : bad;
+
+/** Text that is digits only (after trimming), then the same check as a value read from a file. */
+const parseDigits =
+  (check: (value: unknown) => CheckResult) =>
+  (raw: string): CheckResult => {
+    const trimmed = raw.trim();
+    return /^\d+$/.test(trimmed) ? check(Number(trimmed)) : bad;
+  };
+
+/** A JSON number that is a safe integer from `min` to `max` inclusive: no text, no fraction, no coercion (D-11). */
+const checkIntegerRange =
+  (min: number, max: number) =>
+  (value: unknown): CheckResult =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max ? ok(value) : bad;
+
+/**
+ * An exact version as pip knows it, release part first: two to four numbers, then optional pre, post and dev parts.
+ * No epoch, no local part, no operator, no wildcard. Only text that matches this is ever placed after `mlx-lm==`.
+ */
+const PIN_TEXT = /^[0-9]+(\.[0-9]+){1,3}((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$/;
+
+/** The longest pin that is looked at; real versions are far shorter. */
+const MAX_PIN_LENGTH = 32;
+
+/**
+ * The mlx-lm version policy: the word "latest" or an exact version, nothing else (D-06). Not trimmed, not
+ * case-folded and never a pip specifier, so the value can only ever form the argv element `mlx-lm==VALUE` (T-03-08).
+ */
+function checkPin(value: unknown): CheckResult {
+  if (typeof value !== "string" || value.length > MAX_PIN_LENGTH) return bad;
+  return value === "latest" || PIN_TEXT.test(value) ? ok(value) : bad;
 }
+
+/** The longest package index URL that is looked at; real ones are far shorter. */
+const MAX_PIP_INDEX_LENGTH = 4096;
+/** Whitespace and control characters anywhere in the raw text: `new URL` would silently trim or encode them. */
+const PIP_INDEX_FORBIDDEN = /[\s\u0000-\u001f\u007f-\u009f]/;
+/** The canonical start of an index URL: the scheme and both slashes, exactly as pip's own parser reads them (WR-02). */
+const PIP_INDEX_START = /^https?:\/\//i;
+/** The authority part of a URL as written: between `scheme://` and the next `/`, `?` or `#`. */
+const URL_AUTHORITY = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/;
+
+/**
+ * The package index pip installs from: an https URL, or plain http only for a loopback host, with no whitespace,
+ * no control character and no credentials (use pip's netrc or keyring). The value is kept as written, because pip
+ * takes it as written, and can only ever form the tail of the single argv element `--index-url=VALUE` (T-03-14,
+ * T-03-15, T-03-17). The loopback decision uses the parsed host name, never a string prefix.
+ */
+function checkPipIndex(value: unknown): CheckResult {
+  if (typeof value !== "string" || value.length < 1 || value.length > MAX_PIP_INDEX_LENGTH) return bad;
+  if (PIP_INDEX_FORBIDDEN.test(value)) return bad;
+  // WHATWG and Python's urlsplit read a backslash, a missing slash and an escaped host differently; only the canonical
+  // spelling is accepted, so the host that is checked is the host pip connects to.
+  if (!PIP_INDEX_START.test(value) || value.includes("\\") || (URL_AUTHORITY.exec(value)?.[1] ?? "").includes("%")) return bad;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return bad;
+  }
+  if (url.hostname === "") return bad;
+  // An '@' anywhere in the authority is credentials, or a look-alike such as https://pypi.org@evil.example/.
+  if (url.username !== "" || url.password !== "" || (URL_AUTHORITY.exec(value)?.[1] ?? "").includes("@")) return bad;
+  if (url.protocol === "https:") return ok(value);
+  return url.protocol === "http:" && isLoopbackHost(url.hostname) ? ok(value) : bad;
+}
+
+const checkDraftTokens = checkIntegerAtLeast(1);
+const checkKvBits = checkIntegerRange(2, 8);
 
 /** The most the extension will place in one argv element for the template (T-02-21). */
 const MAX_TEMPLATE_BYTES = 64 * 1024;
@@ -300,9 +381,41 @@ const PHRASES = {
   jsonText: (shown: string) => `${shown} is not valid JSON; give a JSON object`,
   forbiddenKey: (key: string) => (shown: string) => `${shown} contains the key ${showKey(key)}, which is not allowed`,
   argsTooLarge: (shown: string) => `${shown} is larger than 16 KiB`,
+  pin: (shown: string) => `${shown} must be "latest" or an exact version such as 0.32.2`,
+  pipIndex: (shown: string) => `${shown} must be an https URL without credentials or spaces (http only for a loopback host)`,
   tooDeep: (shown: string) => `${shown} is nested too deeply`,
   notJson: (shown: string) => `${shown} contains a value that is not JSON`,
 };
+
+interface IntegerFlagOptions {
+  /** The smallest allowed value; the default is 1. */
+  min?: number;
+  /** The allowed values in words; the default is "an integer of at least {min}". */
+  expected?: string;
+  /** The problem line; the default is `PHRASES.integerAtLeast(min)`. */
+  problem?: (shown: string) => string;
+}
+
+/**
+ * One `server.{key}` row that is a plain integer passed through as `--flag=N`. The row carries no default, no
+ * environment variable and no pi flag (D-04), so a value equal to the server's own default is still emitted and
+ * shown (D-17), and it is the same on the file layers and on `/mlx-start` (D-14). The checks are sanity bounds only.
+ */
+function integerFlagRow(key: string, flag: string, options: IntegerFlagOptions = {}): SettingDef {
+  const min = options.min ?? 1;
+  const check = checkIntegerAtLeast(min);
+  return {
+    path: `server.${key}`,
+    kind: "integer",
+    expected: options.expected ?? `an integer of at least ${min}`,
+    check,
+    problem: options.problem ?? PHRASES.integerAtLeast(min),
+    parseText: parseDigits(check),
+    cli: flag,
+    mlxFlag: flag,
+    emit: valued(flag),
+  };
+}
 
 /** The schema, in the order flags are listed in the start message. */
 export const SETTINGS: readonly SettingDef[] = [
@@ -378,6 +491,34 @@ export const SETTINGS: readonly SettingDef[] = [
     emit: (value) => (value === true ? ["--trust-remote-code"] : []),
     default: false,
   },
+  integerFlagRow("decodeConcurrency", "--decode-concurrency"),
+  integerFlagRow("promptConcurrency", "--prompt-concurrency"),
+  integerFlagRow("prefillStepSize", "--prefill-step-size"),
+  integerFlagRow("promptCacheSize", "--prompt-cache-size"),
+  // A plain integer of bytes, as the flag takes it; size strings such as "8GB" stay deferred (D-16).
+  integerFlagRow("promptCacheBytes", "--prompt-cache-bytes", {
+    expected: "an integer number of bytes, at least 1 (for example 8589934592 for 8 GiB)",
+    problem: (shown) => `${shown} is not an integer number of bytes of at least 1, for example 8589934592 for 8 GiB`,
+  }),
+  {
+    // KV cache quantization. The range is the one locked in D-11; MLX itself rejects 7, and mlx-lm's own error
+    // comes through if a value it cannot do is passed. Server-wide, not per model (D-13).
+    path: "server.kvBits",
+    kind: "integer",
+    expected: "an integer from 2 to 8 (MLX itself does not support 7)",
+    check: checkKvBits,
+    problem: PHRASES.integerRange(2, 8),
+    parseText: parseDigits(checkKvBits),
+    cli: "--kv-bits",
+    mlxFlag: "--kv-bits",
+    emit: valued("--kv-bits"),
+  },
+  // The bounds below are sanity bounds only (D-17); the limits MLX enforces are in the wording.
+  integerFlagRow("kvGroupSize", "--kv-group-size", { expected: "an integer of at least 1 (MLX supports 32, 64 and 128)" }),
+  integerFlagRow("quantizedKvStart", "--quantized-kv-start", {
+    min: 0,
+    expected: "an integer of at least 0 (quantization starts after this many tokens)",
+  }),
   {
     path: "model.adapterPath",
     kind: "path",
@@ -409,10 +550,7 @@ export const SETTINGS: readonly SettingDef[] = [
     expected: "an integer of at least 1",
     check: checkDraftTokens,
     problem: PHRASES.integerAtLeast(1),
-    parseText: (raw) => {
-      const trimmed = raw.trim();
-      return /^\d+$/.test(trimmed) ? checkDraftTokens(Number(trimmed)) : bad;
-    },
+    parseText: parseDigits(checkDraftTokens),
     cli: "--num-draft-tokens",
     mlxFlag: "--num-draft-tokens",
     emit: valued("--num-draft-tokens"),
@@ -478,6 +616,34 @@ export const SETTINGS: readonly SettingDef[] = [
     env: "PI_MLX_MODELS_DEFAULT_MODEL",
     emit: () => [],
   },
+  {
+    // Which mlx-lm /mlx-init installs. A project file may set it: a pin only chooses among the versions of the index
+    // the user configured (D-03). It is not a server flag, so it never reaches argv or the flags line.
+    path: "mlxLm.version",
+    kind: "string",
+    expected: 'the word "latest" or an exact version such as 0.32.2',
+    check: checkPin,
+    problem: PHRASES.pin,
+    parseText: (raw) => checkPin(raw.trim()),
+    env: "PI_MLX_MODELS_MLX_LM_VERSION",
+    initCli: "--mlx-lm-version",
+    emit: () => [],
+  },
+  {
+    // Where /mlx-init installs from. Whoever chooses the index chooses which code gets installed, so a project file may
+    // never set it (D-01): the project layer is skipped for this row and a project value is a project violation.
+    path: "mlxLm.pipIndex",
+    kind: "string",
+    userLevelOnly: true,
+    failClosedEnv: true,
+    expected: "an https URL without credentials (http only for a loopback host)",
+    check: checkPipIndex,
+    problem: PHRASES.pipIndex,
+    parseText: (raw) => checkPipIndex(raw.trim()),
+    env: "PI_MLX_MODELS_PIP_INDEX",
+    initCli: "--pip-index",
+    emit: () => [],
+  },
 ];
 
 /** A pi flag: its name without dashes, what it does, and the setting it sets (none for `mlx-model`). */
@@ -501,6 +667,11 @@ export const PI_FLAGS: readonly PiFlagDef[] = [
 /** The flags `/mlx-start` accepts, derived from the rows that declare one; all take a value except the bare ones. */
 export function cliFlagSpecs(): CliFlagSpec[] {
   return SETTINGS.flatMap((row) => (row.cli === undefined ? [] : [{ flag: row.cli, path: row.path, takesValue: row.bare !== true }]));
+}
+
+/** The flags `/mlx-init` accepts, derived from the rows that declare an `initCli`; all of them take a value. */
+export function initFlagSpecs(): CliFlagSpec[] {
+  return SETTINGS.flatMap((row) => (row.initCli === undefined ? [] : [{ flag: row.initCli, path: row.path, takesValue: true }]));
 }
 
 const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
@@ -610,8 +781,11 @@ function unknownKeyHint(key: string, block: string | undefined, container: strin
 
 const FILE_LABEL = { global:"global config.json", project: "project .pi/pi-mlx-models.json" } as const;
 
+/** The user and password of a URL, replaced by `***` wherever the text is shown: a refused index is often one with a pasted secret (WR-01). */
+const redactCredentials = (text: string): string => text.replace(/([/\\]{2})[^\s/\\?#"]*@/g, "$1***@");
+
 /** Text that came from a file, the environment or a flag, made safe and bounded before it is shown (D-24). */
-const show = (text: string): string => clipDiagnostic(cleanLabel(text), 60, "start");
+const show = (text: string): string => clipDiagnostic(redactCredentials(cleanLabel(text)), 60, "start");
 const showValue = (value: unknown): string => {
   try {
     return show(JSON.stringify(value) ?? String(value));
@@ -621,6 +795,9 @@ const showValue = (value: unknown): string => {
   }
 };
 
+/** The command a typed flag of this row belongs to: `/mlx-init` for an install setting, else `/mlx-start`. */
+const commandOf = (row: SettingDef): string => (row.initCli === undefined ? "/mlx-start" : "/mlx-init");
+
 /** The layer name as it appears in the flags line. */
 function displayLabel(layer: LayerName, row: SettingDef): string {
   switch (layer) {
@@ -629,7 +806,7 @@ function displayLabel(layer: LayerName, row: SettingDef): string {
     case "project":
       return "project file";
     case "args":
-      return "/mlx-start";
+      return commandOf(row);
     case "piFlags":
       return `pi flag --${row.piFlag}`;
     case "env":
@@ -639,7 +816,7 @@ function displayLabel(layer: LayerName, row: SettingDef): string {
 
 /** The layer as a problem line labels it. A command-line or pi flag label already names the flag. */
 function problemLabel(layer: "args" | "piFlags", row: SettingDef): string {
-  return layer === "args" ? `/mlx-start ${row.cli}` : displayLabel(layer, row);
+  return layer === "args" ? `${commandOf(row)} ${row.initCli ?? row.cli}` : displayLabel(layer, row);
 }
 
 /** What names the value in a base URL warning. */
@@ -649,7 +826,7 @@ function sourceName(layer: LayerName, row: SettingDef): string {
     case "project":
       return `${row.path} in ${FILE_LABEL[layer]}`;
     case "args":
-      return String(row.cli);
+      return String(row.cli ?? row.initCli);
     case "piFlags":
       return `--${row.piFlag}`;
     case "env":
@@ -686,6 +863,17 @@ export interface Prepared {
   projectViolations: ProjectViolation[];
   /** The validated model options of every layer, held until a model is chosen: `buildLaunch` is their second stage. */
   modelSettings: ModelSettings;
+  /** What /mlx-init installs: the version policy and the package index, with the layer each came from (D-04, D-07). */
+  install: InstallSettings;
+}
+
+/** The install policy of one resolved configuration. A source is a layer label, and absent when the value is the default. */
+export interface InstallSettings {
+  /** "latest" or an exact version. */
+  version: string;
+  pipIndex: string;
+  versionSource?: string;
+  pipIndexSource?: string;
 }
 
 /** One file's model options: the `model` block, and each `models` entry by its key or model id. */
@@ -707,6 +895,8 @@ export interface ProjectViolation {
   /** The offending value, cleaned and clipped; empty for a boolean. */
   shown: string;
   reason: string;
+  /** Chooses where mlx-lm is installed from rather than what runs or listens; the refusal then words its header for it. */
+  installOnly?: true;
 }
 
 export type PrepareResult =
@@ -821,6 +1011,11 @@ function projectViolationsOf(project: ReadonlyMap<string, SettingValue>): Projec
   if (typeof origins === "string") {
     violations.push({ path: "server.allowedOrigins", shown: showValue(origins), reason: "lets web pages call the local server" });
   }
+  // Whoever chooses the package index chooses which code /mlx-init installs (D-01). mlxLm.version is not listed (D-03).
+  const pipIndex = project.get("mlxLm.pipIndex");
+  if (typeof pipIndex === "string") {
+    violations.push({ path: "mlxLm.pipIndex", shown: show(pipIndex), reason: "chooses where mlx-lm is installed from", installOnly: true });
+  }
   return violations;
 }
 
@@ -845,6 +1040,7 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
     switch (layer) {
       case "global":
       case "project":
+        if (layer === "project" && row.userLevelOnly === true) return undefined;
         return fileValues[layer].get(row.path);
       case "env": {
         if (row.env === undefined) return undefined;
@@ -853,14 +1049,15 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
         if (!row.blankEnvInvalid && envText(raw) === undefined) return undefined;
         const result = row.parseText(raw);
         if (result.ok) return result.value;
-        warnings.push(`${row.env}=${showValue(raw)} is not ${row.expected}; ignoring it.`);
+        if (row.failClosedEnv === true) problems.env.push(`${row.env}=${showValue(raw)} is not ${row.expected}`);
+        else warnings.push(`${row.env}=${showValue(raw)} is not ${row.expected}; ignoring it.`);
         return undefined;
       }
       case "args":
       case "piFlags": {
         // Only a row that declares a flag for this layer can be set by it; anything else is never looked at.
         let raw: string | true | undefined;
-        if (layer === "args") raw = row.cli === undefined ? undefined : input.args?.[row.path];
+        if (layer === "args") raw = row.cli === undefined && row.initCli === undefined ? undefined : input.args?.[row.path];
         else raw = row.piFlag === undefined ? undefined : input.piFlags?.[row.piFlag];
         // A pi flag that was given no text is the same as one that was not given.
         if (raw === undefined || (raw !== true && layer === "piFlags" && raw.trim() === "")) return undefined;
@@ -950,6 +1147,12 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
       flags,
       sources,
       projectViolations: projectViolationsOf(fileValues.project),
+      install: {
+        version: String(value("mlxLm.version") ?? "latest"),
+        pipIndex: String(value("mlxLm.pipIndex") ?? DEFAULT_PIP_INDEX),
+        ...(sources.has("mlxLm.version") ? { versionSource: sources.get("mlxLm.version")!.label } : {}),
+        ...(sources.has("mlxLm.pipIndex") ? { pipIndexSource: sources.get("mlxLm.pipIndex")!.label } : {}),
+      },
       modelSettings: {
         layers: (["global", "project"] as const).map((layer) => ({
           layer,
@@ -1137,6 +1340,57 @@ export function describeFlags(launch: ResolvedLaunch, skipped?: ReadonlySet<stri
   return `flags: ${parts.join(", ")}`;
 }
 
+/** What a launch with KV cache quantization has to tell the user (D-09, D-10, D-12). */
+export interface KvNotices {
+  /** Shown at level warning on every launch that quantizes. */
+  warning?: string;
+  /** Shown at level info when a KV key is set without kvBits. */
+  info?: string;
+}
+
+/** `--flag value`, `--flag value and --flag value`: the flags of a notice with their cleaned values. */
+const flagList = (flags: readonly LaunchFlag[]): string => flags.map((flag) => `${flag.flag} ${flag.display}`).join(" and ");
+
+/**
+ * "{list} has no effect {tail}", or "have" for two. The values are the `display` of validated safe integers; no
+ * argv element is parsed again.
+ */
+const noEffect = (flags: readonly LaunchFlag[], tail: string): string =>
+  `${flagList(flags)} ${flags.length === 1 ? "has" : "have"} no effect ${tail}`;
+
+/** The flags of `paths` that the launch sets and the install can do, in launch (schema) order. */
+const setFlags = (launch: ResolvedLaunch, skipped: ReadonlySet<string> | undefined, paths: readonly string[]): LaunchFlag[] =>
+  launch.flags.filter((flag) => paths.includes(flag.path) && !skipped?.has(flag.flag));
+
+/**
+ * The words after the batching sentence when a concurrency setting above 1 is also set. Nothing is dropped from the
+ * launch (D-10); the user is only told those settings do nothing while kvBits is set.
+ */
+function concurrencyClause(launch: ResolvedLaunch, skipped: ReadonlySet<string> | undefined): string {
+  const above = setFlags(launch, skipped, ["server.decodeConcurrency", "server.promptConcurrency"]).filter(
+    (flag) => /^\d+$/.test(flag.display) && Number(flag.display) > 1,
+  );
+  return above.length === 0 ? "" : noEffect(above, "while --kv-bits is set.");
+}
+
+/**
+ * The notices for the KV cache settings of a resolved launch. A flag the install does not list (`skipped`) does not
+ * count as set: the skip notice already covers it (D-09). The text is schema-derived plus the cleaned `display` and
+ * `label` of validated flags (T-03-04), and no state is kept, so every launch gets its own notices.
+ */
+export function kvNotices(launch: ResolvedLaunch, skipped?: ReadonlySet<string>): KvNotices {
+  const bits = launch.flags.find((flag) => flag.path === "server.kvBits");
+  if (bits !== undefined) {
+    if (skipped?.has(bits.flag)) return {};
+    const clause = concurrencyClause(launch, skipped);
+    return {
+      warning: `KV quantization (${bits.flag} ${bits.display}, ${bits.label}): Disables batching, so requests are served one at a time.${clause ? ` ${clause}` : ""}`,
+    };
+  }
+  const idle = setFlags(launch, skipped, ["server.kvGroupSize", "server.quantizedKvStart"]);
+  return idle.length === 0 ? {} : { info: noEffect(idle, "without --kv-bits.") };
+}
+
 /** The most problem lines one refusal shows; the rest are counted. */
 const MAX_REPORT_LINES = 20;
 
@@ -1159,6 +1413,46 @@ export interface TrustRisk {
 
 /** Text for a confirmation dialog: cleaned, and long enough that clipping cannot hide where a URL really points. */
 const showInDialog = (text: string): string => clipDiagnostic(cleanLabel(text), 300, "start");
+
+/**
+ * The line /mlx-init shows before it installs: the version policy and the index, each with the layer it came from or
+ * "default". The index is cleaned and clipped long enough that clipping cannot hide where a look-alike URL points.
+ */
+export function describeInstall(install: InstallSettings): string {
+  return `mlx-lm ${install.version} (${install.versionSource ?? "default"}) from ${showInDialog(install.pipIndex)} (${install.pipIndexSource ?? "default"})`;
+}
+
+/** The leading release number of a version text (digits and dots) and what follows it, lower-cased. */
+function splitVersion(text: string): { release: string[]; suffix: string } | undefined {
+  const lower = text.trim().toLowerCase();
+  const match = /^[0-9]+(?:\.[0-9]+)*/.exec(lower);
+  if (match === null) return undefined;
+  const release = match[0].split(".");
+  // PEP 440 pads the release with zeros: 0.32 and 0.32.0 are the same version. At least the first part stays.
+  while (release.length > 1 && /^0+$/.test(release[release.length - 1])) release.pop();
+  return { release: release.map((part) => String(Number(part))), suffix: lower.slice(match[0].length) };
+}
+
+/**
+ * Whether two version texts name the same release: equal after the trailing `.0` parts of the release number are
+ * dropped, with whatever follows it (`rc1`, `.post1`, `.dev1`) compared exactly. Not a full PEP 440 parser (D-08).
+ */
+export function sameVersion(a: string, b: string): boolean {
+  const left = splitVersion(a);
+  const right = splitVersion(b);
+  if (left === undefined || right === undefined) return a.trim().toLowerCase() === b.trim().toLowerCase();
+  return left.release.join(".") === right.release.join(".") && left.suffix === right.suffix;
+}
+
+/**
+ * The one warning /mlx-start shows when an exact pin is configured and the installed mlx-lm is another version (D-07).
+ * Undefined when the policy floats or the two are the same release. Every part is cleaned and clipped.
+ */
+export function pinNotice(install: InstallSettings, installed: string): string | undefined {
+  if (install.version === "latest" || sameVersion(install.version, installed)) return undefined;
+  const source = install.versionSource === undefined ? "" : ` (${show(install.versionSource)})`;
+  return `mlx-lm pinned ${show(install.version)}${source}, installed ${show(installed)}; run /mlx-init to apply`;
+}
 
 /**
  * The risks in the effective merged values whose layer is not the project file (that one is refused by
@@ -1209,11 +1503,18 @@ export function trustRisks(prepared: Prepared): TrustRisk[] {
 
 /** The text that refuses a project file asking for a risky setting, without the "mlx-start failed: " prefix. */
 export function formatProjectRefusal(violations: readonly ProjectViolation[], globalConfigPath: string): string {
+  const withInstall = violations.some((violation) => violation.installOnly === true);
+  const header = withInstall
+    ? ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:"
+    : ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:";
+  const footer = withInstall
+    ? `Move them to ${cleanLabel(globalConfigPath)}. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking.`
+    : `Move them to ${cleanLabel(globalConfigPath)}; starting then asks for confirmation.`;
   return [
-    ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+    header,
     ...violations.map(
       (violation) => `  ${show(violation.path)}${violation.shown === "" ? "" : ` (${show(violation.shown)})`}: ${show(violation.reason)}`,
     ),
-    `Move them to ${cleanLabel(globalConfigPath)}; starting then asks for confirmation.`,
+    footer,
   ].join("\n");
 }

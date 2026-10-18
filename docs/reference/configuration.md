@@ -15,7 +15,7 @@ Every setting `@taoc/pi-mlx-models` reads, where it can be set, and how the sour
 
 The first source that sets a value wins. Each source is read at every `/mlx-start`, so an edit takes effect on the next start without reloading pi.
 
-Environment variables and pi flags only exist for the connection settings listed below. Model options (`model` block and `models` entries) come from the two files and from `/mlx-start` flags; see [Model options](#model-options).
+Environment variables and pi flags only exist for the settings that have such a column entry below. Model options (`model` block and `models` entries) come from the two files and from `/mlx-start` flags; see [Model options](#model-options). The `mlxLm` block is read by `/mlx-init` and `/mlx-start` and has its own flags and variables; see [mlx-lm version and install source](#mlx-lm-version-and-install-source).
 
 ## Files
 
@@ -39,7 +39,19 @@ Values in files are checked strictly: a number must be a JSON number, a boolean 
     "port": 8080,
     "allowedOrigins": ["http://localhost:3000"],
     "logLevel": "INFO",
-    "trustRemoteCode": false
+    "trustRemoteCode": false,
+    "decodeConcurrency": 4,
+    "promptConcurrency": 4,
+    "prefillStepSize": 2048,
+    "promptCacheSize": 10,
+    "promptCacheBytes": 8589934592,
+    "kvBits": 4,
+    "kvGroupSize": 64,
+    "quantizedKvStart": 5000
+  },
+  "mlxLm": {
+    "version": "0.32.2",
+    "pipIndex": "https://mirror.example/simple/"
   },
   "model": {
     "adapterPath": "~/adapters/my-lora",
@@ -57,11 +69,11 @@ Values in files are checked strictly: a number must be a JSON number, a boolean 
 }
 ```
 
-`baseUrl`, `defaultModel` and `models` are top-level keys. Every other key lives inside its block. An unknown key stops the start; the message names the key and the file layer.
+`baseUrl`, `defaultModel` and `models` are top-level keys. Every other key lives inside its block. `mlxLm` is a block like `server`: it holds `version` and `pipIndex`. An unknown key stops the start; the message names the key and the file layer.
 
 ## Settings
 
-The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and port are always passed. Every other flag is passed only when some source sets it to something other than its default.
+The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and port are always passed. Every other flag is passed only when some source sets it to something other than its default. A setting with no default is passed whenever a source sets it, even to the value mlx-lm uses itself.
 
 | Setting | Type and allowed values | Default | Flag | `/mlx-start` flag | pi flag | Environment variable |
 |---------|-------------------------|---------|------|-------------------|---------|----------------------|
@@ -70,6 +82,14 @@ The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and po
 | `server.allowedOrigins` | list of non-empty strings without commas or spaces | none | `--allowed-origins` | `--allowed-origins` (comma-separated) | | |
 | `server.logLevel` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | none | `--log-level` | `--log-level` | `--mlx-log-level` | |
 | `server.trustRemoteCode` | `true` or `false` | `false` | `--trust-remote-code` | `--trust-remote-code` (no value) | | |
+| `server.decodeConcurrency` | integer of at least 1 | none | `--decode-concurrency` | `--decode-concurrency` | | |
+| `server.promptConcurrency` | integer of at least 1 | none | `--prompt-concurrency` | `--prompt-concurrency` | | |
+| `server.prefillStepSize` | integer of at least 1 | none | `--prefill-step-size` | `--prefill-step-size` | | |
+| `server.promptCacheSize` | integer of at least 1 | none | `--prompt-cache-size` | `--prompt-cache-size` | | |
+| `server.promptCacheBytes` | integer number of bytes, at least 1 | none | `--prompt-cache-bytes` | `--prompt-cache-bytes` | | |
+| `server.kvBits` | integer from 2 to 8 | none | `--kv-bits` | `--kv-bits` | | |
+| `server.kvGroupSize` | integer of at least 1 | none | `--kv-group-size` | `--kv-group-size` | | |
+| `server.quantizedKvStart` | integer of at least 0 | none | `--quantized-kv-start` | `--quantized-kv-start` | | |
 | `model.adapterPath` | non-empty path | none | `--adapter-path` | `--adapter-path` | | |
 | `model.draftModel` | non-empty model id | none | `--draft-model` | `--draft-model` | | |
 | `model.numDraftTokens` | integer of at least 1 | none | `--num-draft-tokens` | `--num-draft-tokens` | | |
@@ -78,6 +98,10 @@ The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and po
 | `model.chatTemplateArgs` | JSON object | none | `--chat-template-args` | `--chat-template-args` (a JSON string) | | |
 | `baseUrl` | `http` or `https` URL; a trailing slash is removed | `http://<host>:<port>/v1` | | | | `PI_MLX_MODELS_BASE_URL` |
 | `defaultModel` | non-empty model id or preset key | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | | | | `PI_MLX_MODELS_DEFAULT_MODEL` |
+| `mlxLm.version` | the word `latest` or an exact version such as `0.32.2` | `latest` | | | | `PI_MLX_MODELS_MLX_LM_VERSION` |
+| `mlxLm.pipIndex` | `https` URL without credentials or spaces (`http` only for a loopback host) | `https://pypi.org/simple/` | | | | `PI_MLX_MODELS_PIP_INDEX` |
+
+The two `mlxLm` rows are settings of `/mlx-init`, not of the server. Their command-line forms are the `/mlx-init` flags `--mlx-lm-version` and `--pip-index`, not `/mlx-start` flags. They have no pi flag.
 
 A valued flag is passed to the server as one argument, `--flag=value`. The `--host` and `--port` pair keeps its two-argument form, so a launch that sets nothing has the same arguments as before configuration files existed.
 
@@ -93,10 +117,83 @@ A valued flag is passed to the server as one argument, `--flag=value`. The `--ho
 | `PI_MLX_MODELS_HOST` | An empty value counts as unset. |
 | `PI_MLX_MODELS_BASE_URL` | An empty value counts as unset. |
 | `PI_MLX_MODELS_DEFAULT_MODEL` | |
+| `PI_MLX_MODELS_MLX_LM_VERSION` | `latest` or an exact version. An invalid value is ignored with a warning. An empty value counts as unset. |
+| `PI_MLX_MODELS_PIP_INDEX` | The pip index URL. An invalid value refuses `/mlx-init` and `/mlx-start` with an error, so an install never silently falls back to another index. An empty value counts as unset. |
 | `PI_MLX_MODELS_PYTHON` | Path to the Python interpreter used to build the virtual environment. Must be Python 3.11 or newer. If it is set but unusable, `/mlx-init` fails and names it instead of choosing another Python. |
 | `PI_CODING_AGENT_DIR` | pi's agent directory. Sets where `pi-mlx-models` keeps its files. |
 
 A bad value in a file, a pi flag or a `/mlx-start` flag stops the start. A bad value in an environment variable is ignored with a warning and the next source down is used.
+
+## Performance and KV cache options
+
+Eight `server` keys tune throughput and memory. They have no default of their own and no environment variable or pi flag: a key that no source sets is not passed, and mlx-lm uses its own default. They are server-wide, not per model, and can be set in either file or typed after `/mlx-start` with the flag in the Flag column above.
+
+| Key | mlx-lm's own default | First mlx-lm release with the flag |
+|-----|----------------------|------------------------------------|
+| `decodeConcurrency` | 32 | 0.30.6 |
+| `promptConcurrency` | 8 | 0.30.6 |
+| `prefillStepSize` | 2048 | 0.31.1 |
+| `promptCacheSize` | 10 | 0.31.1 |
+| `promptCacheBytes` | none (no byte limit) | 0.31.1 |
+| `kvBits` | none (no quantization) | 0.32.0 |
+| `kvGroupSize` | 64 | 0.32.0 |
+| `quantizedKvStart` | 5000 | 0.32.0 |
+
+mlx-lm 0.31.0 was yanked from PyPI because of a KV cache cross-contamination bug, so 0.31.1 is the first usable release for the prefill and prompt cache flags. An install that lacks a flag skips it with a notice; see [Flags the installed mlx-lm does not support](#flags-the-installed-mlx-lm-does-not-support).
+
+Checks are sanity checks only: values are integers, at least 1 (`quantizedKvStart` at least 0), and `kvBits` is from 2 to 8. There is no upper bound, because mlx-lm decides what the hardware can take. `promptCacheBytes` is a plain integer number of bytes, for example `8589934592` for 8 GiB; size words such as `8GB` are not accepted.
+
+### Quantized KV cache
+
+Setting `kvBits` turns on KV cache quantization, which saves memory on long sessions. It disables batching in mlx-lm. Every start that passes `--kv-bits` shows one warning, with the value and the source:
+
+```
+KV quantization (--kv-bits 4, global file): Disables batching, so requests are served one at a time.
+```
+
+- `decodeConcurrency` or `promptConcurrency` above 1 together with `kvBits` still launches. The warning adds that they have no effect while `--kv-bits` is set, for example `--decode-concurrency 2 has no effect while --kv-bits is set.`
+- `kvGroupSize` or `quantizedKvStart` without `kvBits` still launches. One info note says the flag has no effect without `--kv-bits`.
+
+Limits that MLX enforces and the extension does not check:
+
+- `kvBits` 7 is rejected by MLX.
+- `kvGroupSize` must be 32, 64 or 128.
+- Quantization starts only after `quantizedKvStart` tokens (5000 by default), so a bad pair of values fails on the first long prompt and not at launch. The server's own error is shown.
+
+## mlx-lm version and install source
+
+`/mlx-init` installs mlx-lm into the virtual environment. Two settings control what it installs and where from.
+
+**`mlxLm.version`** is one of:
+
+- `latest` (the default): `/mlx-init` installs the newest mlx-lm, never below 0.24.0.
+- An exact version such as `0.32.2`: `/mlx-init` installs exactly that version, upgrading or downgrading as needed.
+
+Nothing else is accepted: no ranges, no specifiers such as `>=`, no URLs. The project file may set `mlxLm.version`.
+
+**`mlxLm.pipIndex`** is the package index pip installs from.
+
+- It must be an `https` URL, or `http` for `127.0.0.1`, `localhost` or `::1`. It must contain no whitespace and no credentials; use pip's netrc file or keyring for those.
+- It is passed to pip as `--index-url=VALUE` in both pip steps, the pip upgrade and the mlx-lm install. The index must therefore carry `pip` itself.
+- Only `--index-url` is passed. pip's own environment and configuration, for example `PIP_EXTRA_INDEX_URL`, still apply.
+- A refused value is shown with its user name and password replaced by `***`. Only the plain `http://` or `https://` spelling is accepted: a backslash, a single slash after the scheme and an escaped character in the host are refused, because pip reads them differently from the check.
+- It can be set in the global file, by `PI_MLX_MODELS_PIP_INDEX` or by `/mlx-init --pip-index`. A project file cannot set it; see [Settings that ask for permission](#settings-that-ask-for-permission).
+
+Only `/mlx-init` changes the installed mlx-lm. `/mlx-start` never upgrades or downgrades, and runs pip only when there is no working install at all. In that case it uses the same index and pin as `/mlx-init`, so a configured mirror applies on the first launch.
+
+A yanked release such as 0.31.0 can still be pinned: pip installs an exact pin to a yanked file and prints the reason.
+
+### When the pin and the install differ
+
+- If an exact pin is set and the installed mlx-lm is another version, every `/mlx-start` shows one warning before the start message and launches what is installed:
+
+  ```
+  mlx-lm pinned 0.31.1 (project file), installed 0.32.2; run /mlx-init to apply
+  ```
+
+  The part in parentheses names the source of the pin and is left out when none is known. `0.32` and `0.32.0` count as the same version. With `latest` the installed version is not queried and nothing is shown.
+- If the installed version cannot be read, no warning is shown and the start goes on.
+- A flag that is newer than a pinned version is skipped by the usual check. The notice then names the pin: `mlx-lm is pinned to 0.31.1 by project file; raise or remove the pin, then run /mlx-init`.
 
 ## Model options
 
@@ -117,6 +214,16 @@ Limits:
 - A chat template file must be a regular file of at most 64 KiB containing non-empty UTF-8 text. Its text, not its path, is passed to the server.
 - `chatTemplateArgs` is at most 16 KiB, after merging.
 
+## `/mlx-init` arguments
+
+```
+/mlx-init [--pip-index url] [--mlx-lm-version latest|X]
+```
+
+- `--pip-index` and `--mlx-lm-version` are the only flags. There is no model word. Each takes a value, as the next word or as `--flag=value`, and the tokenizer rules are those of `/mlx-start`.
+- They apply to that run only; nothing is remembered. A flag beats the environment variable and both files.
+- `/mlx-init` reads the global file, the project file and the environment, like `/mlx-start`. It refuses on an invalid file or on a project file that asks for something it may not, so an unrelated bad key also stops it. Nothing is installed in that case.
+
 ## `/mlx-start` arguments
 
 ```
@@ -126,6 +233,7 @@ Limits:
 - `model` is a preset number (1 to 5), a preset key, or a full model id. A model id must not start with `-`.
 - A valued flag takes the next word, unless that word starts with `--`. Use `--flag=value` for such a value.
 - `--trust-remote-code` and `--use-default-chat-template` take no value.
+- The performance and KV cache flags (`--decode-concurrency`, `--prompt-concurrency`, `--prefill-step-size`, `--prompt-cache-size`, `--prompt-cache-bytes`, `--kv-bits`, `--kv-group-size`, `--quantized-kv-start`) take a whole number.
 - Single quotes are literal. Inside double quotes a backslash escapes a quote or a backslash. A quoted part joins the text next to it, so `--chat-template-args='{"a":1}'` is one word.
 - A flag may appear once. An unknown flag, a missing value, a second model and an unterminated quote are errors.
 - The whole argument string is limited to 8192 characters.
@@ -151,17 +259,19 @@ A loopback host is `127.0.0.1`, `localhost` or `::1`. Everything else is non-loo
 | `server.trustRemoteCode: true` | The start is refused. | Asks for confirmation. |
 | `server.host` that is non-loopback | The start is refused. | Asks for confirmation. |
 | `baseUrl` that is non-loopback | The start is refused. | Asks for confirmation. |
+| `mlxLm.pipIndex` | `/mlx-init` and `/mlx-start` are refused. | Accepted without a dialog from the global file, the environment or the `/mlx-init` flag. |
 
 - A refused project file cannot be overridden, even when a higher source sets a different value, because the file is checked on its own content.
 - A confirmation is asked at every start, one dialog per risk, and nothing is remembered. Declining cancels the start. The dialog shows which source set the value.
 - With no interactive UI, a start that needs confirmation is refused.
 - `trustRemoteCode` has no environment variable and no pi flag.
+- The pip index decides which code `pip install` fetches, so a project file may not choose it. From your own sources it applies without confirmation, and `/mlx-init` always shows it. A project file may pin `mlxLm.version`.
 
 ## Flags the installed mlx-lm does not support
 
 When a launch uses any flag beyond host and port, the extension asks the installed mlx-lm which flags it supports, by running `python -m mlx_lm.server --help` in the virtual environment, with a 15 second limit. The answer is kept for the session, per mlx-lm version.
 
-- A flag the install does not list is left out of the launch. One warning names each skipped flag and the mlx-lm version, and the start continues.
+- A flag the install does not list is left out of the launch. One warning names each skipped flag and the mlx-lm version, and the start continues. The warning ends with `(run /mlx-init to upgrade)`. When an exact `mlxLm.version` is set it ends with `(mlx-lm is pinned to X by SOURCE; raise or remove the pin, then run /mlx-init)` instead, because upgrading is not what a pinned install needs.
 - If the check fails, a warning says so and every configured flag is passed.
 - Host and port are never skipped. A launch that uses only host and port does not run the check.
 
@@ -174,6 +284,8 @@ flags: --log-level INFO (global file), --num-draft-tokens 4 (project file)
 ```
 
 Sources are named `global file`, `project file`, `/mlx-start`, `pi flag --mlx-port` and `env PI_MLX_MODELS_PORT`. A skipped flag is marked `skipped`.
+
+Before the start message, a start can show a [pin warning](#when-the-pin-and-the-install-differ) and the [skipped-flag warning](#flags-the-installed-mlx-lm-does-not-support). After it, a launch with `kvBits` shows the [batching warning](#quantized-kv-cache), and a launch with `kvGroupSize` or `quantizedKvStart` but no `kvBits` shows the no-effect note. These are shown on every start, not once.
 
 A configuration problem is reported once, as one message that names every offending key, its source and what is allowed. Nothing is installed or started when that happens.
 

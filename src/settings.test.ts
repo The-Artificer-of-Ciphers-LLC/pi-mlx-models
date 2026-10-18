@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_MODEL_ID } from "./config.js";
+import { DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX } from "./config.js";
 import {
   PI_FLAGS,
   SETTINGS,
@@ -12,8 +12,12 @@ import {
   describeFlags,
   formatConfigErrors,
   formatProjectRefusal,
+  initFlagSpecs,
+  kvNotices,
+  pinNotice,
   prepareSettings,
   readLayerFile,
+  sameVersion,
   toLaunchSpec,
   trustRisks,
   type LayerFile,
@@ -888,6 +892,14 @@ test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order; only the
     { flag: "--allowed-origins", path: "server.allowedOrigins", takesValue: true },
     { flag: "--log-level", path: "server.logLevel", takesValue: true },
     { flag: "--trust-remote-code", path: "server.trustRemoteCode", takesValue: false },
+    { flag: "--decode-concurrency", path: "server.decodeConcurrency", takesValue: true },
+    { flag: "--prompt-concurrency", path: "server.promptConcurrency", takesValue: true },
+    { flag: "--prefill-step-size", path: "server.prefillStepSize", takesValue: true },
+    { flag: "--prompt-cache-size", path: "server.promptCacheSize", takesValue: true },
+    { flag: "--prompt-cache-bytes", path: "server.promptCacheBytes", takesValue: true },
+    { flag: "--kv-bits", path: "server.kvBits", takesValue: true },
+    { flag: "--kv-group-size", path: "server.kvGroupSize", takesValue: true },
+    { flag: "--quantized-kv-start", path: "server.quantizedKvStart", takesValue: true },
     { flag: "--adapter-path", path: "model.adapterPath", takesValue: true },
     { flag: "--draft-model", path: "model.draftModel", takesValue: true },
     { flag: "--num-draft-tokens", path: "model.numDraftTokens", takesValue: true },
@@ -1596,9 +1608,10 @@ test("model options have no environment variable and no pi flag", () => {
   assert.deepEqual(extraOf({ env, piFlags: { "mlx-draft-model": "x" } }), []);
 });
 
-test("the six model rows come after server.trustRemoteCode, in the order of the flags", () => {
+test("the six model rows come after the server rows, in the order of the flags", () => {
   const paths = SETTINGS.map((row) => row.path);
-  assert.deepEqual(paths.slice(paths.indexOf("server.trustRemoteCode") + 1, paths.indexOf("server.trustRemoteCode") + 7), [
+  assert.ok(paths.indexOf("model.adapterPath") > paths.indexOf("server.trustRemoteCode"));
+  assert.deepEqual(paths.slice(paths.indexOf("model.adapterPath"), paths.indexOf("model.adapterPath") + 6), [
     "model.adapterPath",
     "model.draftModel",
     "model.numDraftTokens",
@@ -2226,4 +2239,679 @@ test("a model flag can be skipped as well", () => {
   const launch = launchOf({ global: ok({ model: { numDraftTokens: 4 } }) });
   assert.equal(describeFlags(launch, new Set(["--num-draft-tokens"])), "flags: --num-draft-tokens 4 (global file, skipped)");
   assert.deepEqual(toLaunchSpec(launch, new Set(["--num-draft-tokens"])).extraArgs, []);
+});
+
+// ---- performance flags (SRV-04) ----
+
+test("server.decodeConcurrency: a global value becomes one --decode-concurrency=N element with its layer", () => {
+  const { prepared } = resolved({ global: ok({ server: { decodeConcurrency: 4 } }) });
+  assert.equal(prepared.flags.length, 1);
+  const [flag] = prepared.flags;
+  assert.equal(flag.flag, "--decode-concurrency");
+  assert.deepEqual(flag.args, ["--decode-concurrency=4"]);
+  assert.equal(flag.display, "4");
+  assert.equal(flag.label, "global file");
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--decode-concurrency=4"]);
+});
+
+const BAD_DECODE_CONCURRENCY: ReadonlyArray<[unknown, string]> = [
+  [0, "0"],
+  [-1, "-1"],
+  [1.5, "1.5"],
+  ["4", '"4"'],
+  [true, "true"],
+  [null, "null"],
+];
+
+for (const [value, shown] of BAD_DECODE_CONCURRENCY) {
+  test(`server.decodeConcurrency: ${shown} in the global file is refused with one line`, () => {
+    assert.deepEqual(refused({ global: ok({ server: { decodeConcurrency: value } }) }), [
+      `server.decodeConcurrency (${GLOBAL}): ${shown} is not an integer of at least 1 (flag --decode-concurrency)`,
+    ]);
+  });
+}
+
+test("server.decodeConcurrency: a value typed on /mlx-start beats the global file and is labelled with the command", () => {
+  const { prepared } = resolved({
+    global: ok({ server: { decodeConcurrency: 4 } }),
+    args: { "server.decodeConcurrency": "2" },
+  });
+  assert.equal(prepared.flags.length, 1);
+  assert.deepEqual(prepared.flags[0].args, ["--decode-concurrency=2"]);
+  assert.equal(prepared.flags[0].label, "/mlx-start");
+});
+
+test("server.decodeConcurrency: PI_MLX_MODELS_DECODE_CONCURRENCY has no effect and draws no warning", () => {
+  const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_DECODE_CONCURRENCY: "4" } });
+  assert.deepEqual(prepared.flags, []);
+  assert.deepEqual(warnings, []);
+});
+
+// ---- the other four performance rows (SRV-04) ----
+
+const PERFORMANCE_ROWS: ReadonlyArray<[key: string, flag: string]> = [
+  ["promptConcurrency", "--prompt-concurrency"],
+  ["prefillStepSize", "--prefill-step-size"],
+  ["promptCacheSize", "--prompt-cache-size"],
+  ["promptCacheBytes", "--prompt-cache-bytes"],
+];
+
+const BYTES_EXAMPLE = "an integer number of bytes of at least 1, for example 8589934592 for 8 GiB";
+
+for (const [key, flag] of PERFORMANCE_ROWS) {
+  test(`server.${key}: 1 and the largest safe integer are accepted and emitted as one ${flag}=N element`, () => {
+    for (const value of [1, 9007199254740991]) {
+      const { prepared } = resolved({ global: ok({ server: { [key]: value } }) });
+      assert.deepEqual(prepared.flags.map((flag) => flag.args), [[`${flag}=${value}`]]);
+      assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [`${flag}=${value}`]);
+    }
+  });
+
+  const cases: ReadonlyArray<[unknown, string]> = [
+    [0, "0"],
+    [-1, "-1"],
+    [1.5, "1.5"],
+    ["3", '"3"'],
+    [true, "true"],
+    [9007199254740992, "9007199254740992"],
+  ];
+  for (const [value, shown] of cases) {
+    test(`server.${key}: ${shown} in the global file is refused with one line`, () => {
+      const problem = key === "promptCacheBytes" ? `is not ${BYTES_EXAMPLE}` : "is not an integer of at least 1";
+      assert.deepEqual(refused({ global: ok({ server: { [key]: value } }) }), [
+        `server.${key} (${GLOBAL}): ${shown} ${problem} (flag ${flag})`,
+      ]);
+    });
+  }
+}
+
+test("server.promptCacheBytes: the refusal of 0 reads exactly, with the 8 GiB example", () => {
+  assert.deepEqual(refused({ global: ok({ server: { promptCacheBytes: 0 } }) }), [
+    "server.promptCacheBytes (global config.json): 0 is not an integer number of bytes of at least 1, for example 8589934592 for 8 GiB (flag --prompt-cache-bytes)",
+  ]);
+});
+
+const ALL_FIVE = {
+  decodeConcurrency: 2,
+  promptConcurrency: 4,
+  prefillStepSize: 1024,
+  promptCacheSize: 5,
+  promptCacheBytes: 8589934592,
+};
+
+test("a global file that sets all five lists them in schema order with their layer, and passes them in that order", () => {
+  const { prepared } = resolved({ global: ok({ server: ALL_FIVE }) });
+  assert.equal(
+    describeFlags(buildOk(prepared)),
+    "flags: --decode-concurrency 2 (global file), --prompt-concurrency 4 (global file), --prefill-step-size 1024 (global file), --prompt-cache-size 5 (global file), --prompt-cache-bytes 8589934592 (global file)",
+  );
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [
+    "--decode-concurrency=2",
+    "--prompt-concurrency=4",
+    "--prefill-step-size=1024",
+    "--prompt-cache-size=5",
+    "--prompt-cache-bytes=8589934592",
+  ]);
+});
+
+test("the five performance rows follow server.trustRemoteCode in the order of the flags", () => {
+  const paths = SETTINGS.map((row) => row.path);
+  const start = paths.indexOf("server.trustRemoteCode") + 1;
+  assert.deepEqual(paths.slice(start, start + 5), [
+    "server.decodeConcurrency",
+    "server.promptConcurrency",
+    "server.prefillStepSize",
+    "server.promptCacheSize",
+    "server.promptCacheBytes",
+  ]);
+});
+
+test("a value equal to the server's own default is still passed and shown", () => {
+  const { prepared } = resolved({ global: ok({ server: { prefillStepSize: 2048 } }) });
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--prefill-step-size=2048"]);
+  assert.equal(describeFlags(buildOk(prepared)), "flags: --prefill-step-size 2048 (global file)");
+});
+
+test("the project file may set all five: no violation, and the layer is the project file", () => {
+  const { prepared } = resolved({ project: ok({ server: ALL_FIVE }) });
+  assert.deepEqual(prepared.projectViolations, []);
+  assert.deepEqual(
+    prepared.flags.map((flag) => flag.label),
+    ["project file", "project file", "project file", "project file", "project file"],
+  );
+});
+
+test("none of the five rows has an environment variable or a pi flag, and the pi flags stay the four of phase 2", () => {
+  for (const key of ["decodeConcurrency", ...PERFORMANCE_ROWS.map(([name]) => name)]) {
+    const row = SETTINGS.find((setting) => setting.path === `server.${key}`);
+    assert.ok(row, key);
+    assert.equal(row.env, undefined, key);
+    assert.equal(row.piFlag, undefined, key);
+    assert.equal(row.default, undefined, key);
+    assert.equal(row.perModel, undefined, key);
+  }
+  assert.deepEqual(
+    PI_FLAGS.map((flag) => flag.name),
+    ["mlx-model", "mlx-port", "mlx-host", "mlx-log-level"],
+  );
+});
+
+// ---- KV quantization (SRV-05) ----
+
+const BATCHING = "Disables batching, so requests are served one at a time.";
+
+for (const bits of [2, 8]) {
+  test(`server.kvBits: ${bits} in the global file is accepted and emitted as --kv-bits=${bits}`, () => {
+    const { prepared } = resolved({ global: ok({ server: { kvBits: bits } }) });
+    assert.deepEqual(prepared.flags.map((flag) => flag.args), [[`--kv-bits=${bits}`]]);
+    assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [`--kv-bits=${bits}`]);
+  });
+}
+
+const BAD_KV_BITS: ReadonlyArray<[unknown, string]> = [
+  [1, "1"],
+  [9, "9"],
+  [0, "0"],
+  [4.5, "4.5"],
+  ["4", '"4"'],
+  [true, "true"],
+  [null, "null"],
+];
+
+for (const [value, shown] of BAD_KV_BITS) {
+  test(`server.kvBits: ${shown} in the global file is refused naming the range`, () => {
+    assert.deepEqual(refused({ global: ok({ server: { kvBits: value } }) }), [
+      `server.kvBits (${GLOBAL}): ${shown} is not an integer from 2 to 8 (flag --kv-bits)`,
+    ]);
+  });
+}
+
+test("server.kvBits: a value typed on /mlx-start is labelled with the command", () => {
+  const { prepared } = resolved({ args: { "server.kvBits": "4" } });
+  assert.deepEqual(prepared.flags.map((flag) => [flag.args, flag.label]), [[["--kv-bits=4"], "/mlx-start"]]);
+});
+
+test("kvNotices: kvBits from the global file gives mlx-lm's own batching sentence and no info note", () => {
+  const notices = kvNotices(launchOf({ global: ok({ server: { kvBits: 4 } }) }));
+  assert.deepEqual(notices, { warning: `KV quantization (--kv-bits 4, global file): ${BATCHING}` });
+});
+
+test("kvNotices: without kvBits there is neither a warning nor an info note", () => {
+  assert.deepEqual(kvNotices(launchOf({})), {});
+  assert.deepEqual(kvNotices(launchOf({ global: ok({ server: { logLevel: "DEBUG" } }) })), {});
+});
+
+// ---- kvGroupSize, quantizedKvStart and the interaction notes (SRV-05, D-10, D-12) ----
+
+test("server.kvGroupSize: 1 and 64 in the global file are accepted and emitted as --kv-group-size=N", () => {
+  for (const value of [1, 64]) {
+    const { prepared } = resolved({ global: ok({ server: { kvGroupSize: value } }) });
+    assert.deepEqual(prepared.flags.map((flag) => flag.args), [[`--kv-group-size=${value}`]]);
+    assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [`--kv-group-size=${value}`]);
+  }
+});
+
+for (const [value, shown] of [[0, "0"], [-1, "-1"], [1.5, "1.5"], ["64", '"64"'], [true, "true"]] as const) {
+  test(`server.kvGroupSize: ${shown} in the global file is refused naming the minimum`, () => {
+    assert.deepEqual(refused({ global: ok({ server: { kvGroupSize: value } }) }), [
+      `server.kvGroupSize (${GLOBAL}): ${shown} is not an integer of at least 1 (flag --kv-group-size)`,
+    ]);
+  });
+}
+
+test("server.quantizedKvStart: 0 and 5000 in the global file are accepted, 0 included", () => {
+  for (const value of [0, 5000]) {
+    const { prepared } = resolved({ global: ok({ server: { quantizedKvStart: value } }) });
+    assert.deepEqual(prepared.flags.map((flag) => flag.args), [[`--quantized-kv-start=${value}`]]);
+    assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [`--quantized-kv-start=${value}`]);
+  }
+});
+
+for (const [value, shown] of [[-1, "-1"], [1.5, "1.5"], ["0", '"0"'], [true, "true"]] as const) {
+  test(`server.quantizedKvStart: ${shown} in the global file is refused naming the minimum`, () => {
+    assert.deepEqual(refused({ global: ok({ server: { quantizedKvStart: value } }) }), [
+      `server.quantizedKvStart (${GLOBAL}): ${shown} is not an integer of at least 0 (flag --quantized-kv-start)`,
+    ]);
+  });
+}
+
+test("the three KV rows follow the performance rows in the order of the flags and stay server-wide", () => {
+  const paths = SETTINGS.map((row) => row.path);
+  const start = paths.indexOf("server.promptCacheBytes") + 1;
+  assert.deepEqual(paths.slice(start, start + 3), ["server.kvBits", "server.kvGroupSize", "server.quantizedKvStart"]);
+  for (const path of paths.slice(start, start + 3)) {
+    const row = SETTINGS.find((setting) => setting.path === path)!;
+    assert.equal(row.perModel, undefined, path);
+    assert.equal(row.env, undefined, path);
+    assert.equal(row.default, undefined, path);
+  }
+});
+
+const KV_WARNING = `KV quantization (--kv-bits 4, global file): ${BATCHING}`;
+
+test("kvNotices: decodeConcurrency above 1 adds a clause to the warning and nothing is dropped", () => {
+  const launch = launchOf({ global: ok({ server: { decodeConcurrency: 2, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch), { warning: `${KV_WARNING} --decode-concurrency 2 has no effect while --kv-bits is set.` });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--decode-concurrency=2", "--kv-bits=4"]);
+});
+
+test("kvNotices: promptConcurrency above 1 adds the matching clause", () => {
+  const launch = launchOf({ global: ok({ server: { promptConcurrency: 4, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch), { warning: `${KV_WARNING} --prompt-concurrency 4 has no effect while --kv-bits is set.` });
+});
+
+test("kvNotices: both concurrency settings above 1 share one clause in row order", () => {
+  const launch = launchOf({ global: ok({ server: { promptConcurrency: 4, decodeConcurrency: 2, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch), {
+    warning: `${KV_WARNING} --decode-concurrency 2 and --prompt-concurrency 4 have no effect while --kv-bits is set.`,
+  });
+});
+
+test("kvNotices: concurrency values of 1 add no clause", () => {
+  const launch = launchOf({ global: ok({ server: { decodeConcurrency: 1, promptConcurrency: 1, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch), { warning: KV_WARNING });
+});
+
+test("kvNotices: a concurrency flag the install does not list adds no clause", () => {
+  const launch = launchOf({ global: ok({ server: { decodeConcurrency: 2, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch, new Set(["--decode-concurrency"])), { warning: KV_WARNING });
+});
+
+test("kvNotices: kvGroupSize without kvBits gives one info note and no warning", () => {
+  const launch = launchOf({ global: ok({ server: { kvGroupSize: 32 } }) });
+  assert.deepEqual(kvNotices(launch), { info: "--kv-group-size 32 has no effect without --kv-bits." });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--kv-group-size=32"]);
+});
+
+test("kvNotices: quantizedKvStart 0 without kvBits gives the matching info note", () => {
+  const launch = launchOf({ global: ok({ server: { quantizedKvStart: 0 } }) });
+  assert.deepEqual(kvNotices(launch), { info: "--quantized-kv-start 0 has no effect without --kv-bits." });
+});
+
+test("kvNotices: both without kvBits share one info note", () => {
+  const launch = launchOf({ global: ok({ server: { quantizedKvStart: 0, kvGroupSize: 32 } }) });
+  assert.deepEqual(kvNotices(launch), { info: "--kv-group-size 32 and --quantized-kv-start 0 have no effect without --kv-bits." });
+});
+
+test("kvNotices: kvBits together with kvGroupSize gives the warning and no info note", () => {
+  const launch = launchOf({ global: ok({ server: { kvBits: 4, kvGroupSize: 32 } }) });
+  assert.deepEqual(kvNotices(launch), { warning: KV_WARNING });
+});
+
+test("kvNotices: when kvBits is skipped by the probe neither notice is given, because the skip notice covers it", () => {
+  const launch = launchOf({ global: ok({ server: { kvBits: 4, kvGroupSize: 32 } }) });
+  assert.deepEqual(kvNotices(launch, new Set(["--kv-bits", "--kv-group-size"])), {});
+  assert.deepEqual(kvNotices(launch, new Set(["--kv-bits"])), {});
+});
+
+// ---- mlx-lm version policy (RUN-02) ----
+
+const PIN_EXPECTED = 'must be "latest" or an exact version such as 0.32.2';
+const pinLine = (shown: string, label = "global config.json") => `mlxLm.version (${label}): ${shown} ${PIN_EXPECTED}`;
+
+for (const version of ["latest", "0.32.2", "0.31.1", "0.32", "1.0", "0.33.0rc1", "0.32.2.post1", "0.33.0.dev1"]) {
+  test(`mlxLm.version ${JSON.stringify(version)} is accepted in a global file`, () => {
+    const { prepared, warnings } = resolved({ global: ok({ mlxLm: { version } }) });
+    assert.equal(prepared.install.version, version);
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(prepared.flags, [], "the version is not a server flag");
+  });
+}
+
+const BAD_PINS: unknown[] = [
+  0.32,
+  "^0.32",
+  ">=1",
+  "~=0.32",
+  "0.32.*",
+  "==0.32.2",
+  "1!2",
+  "abc",
+  "-",
+  "",
+  " ",
+  "https://example.test/mlx_lm.whl",
+  "git+https://example.test/x",
+  "--upgrade",
+  "0.32.2 --upgrade",
+  "Latest",
+  "0.32 ",
+  "latest ",
+];
+for (const version of BAD_PINS) {
+  test(`mlxLm.version ${JSON.stringify(version)} is refused naming the allowed values`, () => {
+    assert.deepEqual(refused({ global: ok({ mlxLm: { version } }) }), [pinLine(JSON.stringify(version))]);
+  });
+}
+
+test("mlxLm.version typed with surrounding spaces on /mlx-init is trimmed and accepted", () => {
+  const { prepared } = resolved({ args: { "mlxLm.version": " 0.31.1 " } });
+  assert.equal(prepared.install.version, "0.31.1");
+});
+
+test("PI_MLX_MODELS_MLX_LM_VERSION is used and its source is the variable", () => {
+  const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_MLX_LM_VERSION: "0.31.1" } });
+  assert.equal(prepared.install.version, "0.31.1");
+  assert.equal(prepared.install.versionSource, "env PI_MLX_MODELS_MLX_LM_VERSION");
+  assert.deepEqual(warnings, []);
+});
+
+test("an invalid PI_MLX_MODELS_MLX_LM_VERSION is ignored with a warning and the next layer down is used", () => {
+  const { prepared, warnings } = resolved({
+    global: ok({ mlxLm: { version: "0.30.7" } }),
+    env: { PI_MLX_MODELS_MLX_LM_VERSION: "^0.32" },
+  });
+  assert.equal(prepared.install.version, "0.30.7");
+  assert.equal(prepared.install.versionSource, "global file");
+  assert.deepEqual(warnings, ['PI_MLX_MODELS_MLX_LM_VERSION="^0.32" is not the word "latest" or an exact version such as 0.32.2; ignoring it.']);
+});
+
+test("a blank PI_MLX_MODELS_MLX_LM_VERSION counts as unset", () => {
+  for (const raw of ["", "   "]) {
+    const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_MLX_LM_VERSION: raw } });
+    assert.equal(prepared.install.version, "latest", JSON.stringify(raw));
+    assert.equal(prepared.install.versionSource, undefined);
+    assert.deepEqual(warnings, []);
+  }
+});
+
+test("mlxLm.version: /mlx-init beats the environment, which beats the project file, which beats the global file", () => {
+  const global = ok({ mlxLm: { version: "0.30.1" } });
+  const project = ok({ mlxLm: { version: "0.30.2" } });
+  const env = { PI_MLX_MODELS_MLX_LM_VERSION: "0.30.3" };
+  const args = { "mlxLm.version": "0.30.4" };
+  const at = (input: Partial<PrepareInput>) => {
+    const { install } = resolved(input).prepared;
+    return [install.version, install.versionSource];
+  };
+  assert.deepEqual(at({ global }), ["0.30.1", "global file"]);
+  assert.deepEqual(at({ global, project }), ["0.30.2", "project file"]);
+  assert.deepEqual(at({ global, project, env }), ["0.30.3", "env PI_MLX_MODELS_MLX_LM_VERSION"]);
+  assert.deepEqual(at({ global, project, env, args }), ["0.30.4", "/mlx-init"]);
+});
+
+test("the project file may set mlxLm.version: it is not a project violation", () => {
+  const { prepared } = resolved({ project: ok({ mlxLm: { version: "0.31.1" } }) });
+  assert.deepEqual(prepared.projectViolations, []);
+  assert.equal(prepared.install.version, "0.31.1");
+  assert.equal(prepared.install.versionSource, "project file");
+});
+
+test("initFlagSpecs lists only --mlx-lm-version and --pip-index and /mlx-start has neither", () => {
+  assert.deepEqual(initFlagSpecs(), [
+    { flag: "--mlx-lm-version", path: "mlxLm.version", takesValue: true },
+    { flag: "--pip-index", path: "mlxLm.pipIndex", takesValue: true },
+  ]);
+  assert.ok(!cliFlagSpecs().some((spec) => spec.flag === "--mlx-lm-version" || spec.flag === "--pip-index"));
+});
+
+test("a typed mlxLm.version is labelled with the /mlx-init spelling, failing or not", () => {
+  assert.deepEqual(refused({ args: { "mlxLm.version": "^0.32" } }), [pinLine('"^0.32"', "/mlx-init --mlx-lm-version")]);
+  const { prepared } = resolved({ args: { "mlxLm.version": "0.31.1" } });
+  assert.equal(prepared.install.versionSource, "/mlx-init");
+});
+
+// ---- pip index (RUN-04) ----
+
+test("mlxLm.pipIndex from the global file is kept verbatim and labelled global file", () => {
+  const { prepared, warnings } = resolved({ global: ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" } }) });
+  assert.equal(prepared.install.pipIndex, "https://mirror.example/simple/");
+  assert.equal(prepared.install.pipIndexSource, "global file");
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(prepared.flags, [], "the index is not a server flag");
+});
+
+test("with no layer setting it the pip index is the default and has no source", () => {
+  const { prepared } = resolved({});
+  assert.equal(prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+  assert.equal(prepared.install.pipIndexSource, undefined);
+});
+
+const PIP_PROBLEM = "must be an https URL without credentials or spaces (http only for a loopback host)";
+const pipLine = (shown: string, label = GLOBAL) => `mlxLm.pipIndex (${label}): ${shown} ${PIP_PROBLEM}`;
+
+for (const pipIndex of [
+  "https://pypi.org/simple/",
+  "https://mirror.example:8443/root/pypi/+simple/",
+  "http://127.0.0.1:3141/root/pypi/+simple/",
+  "http://localhost/simple/",
+  "http://[::1]:8080/simple/",
+]) {
+  test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is accepted in a global file and kept verbatim`, () => {
+    const { prepared, warnings } = resolved({ global: ok({ mlxLm: { pipIndex } }) });
+    assert.equal(prepared.install.pipIndex, pipIndex);
+    assert.deepEqual(warnings, []);
+  });
+}
+
+const BAD_PIP_INDEXES: unknown[] = [
+  "http://example.com/simple/",
+  "ftp://example.test/simple/",
+  "file:///tmp/simple/",
+  "",
+  "https://exa mple.test/simple/",
+  " https://example.test/simple/",
+  "https://example.test/simple/ ",
+  "https://example.test/sim\nple/",
+  "https://user:pass@example.test/simple/",
+  "https://user@example.test/simple/",
+  "https://pypi.org@evil.example/simple/",
+  "https://:@example.test/simple/",
+  "https://",
+  "pypi.org/simple/",
+  5,
+];
+for (const pipIndex of BAD_PIP_INDEXES) {
+  test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is refused naming the allowed form`, () => {
+    // Credentials are never repeated back (WR-01): the user and password of a refused URL show as ***.
+    const shown = JSON.stringify(pipIndex).replace(/([/\\]{2})[^\s/\\?#"]*@/g, "$1***@");
+    assert.deepEqual(refused({ global: ok({ mlxLm: { pipIndex } }) }), [pipLine(shown)]);
+  });
+}
+
+test("PI_MLX_MODELS_PIP_INDEX is used and its source is the variable", () => {
+  const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_PIP_INDEX: " https://env.example/simple/ " } });
+  assert.equal(prepared.install.pipIndex, "https://env.example/simple/", "surrounding whitespace of a typed value is trimmed");
+  assert.equal(prepared.install.pipIndexSource, "env PI_MLX_MODELS_PIP_INDEX");
+  assert.deepEqual(warnings, []);
+});
+
+test("an invalid PI_MLX_MODELS_PIP_INDEX refuses with an error naming the variable, whatever a lower layer says (WR-03)", () => {
+  const result = resolve({
+    global: ok({ mlxLm: { pipIndex: "https://global.example/simple/" } }),
+    env: { PI_MLX_MODELS_PIP_INDEX: "http://example.com/simple/" },
+  });
+  assert.deepEqual(result.ok ? undefined : result.errors, [
+    'PI_MLX_MODELS_PIP_INDEX="http://example.com/simple/" is not an https URL without credentials (http only for a loopback host)',
+  ]);
+});
+
+test("a blank PI_MLX_MODELS_PIP_INDEX counts as unset", () => {
+  for (const raw of ["", "   "]) {
+    const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_PIP_INDEX: raw } });
+    assert.equal(prepared.install.pipIndex, DEFAULT_PIP_INDEX, JSON.stringify(raw));
+    assert.equal(prepared.install.pipIndexSource, undefined);
+    assert.deepEqual(warnings, []);
+  }
+});
+
+test("mlxLm.pipIndex: /mlx-init beats the environment, which beats the global file; a project value takes no part", () => {
+  const global = ok({ mlxLm: { pipIndex: "https://global.example/simple/" } });
+  const project = ok({ mlxLm: { pipIndex: "https://project.example/simple/" } });
+  const env = { PI_MLX_MODELS_PIP_INDEX: "https://env.example/simple/" };
+  const args = { "mlxLm.pipIndex": "https://args.example/simple/" };
+  const at = (input: Partial<PrepareInput>) => {
+    const { install } = resolved(input).prepared;
+    return [install.pipIndex, install.pipIndexSource];
+  };
+  assert.deepEqual(at({ global }), ["https://global.example/simple/", "global file"]);
+  assert.deepEqual(at({ global, project }), ["https://global.example/simple/", "global file"]);
+  assert.deepEqual(at({ project }), [DEFAULT_PIP_INDEX, undefined]);
+  assert.deepEqual(at({ global, project, env }), ["https://env.example/simple/", "env PI_MLX_MODELS_PIP_INDEX"]);
+  assert.deepEqual(at({ global, project, env, args }), ["https://args.example/simple/", "/mlx-init"]);
+});
+
+test("a project file with mlxLm.pipIndex is one install-only violation, whatever a higher layer says", () => {
+  const project = ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" } });
+  const expected = [
+    { path: "mlxLm.pipIndex", shown: "https://mirror.example/simple/", reason: "chooses where mlx-lm is installed from", installOnly: true },
+  ];
+  assert.deepEqual(violationsOf(project), expected);
+  assert.deepEqual(violationsOf(project, { env: { PI_MLX_MODELS_PIP_INDEX: "https://env.example/simple/" } }), expected);
+  assert.deepEqual(violationsOf(project, { args: { "mlxLm.pipIndex": "https://args.example/simple/" } }), expected);
+});
+
+test("a project file that only pins the version has no violation", () => {
+  assert.deepEqual(violationsOf(ok({ mlxLm: { version: "0.31.1" } })), []);
+});
+
+test("formatProjectRefusal for a pip index alone uses the install header and footer", () => {
+  const text = formatProjectRefusal(violationsOf(ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" } })), "/home/u/config.json");
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:",
+      "  mlxLm.pipIndex (https://mirror.example/simple/): chooses where mlx-lm is installed from",
+      "Move them to /home/u/config.json. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking.",
+    ].join("\n"),
+  );
+});
+
+test("formatProjectRefusal lists a pip index and trustRemoteCode together under the install header", () => {
+  const text = formatProjectRefusal(
+    violationsOf(ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" }, server: { trustRemoteCode: true } })),
+    "/home/u/config.json",
+  );
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:",
+      "  server.trustRemoteCode: lets the model repository run Python code",
+      "  mlxLm.pipIndex (https://mirror.example/simple/): chooses where mlx-lm is installed from",
+      "Move them to /home/u/config.json. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking.",
+    ].join("\n"),
+  );
+});
+
+test("formatProjectRefusal for the four older violations alone keeps its exact text", () => {
+  const project = ok({ baseUrl: "http://example.test/v1", server: { host: "0.0.0.0", trustRemoteCode: true, allowedOrigins: ["*"] } });
+  assert.equal(
+    formatProjectRefusal(violationsOf(project), "/home/u/config.json"),
+    [
+      ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+      "  server.trustRemoteCode: lets the model repository run Python code",
+      "  server.host (0.0.0.0): listens on a non-loopback address",
+      "  baseUrl (http://example.test/v1): sends prompts to a non-loopback address",
+      '  server.allowedOrigins ("*"): lets web pages call the local server',
+      "Move them to /home/u/config.json; starting then asks for confirmation.",
+    ].join("\n"),
+  );
+});
+
+test("a typo of pipIndex inside the mlxLm block is an unknown key that names mlxLm.pipIndex", () => {
+  assert.equal(unknownLine({ mlxLm: { pipindex: "https://mirror.example/simple/" } }), `mlxLm.pipindex (${GLOBAL}): unknown key (did you mean mlxLm.pipIndex?)`);
+});
+
+// ---- the pin comparison and its notice (plan 03-05, D-07, D-08) ----
+
+test("sameVersion: identical texts are the same version", () => {
+  assert.equal(sameVersion("0.32.2", "0.32.2"), true);
+});
+
+test("sameVersion: a missing trailing .0 part makes no difference (0.32 and 0.32.0, 1.0 and 1.0.0)", () => {
+  assert.equal(sameVersion("0.32", "0.32.0"), true);
+  assert.equal(sameVersion("0.32.0", "0.32"), true);
+  assert.equal(sameVersion("1.0", "1.0.0"), true);
+});
+
+test("sameVersion: another release part is another version", () => {
+  assert.equal(sameVersion("0.32.2", "0.32.3"), false);
+  assert.equal(sameVersion("0.32", "0.32.1"), false);
+});
+
+test("sameVersion: a pre-release is not the release it precedes, and equals itself", () => {
+  assert.equal(sameVersion("0.33.0rc1", "0.33.0"), false);
+  assert.equal(sameVersion("0.33.0rc1", "0.33.0rc1"), true);
+});
+
+test("sameVersion: the suffix after the release number is compared exactly, with the release padded", () => {
+  assert.equal(sameVersion("0.32.0.post1", "0.32.post1"), true);
+  assert.equal(sameVersion("0.32.0.post1", "0.32.post2"), false);
+});
+
+test("sameVersion: case does not matter and text with no release number only equals itself", () => {
+  assert.equal(sameVersion("0.33.0RC1", "0.33.0rc1"), true);
+  assert.equal(sameVersion("abc", "ABC"), true);
+  assert.equal(sameVersion("abc", "0.32"), false);
+});
+
+test("pinNotice: a floating policy and an equal pin give no notice", () => {
+  assert.equal(pinNotice({ version: "latest", pipIndex: DEFAULT_PIP_INDEX }, "0.32.2"), undefined);
+  assert.equal(pinNotice({ version: "0.32", pipIndex: DEFAULT_PIP_INDEX, versionSource: "global file" }, "0.32.0"), undefined);
+});
+
+test("pinNotice: a mismatch names the pin, its source, the installed version and the command that applies it", () => {
+  assert.equal(
+    pinNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX, versionSource: "project file" }, "0.32.2"),
+    "mlx-lm pinned 0.31.1 (project file), installed 0.32.2; run /mlx-init to apply",
+  );
+});
+
+test("pinNotice: with no known source the parenthesised part is left out, and untrusted parts are cleaned and clipped", () => {
+  assert.equal(pinNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, "0.32.2"), "mlx-lm pinned 0.31.1, installed 0.32.2; run /mlx-init to apply");
+  const shown = pinNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, `0.32.2\u001b[31m${"9".repeat(100)}`) ?? "";
+  assert.ok(!shown.includes("\u001b"), "no control character reaches the notification");
+  assert.ok(shown.length < 160, `clipped: ${shown.length}`);
+});
+
+// ---- review hardening of the pip index: WR-01 credentials never shown, WR-02 one parser, WR-03 fail closed ----
+
+const SECRET_INDEX = "https://bob:s3cr3tTOKEN@mirror.example/simple/";
+const everyText = (result: ReturnType<typeof resolve>): string =>
+  JSON.stringify(result.ok ? result.warnings : [result.errors, result.warnings]);
+
+test("a pip index with credentials is refused without its credentials appearing in any message", () => {
+  const texts = [
+    everyText(resolve({ env: { PI_MLX_MODELS_PIP_INDEX: SECRET_INDEX } })),
+    everyText(resolve({ args: { "mlxLm.pipIndex": SECRET_INDEX } })),
+    everyText(resolve({ global: ok({ mlxLm: { pipIndex: SECRET_INDEX } }) })),
+  ];
+  for (const text of texts) {
+    assert.ok(!text.includes("s3cr3tTOKEN"), text);
+    assert.ok(!text.includes("bob"), text);
+    assert.ok(text.includes("mirror.example"), `the host stays visible to find the mistake: ${text}`);
+  }
+});
+
+test("a project pip index with credentials is a violation that does not show them", () => {
+  const { prepared } = resolved({ project: ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" } }) });
+  assert.equal(prepared.projectViolations[0].shown, "https://mirror.example/simple/");
+});
+
+test("the pip index check accepts only the canonical http(s):// form that pip parses the same way", () => {
+  const accepted = (pipIndex: string) => resolve({ global: ok({ mlxLm: { pipIndex } }) }).ok;
+  assert.equal(accepted("https://mirror.example/simple/"), true);
+  assert.equal(accepted("http://127.0.0.1:8081/simple"), true);
+  assert.equal(accepted("http://localhost/simple"), true);
+  for (const spelling of [
+    "http://localhost\\.evil.example/simple",
+    "https://mirror.example\\simple",
+    "https:mirror.example/simple",
+    "http:127.0.0.1/simple",
+    "https:/mirror.example/simple",
+    "http://localhost%2eevil.example/simple",
+  ]) {
+    assert.equal(accepted(spelling), false, spelling);
+  }
+});
+
+test("an invalid PI_MLX_MODELS_PIP_INDEX refuses instead of falling back to the default index", () => {
+  const result = resolve({ env: { PI_MLX_MODELS_PIP_INDEX: "http://mirror.example/simple/" } });
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.errors.some((line) => line.includes("PI_MLX_MODELS_PIP_INDEX")), JSON.stringify(result));
+});
+
+test("an unset or blank PI_MLX_MODELS_PIP_INDEX still means the next layer down", () => {
+  assert.equal(resolved({ env: { PI_MLX_MODELS_PIP_INDEX: "" } }).prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+  assert.equal(resolved({ env: { PI_MLX_MODELS_PIP_INDEX: "   " } }).prepared.install.pipIndex, DEFAULT_PIP_INDEX);
 });

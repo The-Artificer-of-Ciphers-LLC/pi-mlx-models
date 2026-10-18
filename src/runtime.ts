@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
-import { VENV_DIR, VENV_PYTHON } from "./config.js";
+import { DEFAULT_PIP_INDEX, VENV_DIR, VENV_PYTHON } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 
 export type RuntimeEvent = {
@@ -19,7 +19,18 @@ export interface RuntimeHost {
   run(cmd: string, args: string[], onLine?: (line: string) => void): Promise<void>;
 }
 
-const PYPI_INDEX = ["--index-url", "https://pypi.org/simple/"];
+/**
+ * What /mlx-init installs. `version` is the word "latest" or an exact version, both already checked by the settings
+ * layer; `pipIndex` is the package index, the default one when omitted. Neither can reach pip as anything but part of
+ * one argv element (`mlx-lm==VERSION`, `--index-url=VALUE`), so neither can become a second pip option.
+ */
+export interface InstallPolicy {
+  version: string;
+  pipIndex?: string;
+}
+
+/** The mlx-lm floor used when the version floats (D-05). */
+const MLX_LM_FLOOR = "mlx-lm>=0.24.0";
 
 /** mlx-lm 0.32 requires Python 3.11+. There is deliberately no ceiling. */
 const MIN_PYTHON_MINOR = 11;
@@ -140,9 +151,18 @@ export async function ensureInstalled(options: {
   upgrade?: boolean;
   onEvent?: (event: RuntimeEvent) => void;
   host?: RuntimeHost;
+  /** Omitted means float to the newest mlx-lm on the default index. */
+  policy?: InstallPolicy;
 } = {}): Promise<void> {
   const host = options.host ?? systemHost;
   const emit = options.onEvent ?? (() => {});
+  const policy = options.policy ?? { version: "latest" };
+  // One element each, built from a validated value: a value can never become a second pip argument (D-18).
+  const index = policy.pipIndex ?? DEFAULT_PIP_INDEX;
+  const indexArg = `--index-url=${index}`;
+  const mlxLmSpec = policy.version === "latest" ? MLX_LM_FLOOR : `mlx-lm==${policy.version}`;
+  // What events and failures say about the index: already validated, and still cleaned and clipped (T-03-18).
+  const shownIndex = clipDiagnostic(cleanLabel(index), 200, "start");
 
   if (!options.upgrade && host.exists(VENV_PYTHON)) {
     const importable = await host.run(VENV_PYTHON, ["-c", "import mlx_lm"]).then(
@@ -189,17 +209,33 @@ export async function ensureInstalled(options: {
   }
   emit({ phase: "venv", state: "done", detail: "Virtual environment ready" });
 
-  const pipStep = (phase: "pip" | "mlx-lm") => (rawLine: string) => {
+  // The step keeps announcing what it does and where from while pip talks, so pip's own text never hides the index.
+  const pipStep = (phase: "pip" | "mlx-lm", announcement: string) => (rawLine: string) => {
     const line = cleanLabel(rawLine);
     const m = line.match(/(\d+)%/);
-    emit({ phase, state: "active", detail: line.slice(0, 120), progress: m ? Number(m[1]) / 100 : undefined });
+    emit({ phase, state: "active", detail: `${announcement}: ${line.slice(0, 120)}`, progress: m ? Number(m[1]) / 100 : undefined });
   };
 
-  emit({ phase: "pip", state: "active", detail: "Upgrading pip" });
-  await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", "pip", ...PYPI_INDEX], pipStep("pip"));
+  // A failure keeps pip's own text whole (already cleaned and clipped to its last 800 characters by `run`), after a
+  // prefix that says which spec and which index were being used, so a mistyped pin or an unreachable mirror reads at once.
+  const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+  const pipAnnouncement = `Upgrading pip (index ${shownIndex})`;
+  emit({ phase: "pip", state: "active", detail: pipAnnouncement });
+  try {
+    await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", "pip", indexArg], pipStep("pip", pipAnnouncement));
+  } catch (error) {
+    if (index === DEFAULT_PIP_INDEX) throw error;
+    throw new Error(`pip could not be upgraded from ${shownIndex}: ${messageOf(error)}`);
+  }
   emit({ phase: "pip", state: "done", detail: "pip upgraded" });
 
-  emit({ phase: "mlx-lm", state: "active", detail: "Installing mlx-lm" });
-  await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", "mlx-lm>=0.24.0", ...PYPI_INDEX], pipStep("mlx-lm"));
+  const mlxLmAnnouncement = `Installing ${mlxLmSpec} (index ${shownIndex})`;
+  emit({ phase: "mlx-lm", state: "active", detail: mlxLmAnnouncement });
+  try {
+    await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", mlxLmSpec, indexArg], pipStep("mlx-lm", mlxLmAnnouncement));
+  } catch (error) {
+    throw new Error(`Installing ${mlxLmSpec} from ${shownIndex} failed: ${messageOf(error)}`);
+  }
   emit({ phase: "mlx-lm", state: "done", detail: "mlx-lm installed" });
 }

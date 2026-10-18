@@ -16,6 +16,9 @@ export type ProbeResult =
   | { ok: true; version: string; flags: ReadonlySet<string> }
   | { ok: false; reason: string };
 
+/** The answer of the cheap version query: the installed mlx-lm version, or why it could not be read. */
+export type VersionResult = { ok: true; version: string } | { ok: false; reason: string };
+
 export interface ProbeCommandOptions {
   /** Exactly the environment the child gets; nothing is merged in. */
   env: NodeJS.ProcessEnv;
@@ -150,7 +153,7 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
  * A probe over one python. `probe()` never throws: any trouble is `{ ok: false, reason }`, and a failure is never
  * cached, so the next launch tries again.
  */
-export function createFlagProbe(deps: FlagProbeDeps): { probe(): Promise<ProbeResult> } {
+export function createFlagProbe(deps: FlagProbeDeps): { probe(): Promise<ProbeResult>; installedVersion(): Promise<VersionResult> } {
   const run = deps.run ?? runProbeCommand;
   const limits = { timeoutMs: deps.timeoutMs ?? DEFAULT_TIMEOUT_MS, maxBytes: deps.maxBytes ?? DEFAULT_MAX_BYTES };
   const cache = new Map<string, ReadonlySet<string>>();
@@ -188,6 +191,11 @@ export function createFlagProbe(deps: FlagProbeDeps): { probe(): Promise<ProbeRe
   };
 
   return {
+    /** Only the cheap version query (no `--help`, no mlx import); nothing is cached and it never throws. */
+    async installedVersion(): Promise<VersionResult> {
+      const read = await readVersion(probeEnv(deps.env ?? process.env));
+      return "reason" in read ? { ok: false, reason: reasonText(read.reason) } : { ok: true, version: read.version };
+    },
     async probe() {
       const env = probeEnv(deps.env ?? process.env);
       const read = await readVersion(env);
@@ -220,7 +228,13 @@ export function partitionFlags<T extends { flag: string; core: boolean }>(
   return { passed, skipped };
 }
 
-/** The one warning a launch shows for everything it skipped (D-19). */
-export function skippedNotice(flags: readonly string[], version: string): string {
-  return `Skipped ${flags.join(", ")}: not supported by mlx-lm ${version} (run /mlx-init to upgrade)`;
+/**
+ * The one warning a launch shows for everything it skipped (D-19). Under an exact pin, upgrading is not what the user
+ * should do, so the advice names the pin instead (D-08).
+ */
+export function skippedNotice(flags: readonly string[], version: string, pin?: { version: string; source?: string }): string {
+  const head = `Skipped ${flags.join(", ")}: not supported by mlx-lm ${version}`;
+  if (pin === undefined) return `${head} (run /mlx-init to upgrade)`;
+  const by = pin.source === undefined ? "" : ` by ${reasonText(pin.source)}`;
+  return `${head} (mlx-lm is pinned to ${reasonText(pin.version)}${by}; raise or remove the pin, then run /mlx-init)`;
 }
