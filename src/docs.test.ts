@@ -12,7 +12,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createExtension } from "./index.js";
@@ -112,44 +112,107 @@ interface SettingRow {
 
 /** The text from the line equal to `heading` up to the line before the next heading, or the end; throws when the heading is absent. */
 function sectionOf(markdown: string, heading: string): string {
-  void markdown;
-  void heading;
-  return "";
+  const lines = markdown.split("\n");
+  const start = lines.findIndex((line) => line.trimEnd() === heading);
+  if (start === -1) throw new Error(`no heading ${heading}`);
+  let fenced = false;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^\s*(```|~~~)/.test(lines[i])) fenced = !fenced;
+    else if (!fenced && lines[i].startsWith("#")) {
+      end = i;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
 }
+
+/** `token` as it is written in running text: between backticks. */
+const ticked = (token: string): string => "`" + token + "`";
+
+/** A table row whose first cell is a dotted setting key in backticks. */
+const SETTINGS_ROW = /^\| `([A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*)` \|/;
 
 /** One line per gap between the Settings table of the configuration reference and the SETTINGS rows. */
 function settingsProblems(rows: readonly SettingRow[], doc: string): string[] {
-  void rows;
-  void doc;
-  return [];
+  let section: string;
+  try {
+    section = sectionOf(doc, "## Settings");
+  } catch {
+    return ['docs/reference/configuration.md has no "## Settings" section'];
+  }
+  const tableRows = new Map<string, string>();
+  for (const line of section.split("\n")) {
+    const match = SETTINGS_ROW.exec(line);
+    if (match !== null) tableRows.set(match[1], line);
+  }
+  const problems: string[] = [];
+  const known = new Set<string>();
+  for (const row of rows) {
+    known.add(row.path);
+    const line = tableRows.get(row.path);
+    if (line === undefined) {
+      problems.push(`${row.path}: no row in the Settings table of docs/reference/configuration.md`);
+      continue;
+    }
+    // Backticked text, compared whole, so `--port` is not satisfied by `--mlx-port` or by a bare word.
+    const inRow: Array<[string, string | undefined]> = [
+      ["environment variable", row.env],
+      ["/mlx-start flag", row.cli],
+      ["pi flag", row.piFlag === undefined ? undefined : "--" + row.piFlag],
+    ];
+    for (const [what, token] of inRow) {
+      if (token !== undefined && !line.includes(ticked(token))) problems.push(`${row.path}: the ${what} ${ticked(token)} is not in its row`);
+    }
+    if (row.initCli !== undefined && !doc.includes(ticked(row.initCli))) {
+      problems.push(`${row.path}: the /mlx-init flag ${ticked(row.initCli)} is not named in docs/reference/configuration.md`);
+    }
+  }
+  for (const path of tableRows.keys()) {
+    if (!known.has(path)) problems.push(`${path}: the Settings table names a setting that does not exist`);
+  }
+  return problems;
 }
 
 /** The environment variable names a source text mentions, sorted and without duplicates. */
 function envNamesIn(text: string): string[] {
-  void text;
-  return [];
+  const names = text.match(/\b(?:PI_MLX_MODELS_[A-Z0-9_]+|HF_[A-Z0-9_]+|PI_CODING_AGENT_DIR)\b/g) ?? [];
+  return [...new Set(names)].sort();
 }
 
 /** One line per environment variable name that the document does not name in backticks. */
 function envProblems(names: readonly string[], doc: string): string[] {
-  void names;
-  void doc;
-  return [];
+  return names.filter((name) => !doc.includes(ticked(name))).map((name) => `${name}: not named in backticks in docs/reference/configuration.md`);
 }
 
 /** The bodies of the fenced json blocks of a markdown text, in order. */
 function jsonBlocksOf(markdown: string): string[] {
-  void markdown;
-  return [];
+  const blocks: string[] = [];
+  let body: string[] | undefined;
+  for (const line of markdown.split("\n")) {
+    if (body === undefined) {
+      if (line.trimEnd() === "```json") body = [];
+    } else if (line.startsWith("```")) {
+      blocks.push(body.join("\n"));
+      body = undefined;
+    } else body.push(line);
+  }
+  return blocks;
 }
 
 /** What the real settings reader says about a config file with this text: its errors and warnings, or why it could not be read. */
 function configProblems(jsonText: string): string[] {
-  void jsonText;
-  void readLayerFile;
-  void prepareSettings;
-  void writeFileSync;
-  return [];
+  const dir = mkdtempSync(join(tmpdir(), "docs-check-config-"));
+  try {
+    const path = join(dir, "config.json");
+    writeFileSync(path, jsonText);
+    const layer = readLayerFile(path);
+    if (layer.state !== "ok") return [layer.state === "absent" ? "the config file is absent" : `the config file ${layer.reason}`];
+    const result = prepareSettings({ global: layer, env: {} });
+    return result.ok ? result.warnings : [...result.errors, ...result.warnings];
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 const SETTINGS_DOC = [
