@@ -50,8 +50,8 @@ export const redactCredentials = (text: string): string => {
   return out.replace(EMBEDDED_USERINFO, "$1***@");
 };
 
-/** A model id or path that is written as a URL: an optional double quote, a scheme, then a slash. */
-const URL_LIKE = /^"?[A-Za-z][A-Za-z0-9+.-]*:[/\\]/;
+/** A model id or path that is written as a URL: an optional double quote, a scheme of two or more characters (so a drive letter such as `C:` is a path), then a slash. */
+const URL_LIKE = /^"?[A-Za-z][A-Za-z0-9+.-]+:[/\\]/;
 
 /**
  * `redactCredentials` for a model id or a path. An `@` is ordinary there (`org/model@rev`, `/Users/a@b/models/x`), so the

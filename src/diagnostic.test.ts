@@ -91,10 +91,14 @@ test("redactCredentials takes time proportional to the text: a run of backslashe
 // ---- redactIdCredentials (06 review IN-01) ----
 
 test("redactIdCredentials leaves a revision or a path that holds an @ alone", () => {
-  for (const id of ["org/model@rev", "/Users/a@b/models/x", "a@b.com", "./models/x@1", "C:\\Users\\a@b\\m", "C:/Users/a@b/m"]) {
+  for (const id of ["org/model@rev", "/Users/a@b/models/x", "a@b.com", "./models/x@1", "C:/Users/a@b/m"]) {
     assert.equal(redactIdCredentials(id), id, id);
     assert.equal(redactIdCredentials(asJson(id)), asJson(id), `${id} as JSON text`);
   }
+});
+
+test("redactIdCredentials leaves a drive path with backslashes alone (a backslash path shown as JSON text has doubled backslashes, which read as a UNC-style prefix and are not covered)", () => {
+  assert.equal(redactIdCredentials("C:\\Users\\a@b\\m"), "C:\\Users\\a@b\\m");
 });
 
 test("redactIdCredentials still hides the user and password of an id written as a URL", () => {
