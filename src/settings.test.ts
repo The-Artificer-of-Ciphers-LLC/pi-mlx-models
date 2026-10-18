@@ -888,6 +888,7 @@ test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order; only the
     { flag: "--allowed-origins", path: "server.allowedOrigins", takesValue: true },
     { flag: "--log-level", path: "server.logLevel", takesValue: true },
     { flag: "--trust-remote-code", path: "server.trustRemoteCode", takesValue: false },
+    { flag: "--decode-concurrency", path: "server.decodeConcurrency", takesValue: true },
     { flag: "--adapter-path", path: "model.adapterPath", takesValue: true },
     { flag: "--draft-model", path: "model.draftModel", takesValue: true },
     { flag: "--num-draft-tokens", path: "model.numDraftTokens", takesValue: true },
@@ -1596,9 +1597,10 @@ test("model options have no environment variable and no pi flag", () => {
   assert.deepEqual(extraOf({ env, piFlags: { "mlx-draft-model": "x" } }), []);
 });
 
-test("the six model rows come after server.trustRemoteCode, in the order of the flags", () => {
+test("the six model rows come after the server rows, in the order of the flags", () => {
   const paths = SETTINGS.map((row) => row.path);
-  assert.deepEqual(paths.slice(paths.indexOf("server.trustRemoteCode") + 1, paths.indexOf("server.trustRemoteCode") + 7), [
+  assert.ok(paths.indexOf("model.adapterPath") > paths.indexOf("server.trustRemoteCode"));
+  assert.deepEqual(paths.slice(paths.indexOf("model.adapterPath"), paths.indexOf("model.adapterPath") + 6), [
     "model.adapterPath",
     "model.draftModel",
     "model.numDraftTokens",

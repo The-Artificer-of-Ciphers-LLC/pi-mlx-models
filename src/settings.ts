@@ -213,9 +213,21 @@ function checkOneLineText(value: unknown): CheckResult {
   return trimmed && trimmed.length <= MAX_TEXT_LENGTH && !CONTROL_CHARACTER.test(trimmed) ? ok(trimmed) : bad;
 }
 
-function checkDraftTokens(value: unknown): CheckResult {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? ok(value) : bad;
-}
+/** A JSON number that is a safe integer of at least `min`: no text, no fraction, no coercion (D-07, D-17). */
+const checkIntegerAtLeast =
+  (min: number) =>
+  (value: unknown): CheckResult =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= min ? ok(value) : bad;
+
+/** Text that is digits only (after trimming), then the same check as a value read from a file. */
+const parseDigits =
+  (check: (value: unknown) => CheckResult) =>
+  (raw: string): CheckResult => {
+    const trimmed = raw.trim();
+    return /^\d+$/.test(trimmed) ? check(Number(trimmed)) : bad;
+  };
+
+const checkDraftTokens = checkIntegerAtLeast(1);
 
 /** The most the extension will place in one argv element for the template (T-02-21). */
 const MAX_TEMPLATE_BYTES = 64 * 1024;
@@ -304,6 +316,36 @@ const PHRASES = {
   notJson: (shown: string) => `${shown} contains a value that is not JSON`,
 };
 
+interface IntegerFlagOptions {
+  /** The smallest allowed value; the default is 1. */
+  min?: number;
+  /** The allowed values in words; the default is "an integer of at least {min}". */
+  expected?: string;
+  /** The problem line; the default is `PHRASES.integerAtLeast(min)`. */
+  problem?: (shown: string) => string;
+}
+
+/**
+ * One `server.{key}` row that is a plain integer passed through as `--flag=N`. The row carries no default, no
+ * environment variable and no pi flag (D-04), so a value equal to the server's own default is still emitted and
+ * shown (D-17), and it is the same on the file layers and on `/mlx-start` (D-14). The checks are sanity bounds only.
+ */
+function integerFlagRow(key: string, flag: string, options: IntegerFlagOptions = {}): SettingDef {
+  const min = options.min ?? 1;
+  const check = checkIntegerAtLeast(min);
+  return {
+    path: `server.${key}`,
+    kind: "integer",
+    expected: options.expected ?? `an integer of at least ${min}`,
+    check,
+    problem: options.problem ?? PHRASES.integerAtLeast(min),
+    parseText: parseDigits(check),
+    cli: flag,
+    mlxFlag: flag,
+    emit: valued(flag),
+  };
+}
+
 /** The schema, in the order flags are listed in the start message. */
 export const SETTINGS: readonly SettingDef[] = [
   {
@@ -378,6 +420,7 @@ export const SETTINGS: readonly SettingDef[] = [
     emit: (value) => (value === true ? ["--trust-remote-code"] : []),
     default: false,
   },
+  integerFlagRow("decodeConcurrency", "--decode-concurrency"),
   {
     path: "model.adapterPath",
     kind: "path",
@@ -409,10 +452,7 @@ export const SETTINGS: readonly SettingDef[] = [
     expected: "an integer of at least 1",
     check: checkDraftTokens,
     problem: PHRASES.integerAtLeast(1),
-    parseText: (raw) => {
-      const trimmed = raw.trim();
-      return /^\d+$/.test(trimmed) ? checkDraftTokens(Number(trimmed)) : bad;
-    },
+    parseText: parseDigits(checkDraftTokens),
     cli: "--num-draft-tokens",
     mlxFlag: "--num-draft-tokens",
     emit: valued("--num-draft-tokens"),
