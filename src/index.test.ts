@@ -3079,3 +3079,174 @@ test("the template arguments still reach the requests when the probe skips --cha
   assert.deepEqual(result.chat_template_kwargs, { enable_thinking: false });
   assert.equal("reasoning_effort" in result, false);
 });
+
+// ---- the rest of the launch record's life and the request: line in the start message (plan 04-03: D-12, D-13, A7, A8) ----
+
+const T02 = { model: { sampling: { temperature: 0.2 } } };
+const OTHER_PRESET = MODEL_PRESETS.find((p) => p.key !== "qwen3_4b")!;
+const hookReady = (h: Harness) => {
+  const hook = h.handlers.get("before_provider_request");
+  assert.ok(hook, "the extension registers a before_provider_request handler");
+  return (modelId: string = QWEN.modelId) =>
+    hook({ payload: { model: modelId, messages: [{ role: "user", content: "hi" }], temperature: 0.9 } }, { model: { provider: PROVIDER_ID, id: modelId } }) as
+      | Record<string, unknown>
+      | undefined;
+};
+
+test("when the server process exits the hook stops applying the launch's values (assumption A7)", async () => {
+  let emit: ((event: ServerEvent) => void) | undefined;
+  const settings = freshSettings({});
+  writeGlobal(settings, T02);
+  const h = await setup({
+    settings,
+    server: {
+      start: async (_model, onEvent) => {
+        emit = onEvent;
+        onEvent?.({ type: "ready" });
+      },
+    },
+  });
+  await startMlx(h, "qwen3_4b");
+  const call = hookReady(h);
+  assert.equal(call()?.temperature, 0.2, "premise: the values apply while the launch lives");
+
+  emit?.({ type: "exited" });
+
+  assert.equal(call(), undefined);
+});
+
+test("a start stopped before server.start resolves never installs a launch record", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const settings = freshSettings({});
+  writeGlobal(settings, T02);
+  const h = await setup({
+    settings,
+    server: {
+      start: async () => {
+        calls += 1;
+        await gate.promise;
+      },
+    },
+  });
+
+  const starting = startMlx(h, "qwen3_4b");
+  await flush();
+  assert.equal(calls, 1, "premise: server.start is in flight");
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  gate.resolve();
+  await starting;
+
+  assert.equal(hookReady(h)(), undefined);
+});
+
+test("a superseded start cannot replace the newer start's launch record", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const settings = freshSettings({});
+  writeGlobal(settings, T02);
+  const h = await setup({
+    settings,
+    server: {
+      start: async () => {
+        calls += 1;
+        if (calls === 1) await gate.promise;
+      },
+    },
+  });
+
+  const first = startMlx(h, "qwen3_4b");
+  await flush();
+  assert.equal(calls, 1, "premise: the first server.start is in flight");
+  writeGlobal(settings, { model: { sampling: { temperature: 0.5 } } });
+  await startMlx(h, "qwen3_4b");
+  gate.resolve();
+  await first;
+
+  assert.equal(hookReady(h)()?.temperature, 0.5);
+});
+
+test("a second /mlx-start of another model moves the values to that model (D-13 across launches)", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, T02);
+  const h = await setup({ settings });
+  await startMlx(h, "qwen3_4b");
+  await startMlx(h, OTHER_PRESET.key);
+  const call = hookReady(h);
+
+  assert.equal(call(QWEN.modelId), undefined);
+  assert.equal(call(OTHER_PRESET.modelId)?.temperature, 0.2);
+});
+
+test("a second start whose server.start rejects leaves no record for the first model", async () => {
+  let calls = 0;
+  const settings = freshSettings({});
+  writeGlobal(settings, T02);
+  const h = await setup({
+    settings,
+    server: {
+      start: async (_model, onEvent) => {
+        calls += 1;
+        if (calls === 2) throw new Error("boom");
+        onEvent?.({ type: "ready" });
+      },
+    },
+  });
+  await startMlx(h, "qwen3_4b");
+  assert.equal(hookReady(h)()?.temperature, 0.2, "premise: the first launch applies");
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(errors(h.notes).length, 1, errors(h.notes).join("|"));
+  assert.equal(hookReady(h)(), undefined);
+});
+
+test("editing the config between two starts: the second launch's values apply", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, T02);
+  const h = await setup({ settings });
+  await startMlx(h, "qwen3_4b");
+  assert.equal(hookReady(h)()?.temperature, 0.2);
+
+  writeGlobal(settings, { model: { sampling: { temperature: 0.5 } } });
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(hookReady(h)()?.temperature, 0.5);
+});
+
+test("the start message lists the values that have no server flag on a request: line after the flags line", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { model: { sampling: { repetitionPenalty: 1.1, stop: ["END"], seed: 7, temperature: 0.2 } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(startingNotes(h.notes).length, 1);
+  assert.equal(
+    startingNotes(h.notes)[0],
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --temp 0.2 (global file)\nrequest: repetition_penalty 1.1 (global file), stop ["END"] (global file), seed 7 (global file)`,
+  );
+});
+
+test("with only a request-only value there is no flags line and the request: line is the second line", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { model: { sampling: { repetitionPenalty: 1.1 } } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(
+    startingNotes(h.notes)[0],
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nrequest: repetition_penalty 1.1 (global file)`,
+  );
+});
+
+test("a launch with only server-capable sampling values has no request: line and reads as before", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, T02);
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(startingNotes(h.notes)[0], `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --temp 0.2 (global file)`);
+});

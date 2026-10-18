@@ -10,6 +10,7 @@ import {
   buildLaunch,
   cliFlagSpecs,
   describeFlags,
+  describeRequest,
   formatConfigErrors,
   formatProjectRefusal,
   initFlagSpecs,
@@ -3328,4 +3329,39 @@ test("request.chatTemplateArgs does not depend on the server flag: a skipped --c
   assert.deepEqual(toLaunchSpec(launch).extraArgs, ['--chat-template-args={"enable_thinking":false}']);
   assert.deepEqual(toLaunchSpec(launch, new Set(["--chat-template-args"])).extraArgs, []);
   assert.deepEqual(launch.request.chatTemplateArgs, { enable_thinking: false });
+});
+
+// ---- the request: line of the start message (plan 04-03, assumption A8) ----
+
+test("describeRequest lists the three request-only keys with their layer, in schema order", () => {
+  const launch = launchOf({ global: ok({ model: { sampling: { seed: 7, stop: ["END"], repetitionPenalty: 1.1 } } }) });
+  assert.equal(describeRequest(launch), 'request: repetition_penalty 1.1 (global file), stop ["END"] (global file), seed 7 (global file)');
+  assert.deepEqual(
+    launch.requestNotes.map((note) => note.field),
+    ["repetition_penalty", "stop", "seed"],
+  );
+});
+
+test("describeRequest is empty when the sampling holds only server-capable keys", () => {
+  const launch = launchOf({ global: ok({ model: { sampling: { temperature: 0.2, topP: 0.9, topK: 40, minP: 0.05, maxTokens: 2048 } } }) });
+  assert.equal(describeRequest(launch), "");
+  assert.deepEqual(launch.requestNotes, []);
+  assert.equal(describeRequest(launchOf({})), "");
+});
+
+test("describeRequest labels each key with the layer it came from", () => {
+  const launch = launchOf({
+    global: ok({ model: { sampling: { stop: ["END"] } } }),
+    project: ok({ model: { sampling: { seed: 7 } } }),
+  });
+  assert.equal(describeRequest(launch), 'request: stop ["END"] (global file), seed 7 (project file)');
+});
+
+test("describeRequest shows a hostile stop string cleaned and clipped, never raw", () => {
+  const stop = `\u001b[31m${"x".repeat(200)}\u0007end`;
+  const text = describeRequest(launchOf({ global: ok({ model: { sampling: { stop } } }) }));
+  assert.ok(text.startsWith("request: stop "), text);
+  assert.ok(!/[\u0000-\u001f\u007f]/.test(text), JSON.stringify(text));
+  assert.ok(text.length < 120, `${text.length} characters`);
+  assert.ok(!text.includes("end"), "the clip drops the tail");
 });

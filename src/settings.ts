@@ -1419,6 +1419,13 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
   };
 }
 
+/** A sampling value that has no server flag and so travels in the request only: its OpenAI field name, how it is shown, and its layer. */
+export interface RequestNote {
+  field: string;
+  display: string;
+  label: string;
+}
+
 export interface ResolvedLaunch {
   model: { modelId: string; presetKey?: string };
   address: ServerAddress;
@@ -1426,6 +1433,8 @@ export interface ResolvedLaunch {
   flags: LaunchFlag[];
   /** What the request hook writes into this model's requests; independent of the flags, so a skipped flag still reaches them (D-15). */
   request: RequestOverrides;
+  /** The request-only sampling values with their layer, in schema order, for the `request:` line of the start message. */
+  requestNotes: RequestNote[];
 }
 
 export type BuildResult = { ok: true; launch: ResolvedLaunch } | { ok: false; errors: string[] };
@@ -1581,7 +1590,7 @@ export function buildLaunch(prepared: Prepared, model: { modelId: string; preset
   }
   return {
     ok: true,
-    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: [...prepared.flags, ...modelFlags], request },
+    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: [...prepared.flags, ...modelFlags], request, requestNotes: [] },
   };
 }
 
@@ -1607,6 +1616,11 @@ export function describeFlags(launch: ResolvedLaunch, skipped?: ReadonlySet<stri
     (flag) => `${flag.flag}${flag.display ? ` ${flag.display}` : ""} (${flag.label}${!flag.core && skipped?.has(flag.flag) ? ", skipped" : ""})`,
   );
   return `flags: ${parts.join(", ")}`;
+}
+
+/** The `request: ...` line of the start message, or "" when no value is request-only. */
+export function describeRequest(_launch: ResolvedLaunch): string {
+  return "";
 }
 
 /** What a launch with KV cache quantization has to tell the user (D-09, D-10, D-12). */
