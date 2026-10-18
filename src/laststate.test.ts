@@ -100,7 +100,7 @@ test("lastLaunch unreadable, shape: empty, blank, not JSON and not an object rea
 
 test("lastLaunch unreadable, size: a file larger than the cap is refused", (t) => {
   const dir = tempDir(t);
-  const padding = " ".repeat(MAX_LAST_LAUNCH_BYTES + 1 - Buffer.byteLength(record()));
+  const padding = " ".repeat(MAX_LAST_LAUNCH_BYTES + 2 - Buffer.byteLength(record()));
   const text = record().trimEnd() + padding;
   assert.equal(Buffer.byteLength(text), MAX_LAST_LAUNCH_BYTES + 1);
   assertUnreadable(readRaw(dir, text), "is larger than 8 KiB", "one byte over the cap");
@@ -119,8 +119,11 @@ test("lastLaunch unreadable, permission: a file that cannot be read says so with
   const path = join(dir, LAST_LAUNCH_FILE);
   writeFileSync(path, record());
   chmodSync(path, 0o000);
-  t.after(() => chmodSync(path, 0o600));
-  assertUnreadable(readLastLaunch(path), /^cannot be read \(EACCES\)$/, "a file with no read permission");
+  try {
+    assertUnreadable(readLastLaunch(path), /^cannot be read \(EACCES\)$/, "a file with no read permission");
+  } finally {
+    chmodSync(path, 0o600);
+  }
 });
 
 test("lastLaunch unreadable, version: only the number 1 is a known format version", (t) => {
