@@ -1,4 +1,4 @@
-import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import { cleanLabel, clipDiagnostic, redactIdCredentials } from "./diagnostic.js";
 import { probeModels, type ModelsProbe } from "./discovery.js";
 import { connectProbe, probeAddress } from "./port.js";
 import type { ServerAddress } from "./server.js";
@@ -80,7 +80,7 @@ const MAX_SERVED_IDS = 10;
 const ID_LIMIT = 80;
 
 /** Text from a server or a file, made safe to show: control characters out, credentials hidden, then clipped (the clip is last). */
-const shown = (text: string): string => clipDiagnostic(redactCredentials(cleanLabel(text)), ID_LIMIT, "start");
+const shown = (text: string): string => clipDiagnostic(redactIdCredentials(cleanLabel(text)), ID_LIMIT, "start");
 
 const hostPort = (address: ServerAddress): string =>
   `${address.host.includes(":") ? `[${address.host}]` : address.host}:${address.port}`;

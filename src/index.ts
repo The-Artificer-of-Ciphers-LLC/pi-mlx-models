@@ -13,7 +13,7 @@ import {
   deriveBaseUrl,
 } from "./config.js";
 import { runConfigMenu } from "./configmenu.js";
-import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import { cleanLabel, clipDiagnostic, redactCredentials, redactIdCredentials } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
@@ -143,11 +143,11 @@ const BAD_SHAPE_NOTICE =
  * payload is ever added to it.
  */
 const modelMismatchNotice = (launchedId: string): string =>
-  `pi-mlx-models: a request to the MLX server named a different model than the one launched (${clipDiagnostic(redactCredentials(cleanLabel(launchedId)), 80, "start")}), so the profile and sampling settings were not applied to it. Shown once per session.`;
+  `pi-mlx-models: a request to the MLX server named a different model than the one launched (${clipDiagnostic(redactIdCredentials(cleanLabel(launchedId)), 80, "start")}), so the profile and sampling settings were not applied to it. Shown once per session.`;
 
 /** The ready message when the started model could not be selected for the user: the user picks it themselves. */
 const READY_HINT = "MLX server is ready for prompts. Use /model and pick pi-mlx-models/...";
-const shownModelId = (model: string): string => clipDiagnostic(redactCredentials(cleanLabel(model)), 80, "start");
+const shownModelId = (model: string): string => clipDiagnostic(redactIdCredentials(cleanLabel(model)), 80, "start");
 /** The ready message after pi switched to the started model. The id came from user input or a project file, so it is cleaned. */
 const readySelectedNotice = (model: string): string =>
   `MLX server is ready for prompts. ${PROVIDER_ID}/${shownModelId(model)} is now the selected model.`;

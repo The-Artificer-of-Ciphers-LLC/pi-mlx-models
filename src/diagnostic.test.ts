@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import { cleanLabel, clipDiagnostic, redactCredentials, redactIdCredentials } from "./diagnostic.js";
 
 const CONTROL_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/;
 
@@ -85,5 +85,28 @@ test("redactCredentials takes time proportional to the text: a run of backslashe
   const started = Date.now();
   redactCredentials('{"url":"' + "//".repeat(150000) + '"}');
   redactCredentials("\\".repeat(150000));
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+});
+
+// ---- redactIdCredentials (06 review IN-01) ----
+
+test("redactIdCredentials leaves a revision or a path that holds an @ alone", () => {
+  for (const id of ["org/model@rev", "/Users/a@b/models/x", "a@b.com", "./models/x@1"]) {
+    assert.equal(redactIdCredentials(id), id, id);
+    assert.equal(redactIdCredentials(asJson(id)), asJson(id), `${id} as JSON text`);
+  }
+});
+
+test("redactIdCredentials still hides the user and password of an id written as a URL", () => {
+  assert.equal(redactIdCredentials("https://bob:s3cr3t@host/org/model"), "https://***@host/org/model");
+  assert.equal(redactIdCredentials("https://bob:pa/ss@host/org/model"), "https://***@host/org/model");
+  assert.equal(redactIdCredentials(asJson("https://bob:s3cr3t@host/x")), asJson("https://***@host/x"));
+  assert.equal(redactIdCredentials("hf://bob:s3cr3t@host/x"), "hf://***@host/x");
+  assert.equal(redactIdCredentials("/models/https://u:p@h/x"), "/models/https://***@h/x");
+});
+
+test("redactIdCredentials takes time proportional to the text (T-03-23)", () => {
+  const started = Date.now();
+  for (const text of ["/".repeat(300000), "/".repeat(300000) + "@", "\\".repeat(150000), "a:" + "/".repeat(300000)]) redactIdCredentials(text);
   assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
 });

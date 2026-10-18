@@ -49,3 +49,13 @@ export const redactCredentials = (text: string): string => {
   }
   return out.replace(EMBEDDED_USERINFO, "$1***@");
 };
+
+/** A model id or path that is written as a URL: an optional double quote, a scheme, then a slash. */
+const URL_LIKE = /^"?[A-Za-z][A-Za-z0-9+.-]*:[/\\]/;
+
+/**
+ * `redactCredentials` for a model id or a path. An `@` is ordinary there (`org/model@rev`, `/Users/a@b/models/x`), so the
+ * positional rule applies only to a value written as a URL (a scheme followed by a slash); any other value gets only the
+ * embedded-URL rule. The cost stays linear in the length of the text.
+ */
+export const redactIdCredentials = (text: string): string => (URL_LIKE.test(text) ? redactCredentials(text) : text.replace(EMBEDDED_USERINFO, "$1***@"));
