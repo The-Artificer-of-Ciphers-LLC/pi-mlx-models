@@ -1003,8 +1003,35 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           ctx.ui.notify(failed("mlx-restart", parsed.error), "error");
           return;
         }
+        // The model and the selection to keep: the launch of this session when there is one, else the remembered last launch
+        // (D-16). The record is read before any configuration, as /mlx-last does, so a user with nothing to restart hears that first.
+        let model: string;
+        let kept: string | undefined;
+        let fromLast = false;
         const running = launchRecord;
-        if (running === null) return;
+        if (running !== null) {
+          model = running.modelId;
+          kept = running.profile;
+        } else {
+          const record = readLastLaunch(statePath());
+          if (record.state === "absent") {
+            ctx.ui.notify("mlx-restart: nothing is running and nothing is remembered. Run /mlx-start to pick a model.", "info");
+            return;
+          }
+          if (record.state === "unreadable") {
+            ctx.ui.notify(
+              failed(
+                "mlx-restart",
+                `the remembered launch file ${record.reason}; treating it as nothing remembered. Run /mlx-start to choose a model; a successful start replaces the file.`,
+              ),
+              "error",
+            );
+            return;
+          }
+          model = record.value.model;
+          kept = record.value.profile ?? undefined;
+          fromLast = true;
+        }
         // Everything is validated and confirmed before the server is touched, and this handler never stops it: the server's
         // own start stops the previous process and waits for its port, so a refused restart leaves the running server alone.
         const settings = readLaunchSettings(pi, ctx, "mlx-restart", parsed.flags);
@@ -1012,12 +1039,15 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         const { prepared, profile: typedProfile } = settings;
         // The selection handed to the earlier launch is kept: a name stays a name, and no selection lets defaultProfile decide
         // again. Flags are never kept; only the ones typed here apply (D-13, D-14).
-        const profile = typedProfile ?? running.profile;
+        const profile = typedProfile ?? kept;
         const run: LaunchRun = {
           command: "mlx-restart",
           ...(profile === undefined ? {} : { profile, profileOrigin: typedProfile !== undefined ? "typed" : "kept" }),
         };
-        await startModelFromInput(pi, ctx, running.modelId, prepared, run);
+        // Said after the configuration validated and before the start, so an invalid file is reported first and a declined
+        // confirmation after the note says what was about to start.
+        if (fromLast) ctx.ui.notify(`mlx-restart: nothing was running, starting ${shownModelId(model)} from the last launch.`, "info");
+        await startModelFromInput(pi, ctx, model, prepared, run);
       },
     });
 
