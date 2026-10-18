@@ -39,7 +39,7 @@ Add a `profiles` object to the `models` entry of the model, keyed by a preset ke
 }
 ```
 
-A profile holds the same per-model keys as the `model` block, plus `sampling`. It does not hold `server` keys such as `port`.
+A profile holds the same per-model keys as the `model` block, plus `sampling` and `limits`. It does not hold `server` keys such as `port`. The `limits` object corrects what pi is told about the model (context window, output limit, thinking flag, image input); see [How to set a model's context window, thinking flag and output limit](set-model-limits.md).
 
 ## Start a model with a profile
 
