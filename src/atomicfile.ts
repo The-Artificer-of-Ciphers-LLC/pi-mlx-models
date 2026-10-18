@@ -1,5 +1,5 @@
-import { closeSync, fchmodSync, fsyncSync, mkdirSync, openSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { closeSync, fchmodSync, fsyncSync, mkdirSync, openSync, readlinkSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 
 /**
@@ -35,15 +35,31 @@ function reasonOf(error: unknown): string {
   return clean === "" ? "write failed" : clean;
 }
 
-/** The file the write really replaces: with `followSymlink` the file behind a link, else the path as given. */
+/** The most links one path may pass through before it is taken for a loop. */
+const MAX_LINK_HOPS = 40;
+
+/**
+ * The file the write really replaces: with `followSymlink` the file behind a link, else the path as given. A link whose
+ * target does not exist yet is followed by hand, so the file is created where the link points and the link stays a link.
+ * A loop of links throws ELOOP, which the caller reports as a failed write.
+ */
 function resolveTarget(path: string, followSymlink: boolean): string {
   if (!followSymlink) return path;
-  try {
-    return realpathSync(path);
-  } catch {
-    // A path that does not exist yet (or a link to nothing) is written as given.
-    return path;
+  let current = path;
+  for (let hops = 0; hops < MAX_LINK_HOPS; hops += 1) {
+    try {
+      return realpathSync(current);
+    } catch {
+      // Not resolvable as it stands: a path that does not exist yet, or a link to nothing.
+    }
+    try {
+      current = resolve(dirname(current), readlinkSync(current));
+    } catch {
+      // Not a link (or not readable as one): written as given.
+      return current;
+    }
   }
+  throw Object.assign(new Error("too many levels of symbolic links"), { code: "ELOOP" });
 }
 
 /** The permission bits of an existing regular file, else undefined. */
