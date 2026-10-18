@@ -64,6 +64,60 @@ test("no compatible python is a clear error", async () => {
   await assert.rejects(ensureInstalled({ host }), /Python 3\.11\+ is required/);
 });
 
+// ---- the install policy (plan 03-03, RUN-02) ----
+
+const PIP_INDEX = "--index-url=https://pypi.org/simple/";
+/** The pip install calls, in order. */
+const pipInstalls = (calls: string[][]) => calls.filter((call) => call.includes("pip") && call.includes("install"));
+const mlxLmStep = (calls: string[][]) => pipInstalls(calls)[1];
+
+test("a policy that is omitted floats on the default index", async () => {
+  const { host, calls } = fakeHost({ venv: true });
+  await ensureInstalled({ host, upgrade: true });
+  assert.deepEqual(mlxLmStep(calls), [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "mlx-lm>=0.24.0", PIP_INDEX]);
+});
+
+test("the policy latest is the same as no policy", async () => {
+  const { host, calls } = fakeHost({ venv: true });
+  await ensureInstalled({ host, upgrade: true, policy: { version: "latest" } });
+  assert.deepEqual(mlxLmStep(calls), [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "mlx-lm>=0.24.0", PIP_INDEX]);
+});
+
+test("an exact pin gives the single spec mlx-lm==X and no lower bound", async () => {
+  const { host, calls } = fakeHost({ venv: true });
+  await ensureInstalled({ host, upgrade: true, policy: { version: "0.31.1" } });
+  assert.deepEqual(mlxLmStep(calls), [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "mlx-lm==0.31.1", PIP_INDEX]);
+  assert.ok(!mlxLmStep(calls).some((arg) => arg.includes(">=")));
+});
+
+test("a pin below the installed version is not special-cased: the step keeps --upgrade and never forces a reinstall", async () => {
+  const { host, calls } = fakeHost({ venv: true });
+  await ensureInstalled({ host, upgrade: true, policy: { version: "0.30.7" } });
+  assert.equal(calls.length, 3, "the venv version probe plus the two pip steps, nothing that looks up the installed version");
+  assert.ok(mlxLmStep(calls).includes("--upgrade"));
+  assert.ok(!calls.flat().includes("--force-reinstall"));
+});
+
+test("the index is ONE argv element --index-url=VALUE in both pip steps", async () => {
+  const { host, calls } = fakeHost({ venv: true });
+  await ensureInstalled({ host, upgrade: true, policy: { version: "0.31.1" } });
+  for (const step of pipInstalls(calls)) {
+    assert.equal(step.filter((arg) => arg.startsWith("--index-url")).length, 1);
+    assert.ok(step.includes(PIP_INDEX));
+    assert.ok(!step.includes("--index-url"), "never the two-element spelling");
+  }
+  const custom = fakeHost({ venv: true });
+  await ensureInstalled({ host: custom.host, upgrade: true, policy: { version: "latest", pipIndex: "https://mirror.test/simple/" } });
+  for (const step of pipInstalls(custom.calls)) assert.ok(step.includes("--index-url=https://mirror.test/simple/"));
+});
+
+test("a first install with a pin also uses the pinned spec", async () => {
+  const { host, calls } = fakeHost();
+  await ensureInstalled({ host, policy: { version: "0.31.1" } });
+  assert.deepEqual(calls[0].slice(0, 3), ["/py3", "-m", "venv"]);
+  assert.deepEqual(mlxLmStep(calls), [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "mlx-lm==0.31.1", PIP_INDEX]);
+});
+
 /** A temp directory removed when the test ends. */
 async function tempDir(t: TestContext): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "pi-mlx-py-"));

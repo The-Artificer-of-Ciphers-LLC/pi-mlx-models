@@ -12,6 +12,7 @@ import {
   describeFlags,
   formatConfigErrors,
   formatProjectRefusal,
+  initFlagSpecs,
   kvNotices,
   prepareSettings,
   readLayerFile,
@@ -2539,4 +2540,108 @@ test("kvNotices: when kvBits is skipped by the probe neither notice is given, be
   const launch = launchOf({ global: ok({ server: { kvBits: 4, kvGroupSize: 32 } }) });
   assert.deepEqual(kvNotices(launch, new Set(["--kv-bits", "--kv-group-size"])), {});
   assert.deepEqual(kvNotices(launch, new Set(["--kv-bits"])), {});
+});
+
+// ---- mlx-lm version policy (RUN-02) ----
+
+const PIN_EXPECTED = 'must be "latest" or an exact version such as 0.32.2';
+const pinLine = (shown: string, label = "global config.json") => `mlxLm.version (${label}): ${shown} ${PIN_EXPECTED}`;
+
+for (const version of ["latest", "0.32.2", "0.31.1", "0.32", "1.0", "0.33.0rc1", "0.32.2.post1", "0.33.0.dev1"]) {
+  test(`mlxLm.version ${JSON.stringify(version)} is accepted in a global file`, () => {
+    const { prepared, warnings } = resolved({ global: ok({ mlxLm: { version } }) });
+    assert.equal(prepared.install.version, version);
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(prepared.flags, [], "the version is not a server flag");
+  });
+}
+
+const BAD_PINS: unknown[] = [
+  0.32,
+  "^0.32",
+  ">=1",
+  "~=0.32",
+  "0.32.*",
+  "==0.32.2",
+  "1!2",
+  "abc",
+  "-",
+  "",
+  " ",
+  "https://example.test/mlx_lm.whl",
+  "git+https://example.test/x",
+  "--upgrade",
+  "0.32.2 --upgrade",
+  "Latest",
+  "0.32 ",
+  "latest ",
+];
+for (const version of BAD_PINS) {
+  test(`mlxLm.version ${JSON.stringify(version)} is refused naming the allowed values`, () => {
+    assert.deepEqual(refused({ global: ok({ mlxLm: { version } }) }), [pinLine(JSON.stringify(version))]);
+  });
+}
+
+test("mlxLm.version typed with surrounding spaces on /mlx-init is trimmed and accepted", () => {
+  const { prepared } = resolved({ args: { "mlxLm.version": " 0.31.1 " } });
+  assert.equal(prepared.install.version, "0.31.1");
+});
+
+test("PI_MLX_MODELS_MLX_LM_VERSION is used and its source is the variable", () => {
+  const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_MLX_LM_VERSION: "0.31.1" } });
+  assert.equal(prepared.install.version, "0.31.1");
+  assert.equal(prepared.install.versionSource, "env PI_MLX_MODELS_MLX_LM_VERSION");
+  assert.deepEqual(warnings, []);
+});
+
+test("an invalid PI_MLX_MODELS_MLX_LM_VERSION is ignored with a warning and the next layer down is used", () => {
+  const { prepared, warnings } = resolved({
+    global: ok({ mlxLm: { version: "0.30.7" } }),
+    env: { PI_MLX_MODELS_MLX_LM_VERSION: "^0.32" },
+  });
+  assert.equal(prepared.install.version, "0.30.7");
+  assert.equal(prepared.install.versionSource, "global file");
+  assert.deepEqual(warnings, ['PI_MLX_MODELS_MLX_LM_VERSION="^0.32" is not the word "latest" or an exact version such as 0.32.2; ignoring it.']);
+});
+
+test("a blank PI_MLX_MODELS_MLX_LM_VERSION counts as unset", () => {
+  for (const raw of ["", "   "]) {
+    const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_MLX_LM_VERSION: raw } });
+    assert.equal(prepared.install.version, "latest", JSON.stringify(raw));
+    assert.equal(prepared.install.versionSource, undefined);
+    assert.deepEqual(warnings, []);
+  }
+});
+
+test("mlxLm.version: /mlx-init beats the environment, which beats the project file, which beats the global file", () => {
+  const global = ok({ mlxLm: { version: "0.30.1" } });
+  const project = ok({ mlxLm: { version: "0.30.2" } });
+  const env = { PI_MLX_MODELS_MLX_LM_VERSION: "0.30.3" };
+  const args = { "mlxLm.version": "0.30.4" };
+  const at = (input: Partial<PrepareInput>) => {
+    const { install } = resolved(input).prepared;
+    return [install.version, install.versionSource];
+  };
+  assert.deepEqual(at({ global }), ["0.30.1", "global file"]);
+  assert.deepEqual(at({ global, project }), ["0.30.2", "project file"]);
+  assert.deepEqual(at({ global, project, env }), ["0.30.3", "env PI_MLX_MODELS_MLX_LM_VERSION"]);
+  assert.deepEqual(at({ global, project, env, args }), ["0.30.4", "/mlx-init"]);
+});
+
+test("the project file may set mlxLm.version: it is not a project violation", () => {
+  const { prepared } = resolved({ project: ok({ mlxLm: { version: "0.31.1" } }) });
+  assert.deepEqual(prepared.projectViolations, []);
+  assert.equal(prepared.install.version, "0.31.1");
+  assert.equal(prepared.install.versionSource, "project file");
+});
+
+test("initFlagSpecs lists only --mlx-lm-version and /mlx-start has no such flag", () => {
+  assert.deepEqual(initFlagSpecs(), [{ flag: "--mlx-lm-version", path: "mlxLm.version", takesValue: true }]);
+  assert.ok(!cliFlagSpecs().some((spec) => spec.flag === "--mlx-lm-version"));
+});
+
+test("a typed mlxLm.version is labelled with the /mlx-init spelling, failing or not", () => {
+  assert.deepEqual(refused({ args: { "mlxLm.version": "^0.32" } }), [pinLine('"^0.32"', "/mlx-init --mlx-lm-version")]);
+  const { prepared } = resolved({ args: { "mlxLm.version": "0.31.1" } });
+  assert.equal(prepared.install.versionSource, "/mlx-init");
 });
