@@ -4022,3 +4022,18 @@ test("a typed profile name of 200 characters is shown clipped", () => {
   assert.ok(!line.includes("z"), "the tail is dropped");
   assert.ok(line.length < 200, `${line.length} characters`);
 });
+
+// ---- the provider.listAllModels row (MOD-04) ----
+
+test("provider.listAllModels is false with no provider block and true when the global file sets it", () => {
+  assert.equal(resolved().prepared.listAllModels, false);
+  assert.equal(resolved({ global: ok({ provider: { listAllModels: false } }) }).prepared.listAllModels, false);
+  assert.equal(resolved({ global: ok({ provider: { listAllModels: true } }) }).prepared.listAllModels, true);
+});
+
+test("provider.listAllModels: the project file beats the global file in both directions", () => {
+  const globalTrue = ok({ provider: { listAllModels: true } });
+  const globalFalse = ok({ provider: { listAllModels: false } });
+  assert.equal(resolved({ global: globalTrue, project: ok({ provider: { listAllModels: false } }) }).prepared.listAllModels, false);
+  assert.equal(resolved({ global: globalFalse, project: ok({ provider: { listAllModels: true } }) }).prepared.listAllModels, true);
+});

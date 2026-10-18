@@ -3465,3 +3465,26 @@ test("a hostile profile name is shown without control characters", async () => {
   assert.ok(!/[\u0000-\u0009\u000b-\u001f\u007f]/.test(message), JSON.stringify(message));
   assertNothingHappened(h);
 });
+
+// ---- which models the provider lists (MOD-04) ----
+
+test("by default a start registers only the launched model although the server reports others", async () => {
+  const { commands, ctx, providerCalls } = await setup({ discovered: [MODEL_PRESETS[3].modelId, "org/a", "org/b"] });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(modelIdsOf(providerCalls.at(-1)), [MODEL_PRESETS[3].modelId]);
+});
+
+test("with provider.listAllModels true in the global file a start registers every model the server reports, in order", async () => {
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, '{"provider":{"listAllModels":true}}');
+  const { commands, ctx, providerCalls } = await setup({
+    settings,
+    discovered: [MODEL_PRESETS[3].modelId, "org/a", "org/b"],
+  });
+
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
+
+  assert.deepEqual(modelIdsOf(providerCalls.at(-1)), [MODEL_PRESETS[3].modelId, "org/a", "org/b"]);
+});

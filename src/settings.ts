@@ -1092,6 +1092,8 @@ export interface Prepared {
   modelSettings: ModelSettings;
   /** What /mlx-init installs: the version policy and the package index, with the layer each came from (D-04, D-07). */
   install: InstallSettings;
+  /** Whether the provider lists every model the server reports (`provider.listAllModels`); false lists only the launched one (D-12). */
+  listAllModels: boolean;
 }
 
 /** The install policy of one resolved configuration. A source is a layer label, and absent when the value is the default. */
@@ -1522,6 +1524,7 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
         ...(sources.has("mlxLm.version") ? { versionSource: sources.get("mlxLm.version")!.label } : {}),
         ...(sources.has("mlxLm.pipIndex") ? { pipIndexSource: sources.get("mlxLm.pipIndex")!.label } : {}),
       },
+      listAllModels: false,
       modelSettings: {
         layers: (["global", "project"] as const).map((layer) => ({
           layer,
