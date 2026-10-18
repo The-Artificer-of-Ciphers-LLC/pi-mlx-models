@@ -170,6 +170,7 @@ Opens a menu in pi to view and edit the global configuration file, without leavi
 | Edit options of one model | The keys of one `models` entry, chosen from the entries in the file or added by name. |
 | Add, edit or delete a profile | Adds a profile to a model, edits one key of a profile, or deletes a profile. |
 | Choose a model's default profile | Sets or clears `defaultProfile` for a model. |
+| Delete a model entry | Removes one `models` entry with its options, its profiles and its `defaultProfile`, after a confirmation that lists what is lost. An entry left empty by deleting its last profile is removed this way. |
 | Done | Leaves the menu. |
 
 After each action the menu returns to the top. Every setting in the [settings table](configuration.md#settings) can be set or removed in the place where the file accepts it. The `limits` keys are offered inside a profile only. A profile is renamed by adding the new name and deleting the old one.
@@ -178,7 +179,7 @@ After each action the menu returns to the top. Every setting in the [settings ta
 - **Validation.** Each edit reads the file, changes one key, checks the whole file with the checks a hand-edited file gets, and writes it in one atomic step. An edit that would make the file invalid, or larger than 256 KiB, is refused, and the problem lines are shown. A problem that was already in the file also refuses the edit. A model key typed by hand for a new entry is also checked for a way to match a start: a preset key, a key with a slash such as `org/name`, and a local path (absolute, or starting with `./` or `../`) are added without a question, and any other key, for example a profile name typed where the model key belongs, asks "Add anyway?" because no start would ever use it. A no, a dismissed dialog and a dialog that fails each add nothing, and keys already in the file are not asked about.
 - **A file that cannot be read.** A file that is not valid JSON or cannot be read is never overwritten. The command says so and stops.
 - **Global file only.** The global file is the only file it writes. Project files stay hand-edited. The first edit creates the global file and its directory when they do not exist.
-- **Deleting a profile** asks for confirmation. When the profile is the model's `defaultProfile`, that key is cleared in the same write.
+- **Deleting** asks for confirmation. Deleting a profile asks first, and when the profile is the model's `defaultProfile`, that key is cleared in the same write. Deleting a model entry asks too, and the question lists the profiles, options and `defaultProfile` that go with it. A dismissed or failed dialog counts as no for both, and nothing is deleted.
 - **After an edit** the notice names the key and says the change takes effect on the next `/mlx-start`. When a server of this session is running, it adds that [`/mlx-restart`](#mlx-restart) applies the change. Nothing is restarted automatically.
 - **Without an interactive UI** the command prints the file and says it is a read-only view. It refuses to edit.
 
