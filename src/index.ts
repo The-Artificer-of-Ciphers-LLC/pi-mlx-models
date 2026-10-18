@@ -45,6 +45,13 @@ import { parseStartArgs } from "./startargs.js";
 
 const PROGRESS_WIDGET = "mlx-progress";
 
+/**
+ * Shown once per session when a request for this provider's launched model has a payload the rewrite cannot read (D-11).
+ * A constant on purpose: no part of the payload is ever added to it (T-04-11).
+ */
+const BAD_SHAPE_NOTICE =
+  "pi-mlx-models: a request to the MLX server had an unexpected shape, so the profile and sampling settings were not applied to it. Shown once per session.";
+
 /** What a pi hook receives next to its event; only the model of the request is used. */
 export interface HookContext {
   model?: { provider?: string; id?: string };
@@ -161,6 +168,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   let active: ActiveLaunch | null = null;
   /** Config warnings already shown, so each distinct text appears once per extension instance. */
   const shownWarnings = new Set<string>();
+  /** Whether the bad-payload notice has been shown in this extension instance (D-11). */
+  let badShapeShown = false;
 
   /**
    * The settings in effect outside any /mlx-start: the global file plus the environment, or the environment
@@ -656,6 +665,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       try {
         if (active === null || ctx?.model?.provider !== PROVIDER_ID) return undefined;
         const rewrite = applyRequestOverrides(event?.payload, active);
+        if (rewrite.kind === "bad-shape" && !badShapeShown) {
+          badShapeShown = true;
+          ctx?.ui?.notify?.(BAD_SHAPE_NOTICE, "warning");
+        }
         return rewrite.kind === "rewritten" ? rewrite.payload : undefined;
       } catch {
         return undefined;
