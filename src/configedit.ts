@@ -1,7 +1,6 @@
 import { writeFileAtomic } from "./atomicfile.js";
 import { isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
-import { isLocalPath } from "./modelinfo.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { type LayerFile, MAX_FILE_BYTES, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
 
@@ -372,8 +371,8 @@ const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
 
 /**
  * A model key the user types for `models`. This checks only the shape: one line, not empty after trimming, at most 4096
- * characters, no control character and no leading dash. Any other text, `__proto__` included, is a plain key. Whether a key can
- * ever match a start is a separate, advisory question answered by `isPlausibleModelKey`, which never rejects a key.
+ * characters, no control character and no leading dash. Any other text, `__proto__` included, is a plain key. Whether a key is
+ * likely to match a start is a separate, advisory question answered by `isPlausibleModelKey`, which never rejects a key.
  */
 export function validateModelKey(text: string): Checked {
   const value = text.trim();
@@ -385,11 +384,12 @@ export function validateModelKey(text: string): Checked {
 }
 
 /**
- * Whether a typed model key could ever match a start: a preset key, an id with a slash such as `org/name`, or a local path.
- * Advisory only: it never rejects a key, and a bare name such as a profile name typed by mistake is the case it exists for.
+ * Whether a typed model key is likely to match a start: a preset key, or an id with a slash such as `org/name` (every
+ * absolute or relative path has a slash). A bare name such as `gpt2` does match a start given exactly that name, but it is more
+ * often a profile name typed where the model key belongs, so it counts as unlikely. Advisory only: it never rejects a key.
  */
 export function isPlausibleModelKey(key: string): boolean {
-  return MODEL_PRESETS.some((preset) => preset.key === key) || key.includes("/") || isLocalPath(key);
+  return MODEL_PRESETS.some((preset) => preset.key === key) || key.includes("/");
 }
 
 /** A profile name the user types: the profile rule of the settings module. */
