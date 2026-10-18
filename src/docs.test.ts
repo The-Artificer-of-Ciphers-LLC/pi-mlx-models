@@ -26,12 +26,15 @@ function readRepo(relativePath: string): string {
 
 /** What the real extension registers over the fake host, with every settings source pointed at an empty temporary directory. */
 async function registerAll(): Promise<{ commands: string[]; flags: string[] }> {
-  void createExtension;
-  void makeFakePi;
-  void mkdtempSync;
-  void tmpdir;
-  void join;
-  return { commands: [], flags: [] };
+  const fake = makeFakePi();
+  const dir = mkdtempSync(join(tmpdir(), "docs-check-"));
+  // An empty env, so no variable of the developer's shell reaches the settings.
+  const extension = createExtension({
+    settings: { env: {}, globalConfigPath: join(dir, "config.json"), home: dir },
+    discoverModelIds: async () => [],
+  });
+  await extension(fake.pi);
+  return { commands: [...fake.commands.keys()], flags: fake.flags.map((flag) => flag.name) };
 }
 
 async function registeredCommands(): Promise<string[]> {
@@ -44,10 +47,18 @@ async function registeredFlags(): Promise<string[]> {
 
 /** One line per documentation gap for a list of command names: no heading in the commands reference, no list line in the README. */
 function commandProblems(names: readonly string[], commandsDoc: string, readme: string): string[] {
-  void names;
-  void commandsDoc;
-  void readme;
-  return [];
+  const headings = new Set(commandsDoc.split("\n").map((line) => line.trim()));
+  const readmeLines = readme.split("\n");
+  const problems: string[] = [];
+  for (const name of names) {
+    if (!headings.has(`## /${name}`) && !headings.has(`## \`/${name}\``)) {
+      problems.push(`${name}: no heading in docs/reference/commands.md`);
+    }
+    if (!readmeLines.some((line) => line.startsWith(`- \`/${name}\``))) {
+      problems.push(`${name}: no list line in README.md`);
+    }
+  }
+  return problems;
 }
 
 test("docs check: the extension registers the commands this suite expects to find documented", async () => {
