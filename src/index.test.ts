@@ -3785,3 +3785,100 @@ test("a readable config.json produces no warning at all", async () => {
 
   assert.deepEqual(warnings(h.notes), []);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The other listed models (MOD-04, D-12): local metadata and one aggregate warning
+// ---------------------------------------------------------------------------------------------------------------------
+
+const NOT_CACHED: ModelConfigRead = { ok: false, reason: "not in the Hugging Face cache" };
+const windowsOf = (call: ProviderCall | undefined) =>
+  Object.fromEntries((call?.config.models as Array<{ id: string; contextWindow: number }>).map((m) => [m.id, m.contextWindow]));
+
+/** A harness with `provider.listAllModels` true in the global file; org/cached has a readable 65536 window, other ids none. */
+async function setupListAll(discovered: string[], extra: { ids?: Record<string, unknown>; otherwise?: ModelConfigRead } = {}) {
+  const settings = freshSettings({});
+  writeGlobal(settings, { provider: { listAllModels: true } });
+  const stand = makeFakeModelConfig(
+    { [QWEN_ID]: { max_position_embeddings: 262144 }, "org/cached": { max_position_embeddings: 65536 }, ...extra.ids },
+    extra.otherwise ?? NOT_CACHED,
+  );
+  const h = await setup({ settings, discovered, readModelConfig: stand.read });
+  return { ...h, stand };
+}
+
+test("with provider.listAllModels true each other listed model gets its own window where it is cached and 32768 where it is not", async () => {
+  const h = await setupListAll([QWEN_ID, "org/cached", "org/missing"]);
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(windowsOf(h.providerCalls.at(-1)), { [QWEN_ID]: 262144, "org/cached": 65536, "org/missing": 32768 });
+});
+
+test("the launched model is read once with the Hub allowed and every other listed model only locally, never again by the registration", async () => {
+  const h = await setupListAll([QWEN_ID, "org/cached", "org/missing"]);
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  const withHub = h.stand.calls.filter((call) => call.hub);
+  assert.deepEqual(withHub, [{ modelId: QWEN_ID, hub: true }]);
+  assert.ok(h.stand.calls.some((call) => call.modelId === "org/cached" && !call.hub), "org/cached was read locally");
+  assert.ok(h.stand.calls.some((call) => call.modelId === "org/missing" && !call.hub), "org/missing was read locally");
+  const afterLaunchedRead = h.stand.calls.slice(h.stand.calls.indexOf(withHub[0]) + 1);
+  assert.equal(
+    afterLaunchedRead.some((call) => call.modelId === QWEN_ID),
+    false,
+    "the registration after ready uses the launched model's own record",
+  );
+});
+
+test("the unreadable other models give one aggregate warning that has their count and the first reason and names none of them", async () => {
+  const h = await setupListAll([QWEN_ID, "org/cached", "org/missing"]);
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(warnings(h.notes), [
+    "context window unavailable for 1 other listed model (not in the Hugging Face cache); using 32768 for it",
+  ]);
+  assert.equal(warnings(h.notes).some((message) => message.includes("org/missing")), false);
+});
+
+test("with provider.listAllModels false nothing but the launched model is read", async () => {
+  const stand = makeFakeModelConfig({ [QWEN_ID]: { max_position_embeddings: 262144 } }, NOT_CACHED);
+  const h = await setup({ discovered: [QWEN_ID, "org/cached", "org/missing"], readModelConfig: stand.read });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(stand.calls, [{ modelId: QWEN_ID, hub: true }]);
+  assert.deepEqual(warnings(h.notes), []);
+});
+
+test("at load the other listed models are read locally and registered with their metadata, with no warning because there is no command context", async () => {
+  const h = await setupListAll(["org/cached", "org/missing"]);
+
+  assert.deepEqual(h.stand.calls, [
+    { modelId: "org/cached", hub: false },
+    { modelId: "org/missing", hub: false },
+  ]);
+  assert.deepEqual(windowsOf(h.providerCalls[0]), { "org/cached": 65536, "org/missing": 32768 });
+  assert.deepEqual(warnings(h.notes), []);
+});
+
+test("an other listed model whose id has control characters is read under its own id, shown with a clean name, and named nowhere in the warning", async () => {
+  const hostile = "org/model\u001b]0;pwned\u0007\u009b31m";
+  const h = await setupListAll([QWEN_ID, hostile]);
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.ok(h.stand.calls.some((call) => call.modelId === hostile && !call.hub), "the reader got the id unchanged");
+  const model = (h.providerCalls.at(-1)?.config.models as Array<{ id: string; name: string; contextWindow: number }>).find(
+    (m) => m.id === hostile,
+  );
+  assert.ok(model, "the hostile id is registered");
+  assert.equal(model.contextWindow, 32768);
+  assert.doesNotMatch(model.name, /[\u0000-\u001f\u007f-\u009f]/);
+  const [message] = warnings(h.notes);
+  assert.ok(message !== undefined, "an aggregate warning was shown");
+  assert.doesNotMatch(message, /[\u0000-\u001f\u007f-\u009f]/);
+  assert.equal(message.includes("pwned") || message.includes("org/model"), false);
+});

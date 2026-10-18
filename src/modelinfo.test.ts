@@ -14,6 +14,7 @@ import {
   defaultMaxTokens,
   deriveModelInfo,
   describeModel,
+  extrasFallbackNotice,
   hubBaseUrlOf,
   resolveCacheRoot,
   type ModelConfigReaderOptions,
@@ -875,6 +876,25 @@ test("HF_ENDPOINT is honoured and the token goes to that origin only", async (t)
   assert.equal(authorizationOf(stub.calls[0]), "Bearer tok");
   assert.equal(stub.calls[1]?.url, "https://elsewhere.example.test/cdn/config.json");
   assert.equal(authorizationOf(stub.calls[1]), null);
+});
+
+test("extrasFallbackNotice gives the count and the reason, singular for one model and plural for more, and cleans the reason", () => {
+  const reason = "not in the Hugging Face cache";
+  assert.equal(
+    extrasFallbackNotice(1, reason),
+    "context window unavailable for 1 other listed model (not in the Hugging Face cache); using 32768 for it",
+  );
+  assert.equal(
+    extrasFallbackNotice(3, reason),
+    "context window unavailable for 3 other listed models (not in the Hugging Face cache); using 32768 for them",
+  );
+
+  const hostile = extrasFallbackNotice(2, `esc\u001b[31m\nline https://user:secret@host/path ${"x".repeat(300)}`);
+  assert.equal(/[\u0000-\u001f\u007f-\u009f]/.test(hostile), false, "no control character");
+  assert.equal(hostile.includes("secret"), false);
+  const part = /^context window unavailable for 2 other listed models \((.*)\); using 32768 for them$/.exec(hostile);
+  assert.ok(part, `unexpected shape: ${hostile}`);
+  assert.ok(part[1].length > 0 && part[1].length <= 160, "the reason is clipped to 160 characters");
 });
 
 test("an id that is not a repository id never reaches fetch, and neither does a local path", async (t) => {
