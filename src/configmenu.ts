@@ -142,6 +142,13 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     },
   };
 
+  // Without an interactive UI nothing can be asked, so the menu only prints the config and says why it stops (D-23).
+  if (!options.hasUI) {
+    dialogs.notify(renderConfig(readLayerFile(path), path), "info");
+    dialogs.notify("Editing the config needs an interactive pi session; this is a read-only view of the file.", "warning");
+    return;
+  }
+
   /** The index of the chosen option, or undefined for a dismissal or an answer that is not one of the options. */
   async function pick(title: string, choices: string[]): Promise<number | undefined> {
     const answer = await dialogs.select(title, choices);
