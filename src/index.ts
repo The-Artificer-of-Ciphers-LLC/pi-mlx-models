@@ -16,7 +16,7 @@ import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
-import { createModelConfigReader, describeModel, deriveModelInfo, type ModelConfigRead, type ModelInfo, type ReadModelConfig } from "./modelinfo.js";
+import { createModelConfigReader, describeModel, deriveModelInfo, fallbackNotice, type ModelConfigRead, type ModelInfo, type ReadModelConfig } from "./modelinfo.js";
 import { createProgress, type Progress } from "./progress.js";
 import { applyRequestOverrides, type ActiveLaunch } from "./request.js";
 import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
@@ -547,6 +547,9 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       loaded = { id: model, info };
       await registerProvider(pi, { includeFallback: true });
       if (isStale()) return;
+      // A window that could not be read is registered as the fallback and said so once per model and reason (D-03). The
+      // once-per-text set means "once per model id and reason" for the life of this extension instance.
+      if (info.fallbackReason !== undefined) showConfigWarnings(ctx, [fallbackNotice(model, info.fallbackReason)]);
       // What pi was told, and where each value came from, ahead of the ready message.
       ctx.ui.notify(describeModel(info), "info");
       progress.done(5, "Provider ready");

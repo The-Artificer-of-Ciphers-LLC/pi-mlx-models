@@ -251,8 +251,14 @@ export function deriveModelInfo(input: { id: string; config?: ModelConfigRead })
   return info;
 }
 
-/** A source text as shown: single-line and free of control characters, with credentials hidden, clipped to 80 characters. */
-const shownSource = (text: string): string => clipDiagnostic(redactCredentials(cleanLabel(text)), 80, "start");
+/**
+ * A text as shown: single-line and free of control characters, with credentials hidden, clipped to `max` characters. The
+ * order is the one the project uses for every shown identifier: cleaned, then redacted, then clipped (D-03, T-05-10).
+ */
+const safe = (text: string, max: number): string => clipDiagnostic(redactCredentials(cleanLabel(text)), max, "start");
+
+/** A source text as shown, clipped to 80 characters. */
+const shownSource = (text: string): string => safe(text, 80);
 
 /**
  * The one line that tells the user what pi was told about the model and where each value came from (D-03, D-07). The
@@ -267,7 +273,10 @@ export function describeModel(info: ModelInfo): string {
   );
 }
 
-/** The warning shown when a model's context window could not be read (D-03). */
-export function fallbackNotice(_id: string, _reason: string): string {
-  return "";
+/**
+ * The warning shown when a model's context window could not be read and the documented fallback is used (D-03). The id
+ * is clipped to 80 characters and the reason to 160, both cleaned and redacted first.
+ */
+export function fallbackNotice(id: string, reason: string): string {
+  return `context window unavailable for ${safe(id, 80)} (${safe(reason, 160)}); using ${FALLBACK_CONTEXT_WINDOW}`;
 }
