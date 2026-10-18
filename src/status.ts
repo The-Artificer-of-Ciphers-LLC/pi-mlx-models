@@ -59,10 +59,19 @@ export interface StatusView {
   served: readonly string[];
 }
 
+/**
+ * Turn what a probe found into a health word. While a start of this session is under way the answer is always
+ * loading, even when /v1/models already answers: mlx_lm.server answers it before the model is loaded and warmed, so an
+ * answer then proves nothing (Pitfall 1). Ready needs a completed start of this session or, for a server this session
+ * did not start, an answering /v1/models. A server this session did not start that accepts and stays silent is
+ * reported as not answering and never as loading, because nothing says it is starting.
+ */
 export function classifyHealth(session: SessionState, probe: HealthProbe): Health {
-  if (session !== "none") throw new Error("not implemented");
+  if (session === "starting") return "loading";
   if (!probe.accepts) return "down";
-  return probe.models.answers ? "ready" : "not answering";
+  if (probe.models.answers) return "ready";
+  // A finished start whose server is busy (mlx_lm.server handles one request at a time) is loading, following D-08.
+  return session === "ready" ? "loading" : "not answering";
 }
 
 /** At most this many served ids are listed; the rest are counted (T-06-06). */
@@ -83,9 +92,35 @@ function servedText(served: readonly string[]): string {
   return rest > 0 ? `${listed} and ${rest} more` : listed;
 }
 
-export function formatStatus(view: StatusView): string {
-  if (view.session !== "none") throw new Error("not implemented");
-  const where = hostPort(view.address);
+type Launch = NonNullable<StatusView["launch"]>;
+
+/** The text in parentheses on the first line, for a launch of this session. */
+function sessionReason(view: StatusView, where: string): string {
+  if (view.session === "starting") return "a start is under way";
+  switch (view.health) {
+    case "ready":
+      return `answering on ${where}`;
+    case "loading":
+      return "busy or not answering yet";
+    case "down":
+      return "the server this session started is not answering";
+    case "not answering":
+      return "accepts connections but does not answer /v1/models";
+  }
+}
+
+/** A launch of this session. The profile, flags, request and model lines are the start message lines, passed in as given. */
+function formatSession(view: StatusView, launch: Launch, where: string): string {
+  const preset = launch.presetKey ? ` (preset ${shown(launch.presetKey)})` : "";
+  const out = [`status: ${view.health} (${sessionReason(view, where)})`, `server: ${shown(launch.modelId)}${preset} on ${where}`];
+  for (const line of [launch.profileLine, launch.flagsLine, launch.requestLine]) if (line !== "") out.push(line);
+  if (view.session === "starting") out.push("note: the model details appear after the start finishes");
+  else if (launch.modelLine) out.push(launch.modelLine);
+  return out.join("\n");
+}
+
+/** A server this session did not start: only the port, the health and what it serves are known. */
+function formatForeign(view: StatusView, where: string): string {
   if (view.health === "down") return `status: down (nothing is listening on ${where})`;
   if (view.health === "not answering") {
     return `status: not answering (${where} accepts connections but does not answer /v1/models; not started by this session)`;
@@ -98,4 +133,14 @@ export function formatStatus(view: StatusView): string {
     "flags: unknown",
     "note: the model line is not shown for a server this session did not start",
   ].join("\n");
+}
+
+/**
+ * The status block: one multi-line text. Every id that came from a server or a file is cleaned, has credentials hidden
+ * and is clipped before it is shown (T-06-06); the reasons hold no other text from the probe.
+ */
+export function formatStatus(view: StatusView): string {
+  const where = hostPort(view.address);
+  if (view.session === "none" || view.launch === undefined) return formatForeign(view, where);
+  return formatSession(view, view.launch, where);
 }
