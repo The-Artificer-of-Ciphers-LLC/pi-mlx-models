@@ -46,6 +46,8 @@ interface HarnessExtras {
   readModelConfig?: ReadModelConfig;
   /** The model ids the stand-in discovery reports for the provider's base URL; default is none. */
   discovered?: readonly string[];
+  /** A directory to use instead of a new temporary one, so a second instance sees the files of the first (pi closed and reopened). */
+  dir?: string;
 }
 
 async function harness(
@@ -55,7 +57,7 @@ async function harness(
   probe: ProbeResult = ALL_SUPPORTED,
   extras: HarnessExtras = {},
 ) {
-  const dir = mkdtempSync(join(tmpdir(), "pi-mlx-e2e-"));
+  const dir = extras.dir ?? mkdtempSync(join(tmpdir(), "pi-mlx-e2e-"));
   const globalConfigPath = join(dir, "data", "config.json");
   const argvFile = join(dir, "argv.json");
   const requestFile = join(dir, "requests.jsonl");
@@ -101,6 +103,7 @@ async function harness(
   return {
     ...fakePi,
     ...fakeCtx,
+    dir,
     globalConfigPath,
     argvFile,
     requestFile,
@@ -137,6 +140,7 @@ async function harness(
     },
     argv: (): string[] => JSON.parse(readFileSync(argvFile, "utf8")),
     start: (input = "qwen3_4b") => fakePi.commands.get("mlx-start")!(input, fakeCtx.ctx),
+    last: (input = "") => fakePi.commands.get("mlx-last")!(input, fakeCtx.ctx),
     stop: () => fakePi.commands.get("mlx-stop")!("", fakeCtx.ctx),
   };
 }
@@ -1519,4 +1523,103 @@ test("phase 5 criterion 5: an unreadable config.json still starts with the docum
   assert.equal(registered(manual)[0].contextWindow, 50000);
   assert.deepEqual(warningsOf(manual.notes), [], "a window set by hand skips the read, so there is nothing to warn about");
   await manual.stop();
+});
+
+// ---- /mlx-last: the last launch is remembered at ready and replayed by a fresh extension instance (plan 06-06: CMD-01, CMD-06) ----
+
+const FAST_PROFILE_FILE = (port: number, temperature = 0.2) => ({
+  server: { port },
+  models: { qwen3_4b: { profiles: { fast: { sampling: { temperature } } } } },
+});
+const lastRecordPath = (h: { dir: string }) => join(h.dir, "data", "last-launch.json");
+const errorNotes = (notes: Array<{ message: string; type: string }>) => notes.filter((n) => n.type === "error");
+/** A fresh extension instance over the files of an earlier one, as when pi is closed and opened again. */
+const reopened = (t: TestContext, earlier: { dir: string }, env: Settings = {}) =>
+  harness(t, env, {}, ALL_SUPPORTED, { dir: earlier.dir });
+
+test("mlx-last e2e: a model started once is started again with the same profile by a fresh instance, with no picker", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const first = await harness(t);
+  first.writeConfig(FAST_PROFILE_FILE(port));
+
+  await first.start("qwen3_4b --profile fast");
+
+  assert.deepEqual(errorNotes(first.notes), []);
+  assert.equal(
+    readFileSync(lastRecordPath(first), "utf8"),
+    `{"version":1,"model":"${QWEN.modelId}","profile":"fast"}\n`,
+    "the record holds the model id and the profile and nothing else",
+  );
+  const firstArgv = first.argv();
+  await first.stop();
+  assert.equal(await connectRefused(port), true);
+  rmSync(first.argvFile);
+
+  const second = await reopened(t, first);
+  second.ctx.ui.select = async () => {
+    throw new Error("the picker must not open");
+  };
+  await second.last();
+
+  assert.deepEqual(errorNotes(second.notes), []);
+  assert.deepEqual(second.argv(), firstArgv, "the same model, the same profile, the same server arguments");
+  const starting = startNotes(second.notes);
+  assert.equal(starting.length, 1);
+  assert.ok(starting[0].message.includes("\nprofile: fast (previous launch)"), starting[0].message);
+  assert.ok(second.notes.some((n) => n.message.startsWith("MLX server is ready for prompts.")), "the ready message appears");
+  await second.stop();
+});
+
+test("mlx-last e2e: the replay goes through the files read now, not the files of the first launch", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const first = await harness(t);
+  first.writeConfig(FAST_PROFILE_FILE(port));
+  await first.start("qwen3_4b --profile fast");
+  assert.deepEqual(first.argv().filter((arg) => arg.startsWith("--temp")), ["--temp=0.2"]);
+  await first.stop();
+
+  first.writeConfig(FAST_PROFILE_FILE(port, 0.4));
+  const second = await reopened(t, first);
+  await second.last();
+
+  assert.deepEqual(errorNotes(second.notes), []);
+  assert.deepEqual(second.argv().filter((arg) => arg.startsWith("--temp")), ["--temp=0.4"]);
+  await second.stop();
+});
+
+test("mlx-last e2e: with nothing remembered it says so, points to /mlx-start and starts nothing", { timeout: 30_000 }, async (t) => {
+  const h = await harness(t);
+
+  await h.last();
+
+  assert.deepEqual(errorNotes(h.notes), []);
+  assert.equal(h.notes.length, 1);
+  assert.equal(h.notes[0].type, "info");
+  assert.ok(h.notes[0].message.includes("/mlx-start"), h.notes[0].message);
+  assert.equal(existsSync(h.argvFile), false, "no child was started");
+  assert.equal(h.installCalls, 0);
+  assert.equal(h.providerCalls.length, 1, "nothing was installed or registered");
+});
+
+test("mlx-last e2e: an override applies to one launch only and is never remembered", { timeout: 60_000 }, async (t) => {
+  const port = await freePort();
+  const first = await harness(t);
+  first.writeConfig({ server: { port } });
+  await first.start("qwen3_4b");
+  const record = `{"version":1,"model":"${QWEN.modelId}","profile":null}\n`;
+  assert.equal(readFileSync(lastRecordPath(first), "utf8"), record);
+  await first.stop();
+
+  const second = await reopened(t, first);
+  await second.last("--log-level DEBUG");
+  assert.deepEqual(errorNotes(second.notes), []);
+  assert.ok(second.argv().includes("--log-level=DEBUG"), JSON.stringify(second.argv()));
+  assert.equal(readFileSync(lastRecordPath(first), "utf8"), record, "the record still holds only the model and the profile");
+  await second.stop();
+
+  const third = await reopened(t, first);
+  await third.last();
+  assert.deepEqual(errorNotes(third.notes), []);
+  assert.equal(third.argv().some((arg) => arg.startsWith("--log-level")), false, JSON.stringify(third.argv()));
+  await third.stop();
 });
