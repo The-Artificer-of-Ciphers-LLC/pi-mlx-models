@@ -55,9 +55,18 @@ import {
   type ResolvedLaunch,
   type SettingsSource,
 } from "./settings.js";
-import { parseStartArgs } from "./startargs.js";
+import { parseStartArgs, type CliFlagValue } from "./startargs.js";
 
 const PROGRESS_WIDGET = "mlx-progress";
+
+/** The commands that start a model, as their names without the slash. A closed set of constants: no user text becomes one (T-06-05). */
+type LaunchCommand = "mlx-start" | "mlx-last" | "mlx-restart";
+
+/** The text of a refused or failed launch of `command`. The only place a command name is joined to a failure message. */
+const failed = (command: LaunchCommand, text: string): string => `${command} failed: ${text}`;
+
+/** The text of a launch of `command` the user declined. The only place a command name is joined to a cancel message. */
+const cancelled = (command: LaunchCommand, text: string): string => `${command} cancelled: ${text}`;
 
 /**
  * Shown once per session when a request for this provider's launched model has a payload the rewrite cannot read (D-11).
@@ -311,6 +320,71 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       shownWarnings.add(warning);
       ctx.ui.notify(warning, "warning");
     }
+  }
+
+  /**
+   * Everything a launch command does between its parsed arguments and the choice of a model: refuse an empty `--profile`,
+   * read the pi flags, split the profile from the typed settings, read both configuration files, show the warnings and
+   * refuse invalid configuration or a project file that asks for what it may never ask for. Shared by every command that
+   * starts a model, so validation, project refusal and warnings cannot drift between them. Nothing has been installed,
+   * refreshed or spawned when it returns. Returns undefined after reporting a refusal.
+   *
+   * The order of the `pi.getFlag` calls is observable (tests count them): the flags of PI_FLAGS first, then `mlx-model`
+   * only when the caller asks for it.
+   */
+  function readLaunchSettings(
+    pi: PiHost,
+    ctx: any,
+    command: LaunchCommand,
+    flags: readonly CliFlagValue[],
+    options: { readModelFlag?: boolean } = {},
+  ): { prepared: Prepared; profile: string | undefined; modelFlag: boolean | string | undefined } | undefined {
+    // An empty profile name (`--profile=` or `--profile ""`) names nothing: it is refused here, before any file is read,
+    // and never falls back to the model's defaultProfile (D-02).
+    const profileFlag = flags.find((flag) => flag.path === PROFILE_FLAG_SPEC.path);
+    if (profileFlag !== undefined && (typeof profileFlag.raw !== "string" || profileFlag.raw.trim() === "")) {
+      ctx.ui.notify(failed(command, "--profile needs a profile name"), "error");
+      return undefined;
+    }
+    // Everything below is read from this call alone and kept nowhere: overrides apply to this launch only (D-10).
+    // The pi flags are read here and not in the factory, because pi fills their values in after it ran (D-09).
+    const piFlags: Record<string, string> = {};
+    for (const flag of PI_FLAGS) {
+      const value = flag.path === undefined ? undefined : pi.getFlag(flag.name);
+      if (typeof value === "string") piFlags[flag.name] = value;
+    }
+    const modelFlag = options.readModelFlag === true ? pi.getFlag("mlx-model") : undefined;
+    const typed: Record<string, string | true> = {};
+    // The profile is not a setting: it picks a set of values for this launch only (D-02), so it stays out of the layers.
+    let profile: string | undefined;
+    for (const flag of flags) {
+      if (flag.path === PROFILE_FLAG_SPEC.path) profile = typeof flag.raw === "string" ? flag.raw : undefined;
+      else typed[flag.path] = flag.raw;
+    }
+
+    // The global file and the project file (the working directory's own, never a parent's) are read on every
+    // start, so an edit needs no reload (D-04, D-05).
+    const result = prepareSettings({
+      global: readLayerFile(deps.settings.globalConfigPath),
+      project: readLayerFile(join(workingDirectory(ctx), PROJECT_CONFIG_RELPATH)),
+      env: deps.settings.env,
+      piFlags,
+      args: typed,
+    });
+    showConfigWarnings(ctx, result.warnings);
+    // Invalid configuration stops the start before any install, provider refresh or spawn (D-06).
+    if (!result.ok) {
+      ctx.ui.notify(failed(command, formatConfigErrors(result.errors)), "error");
+      return undefined;
+    }
+    const { prepared } = result;
+    // A cloned repository's file may tune the server but never run code or open the network; no dialog can
+    // override that, and nothing has been touched yet (D-16).
+    if (prepared.projectViolations.length > 0) {
+      ctx.ui.notify(failed(command, formatProjectRefusal(prepared.projectViolations, deps.settings.globalConfigPath)), "error");
+      return undefined;
+    }
+    return { prepared, profile, modelFlag };
   }
 
   /**
@@ -763,54 +837,12 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         // Syntax errors in the arguments are reported before anything else: no unknown flag is ever passed on (D-08).
         const parsed = parseStartArgs(args ?? "", [...cliFlagSpecs(), PROFILE_FLAG_SPEC]);
         if (!parsed.ok) {
-          ctx.ui.notify(`mlx-start failed: ${parsed.error}`, "error");
+          ctx.ui.notify(failed("mlx-start", parsed.error), "error");
           return;
         }
-        // An empty profile name (`--profile=` or `--profile ""`) names nothing: it is refused here, before any file is read,
-        // and never falls back to the model's defaultProfile (D-02).
-        const profileFlag = parsed.flags.find((flag) => flag.path === PROFILE_FLAG_SPEC.path);
-        if (profileFlag !== undefined && (typeof profileFlag.raw !== "string" || profileFlag.raw.trim() === "")) {
-          ctx.ui.notify("mlx-start failed: --profile needs a profile name", "error");
-          return;
-        }
-        // Everything below is read from this call alone and kept nowhere: overrides apply to this launch only (D-10).
-        // The pi flags are read here and not in the factory, because pi fills their values in after it ran (D-09).
-        const piFlags: Record<string, string> = {};
-        for (const flag of PI_FLAGS) {
-          const value = flag.path === undefined ? undefined : pi.getFlag(flag.name);
-          if (typeof value === "string") piFlags[flag.name] = value;
-        }
-        const modelFlag = pi.getFlag("mlx-model");
-        const typed: Record<string, string | true> = {};
-        // The profile is not a setting: it picks a set of values for this launch only (D-02), so it stays out of the layers.
-        let profile: string | undefined;
-        for (const flag of parsed.flags) {
-          if (flag.path === PROFILE_FLAG_SPEC.path) profile = typeof flag.raw === "string" ? flag.raw : undefined;
-          else typed[flag.path] = flag.raw;
-        }
-
-        // The global file and the project file (the working directory's own, never a parent's) are read on every
-        // start, so an edit needs no reload (D-04, D-05).
-        const result = prepareSettings({
-          global: readLayerFile(deps.settings.globalConfigPath),
-          project: readLayerFile(join(workingDirectory(ctx), PROJECT_CONFIG_RELPATH)),
-          env: deps.settings.env,
-          piFlags,
-          args: typed,
-        });
-        showConfigWarnings(ctx, result.warnings);
-        // Invalid configuration stops the start before any install, provider refresh or spawn (D-06).
-        if (!result.ok) {
-          ctx.ui.notify(`mlx-start failed: ${formatConfigErrors(result.errors)}`, "error");
-          return;
-        }
-        const { prepared } = result;
-        // A cloned repository's file may tune the server but never run code or open the network; no dialog can
-        // override that, and nothing has been touched yet (D-16).
-        if (prepared.projectViolations.length > 0) {
-          ctx.ui.notify(`mlx-start failed: ${formatProjectRefusal(prepared.projectViolations, deps.settings.globalConfigPath)}`, "error");
-          return;
-        }
+        const settings = readLaunchSettings(pi, ctx, "mlx-start", parsed.flags, { readModelFlag: true });
+        if (settings === undefined) return;
+        const { prepared, profile, modelFlag } = settings;
 
         // A model typed on the command line beats --mlx-model; with neither, the picker opens even when a default
         // model is configured (the default only fills in for a start that names no model at all).
