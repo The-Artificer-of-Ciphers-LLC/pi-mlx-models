@@ -12,7 +12,7 @@ import {
   VENV_PYTHON,
   deriveBaseUrl,
 } from "./config.js";
-import { cleanLabel } from "./diagnostic.js";
+import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
@@ -54,6 +54,14 @@ const PROGRESS_WIDGET = "mlx-progress";
  */
 const BAD_SHAPE_NOTICE =
   "pi-mlx-models: a request to the MLX server had an unexpected shape, so the profile and sampling settings were not applied to it. Shown once per session.";
+
+/**
+ * Shown once per session when a request for this provider carries a model id other than the launched one, so the profile and
+ * sampling settings did not apply to it (WR-02). The text names only the launched id, cleaned and clipped; nothing from the
+ * payload is ever added to it.
+ */
+const modelMismatchNotice = (launchedId: string): string =>
+  `pi-mlx-models: a request to the MLX server named a different model than the one launched (${clipDiagnostic(redactCredentials(cleanLabel(launchedId)), 80, "start")}), so the profile and sampling settings were not applied to it. Shown once per session.`;
 
 /** What a pi hook receives next to its event; only the model of the request is used. */
 export interface HookContext {
@@ -173,6 +181,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   const shownWarnings = new Set<string>();
   /** Whether the bad-payload notice has been shown in this extension instance (D-11). */
   let badShapeShown = false;
+  let modelMismatchShown = false;
 
   /**
    * The settings in effect outside any /mlx-start: the global file plus the environment, or the environment
@@ -687,6 +696,15 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         if (rewrite.kind === "bad-shape" && !badShapeShown) {
           badShapeShown = true;
           ctx?.ui?.notify?.(BAD_SHAPE_NOTICE, "warning");
+        }
+        // A payload with a model id other than the launched one is left alone (D-13); say so once, because the values the
+        // user configured then never reach the server (WR-02). Only the matching rule in applyRequestOverrides decides.
+        if (rewrite.kind === "unchanged" && !modelMismatchShown) {
+          const model = (event?.payload as { model?: unknown } | null | undefined)?.model;
+          if (typeof model === "string" && model !== active.modelId) {
+            modelMismatchShown = true;
+            ctx?.ui?.notify?.(modelMismatchNotice(active.modelId), "warning");
+          }
         }
         return rewrite.kind === "rewritten" ? rewrite.payload : undefined;
       } catch {
