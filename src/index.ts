@@ -993,6 +993,34 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       },
     });
 
+    pi.registerCommand("mlx-restart", {
+      description:
+        "Restart the server with the same model and profile selection, through the settings as they are now. Usage: /mlx-restart [--profile name] [--flag value ...]",
+      handler: async (args, ctx) => {
+        // The same flags as /mlx-start and no model: the model comes from the running launch (D-14).
+        const parsed = parseStartArgs(args ?? "", [...cliFlagSpecs(), PROFILE_FLAG_SPEC], { command: "/mlx-restart", takesModel: false });
+        if (!parsed.ok) {
+          ctx.ui.notify(failed("mlx-restart", parsed.error), "error");
+          return;
+        }
+        const running = launchRecord;
+        if (running === null) return;
+        // Everything is validated and confirmed before the server is touched, and this handler never stops it: the server's
+        // own start stops the previous process and waits for its port, so a refused restart leaves the running server alone.
+        const settings = readLaunchSettings(pi, ctx, "mlx-restart", parsed.flags);
+        if (settings === undefined) return;
+        const { prepared, profile: typedProfile } = settings;
+        // The selection handed to the earlier launch is kept: a name stays a name, and no selection lets defaultProfile decide
+        // again. Flags are never kept; only the ones typed here apply (D-13, D-14).
+        const profile = typedProfile ?? running.profile;
+        const run: LaunchRun = {
+          command: "mlx-restart",
+          ...(profile === undefined ? {} : { profile, profileOrigin: typedProfile !== undefined ? "typed" : "kept" }),
+        };
+        await startModelFromInput(pi, ctx, running.modelId, prepared, run);
+      },
+    });
+
     pi.registerCommand("mlx-status", {
       description: "Show the MLX server: model, profile, port, flags in effect and health (down, loading, ready)",
       handler: async (args, ctx) => {
