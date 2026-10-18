@@ -4076,3 +4076,81 @@ test("limits.reasoning false on the R1 distill registers a plain model: no compa
   assert.equal(model.maxTokens, 8192);
   assert.ok(modelNotes(h.notes)[0].message.includes("reasoning no (profile plain)"));
 });
+
+// ---- the output-limit warning (MOD-03, D-08) ----
+
+const OUTPUT_WARNING = (requested: number, limit: number, source: string) =>
+  `sampling.maxTokens ${requested} is above the output limit pi is told about, ${limit} (${source}); pi sizes its context for ${limit}. Set limits.maxTokens in the profile to match.`;
+const outputWarnings = (notes: Note[]) => notes.filter((n) => n.type === "warning" && n.message.startsWith("sampling.maxTokens "));
+
+/** A harness whose `fast` profile of qwen3_4b holds the given sampling and limits objects. */
+async function sizedHarness(sampling: Record<string, unknown> | undefined, limits: Record<string, unknown> | undefined, options: Parameters<typeof setup>[0] = {}) {
+  const settings = freshSettings({});
+  writeGlobal(settings, {
+    models: { qwen3_4b: { profiles: { fast: { ...(sampling === undefined ? {} : { sampling }), ...(limits === undefined ? {} : { limits }) } } } },
+  });
+  return setup({ settings, ...options });
+}
+
+test("a sampling.maxTokens above the default output limit shows one warning after the fallback warning and before the model line, and the flag still carries the number", async () => {
+  const h = await sizedHarness({ maxTokens: 16384 }, undefined, { readModelConfig: makeFakeModelConfig({}, HTTP_401).read });
+
+  await h.commands.get("mlx-start")!("qwen3_4b --profile fast", h.ctx);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(
+    warnings(h.notes),
+    [`context window unavailable for ${QWEN_ID} (the Hugging Face Hub answered HTTP 401); using 32768`, OUTPUT_WARNING(16384, 8192, "default")],
+  );
+  const messages = h.notes.map((n) => n.message);
+  const fallback = messages.findIndex((m) => m.startsWith("context window unavailable for "));
+  const notice = messages.indexOf(OUTPUT_WARNING(16384, 8192, "default"));
+  const line = messages.findIndex((m) => m.startsWith("model: context "));
+  assert.ok(fallback >= 0 && fallback < notice, "the notice follows the fallback warning");
+  assert.ok(notice < line, "the notice precedes the model line");
+  assert.equal(messages.at(-1), READY_NOTE);
+  assert.ok(startingNotes(h.notes)[0].includes("--max-tokens 16384 (profile fast)"), startingNotes(h.notes)[0]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--max-tokens=16384"]);
+});
+
+test("the output-limit warning is shown again on a second launch of the same profile", async () => {
+  const h = await sizedHarness({ maxTokens: 16384 }, undefined);
+
+  await h.commands.get("mlx-start")!("qwen3_4b --profile fast", h.ctx);
+  await h.commands.get("mlx-start")!("qwen3_4b --profile fast", h.ctx);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(outputWarnings(h.notes).map((n) => n.message), [OUTPUT_WARNING(16384, 8192, "default"), OUTPUT_WARNING(16384, 8192, "default")]);
+});
+
+test("there is no output-limit warning when limits.maxTokens is at least the request, when sampling.maxTokens is not set, or when it is below the default", async () => {
+  const cases: Array<[string, Record<string, unknown> | undefined, Record<string, unknown> | undefined]> = [
+    ["equal to the limit", { maxTokens: 16384 }, { maxTokens: 16384 }],
+    ["below the limit", { maxTokens: 16384 }, { maxTokens: 32768 }],
+    ["no sampling.maxTokens", { temperature: 0.2 }, { maxTokens: 4096 }],
+    ["below the default", { maxTokens: 4096 }, undefined],
+    ["at the default", { maxTokens: 8192 }, undefined],
+  ];
+  for (const [name, sampling, limits] of cases) {
+    const h = await sizedHarness(sampling, limits);
+    await h.commands.get("mlx-start")!("qwen3_4b --profile fast", h.ctx);
+    assert.deepEqual(errors(h.notes), [], name);
+    assert.deepEqual(outputWarnings(h.notes), [], name);
+  }
+});
+
+test("limits.maxTokens alone adds no --max-tokens to the server; with sampling.maxTokens too the flag keeps its own number", async () => {
+  const alone = await sizedHarness(undefined, { maxTokens: 4096 });
+  await alone.commands.get("mlx-start")!("qwen3_4b --profile fast", alone.ctx);
+  assert.deepEqual(errors(alone.notes), []);
+  assert.deepEqual(alone.server.launches[0]?.extraArgs, []);
+  assert.ok(modelNotes(alone.notes)[0].message.includes("max output 4096 (profile fast)"), modelNotes(alone.notes)[0].message);
+  assert.equal(alone.providerCalls.at(-1)?.config.models[0].maxTokens, 4096);
+
+  const both = await sizedHarness({ maxTokens: 8192 }, { maxTokens: 4096 });
+  await both.commands.get("mlx-start")!("qwen3_4b --profile fast", both.ctx);
+  assert.deepEqual(both.server.launches[0]?.extraArgs, ["--max-tokens=8192"]);
+  assert.ok(startingNotes(both.notes)[0].includes("--max-tokens 8192 (profile fast)"), startingNotes(both.notes)[0]);
+  assert.ok(modelNotes(both.notes)[0].message.includes("max output 4096 (profile fast)"), modelNotes(both.notes)[0].message);
+  assert.deepEqual(outputWarnings(both.notes).map((n) => n.message), [OUTPUT_WARNING(8192, 4096, "profile fast")]);
+});

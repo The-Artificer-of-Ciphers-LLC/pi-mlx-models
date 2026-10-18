@@ -468,3 +468,14 @@ export function extrasFallbackNotice(count: number, reason: string): string {
     `using ${FALLBACK_CONTEXT_WINDOW} for ${count === 1 ? "it" : "them"}`
   );
 }
+
+/**
+ * The warning shown when `sampling.maxTokens` asks for more output than the limit pi is told about (D-08), or undefined
+ * when it asks for no more. pi clamps its requests to the advertised limit and sizes its context for it, so the two
+ * numbers are named with the source of the limit. The source is cleaned, redacted and clipped like every shown source.
+ */
+export function outputLimitNotice(requested: number, info: ModelInfo): string | undefined {
+  void requested;
+  void info;
+  return undefined;
+}

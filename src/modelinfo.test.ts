@@ -18,6 +18,7 @@ import {
   extrasFallbackNotice,
   hubBaseUrlOf,
   isReasoningModelId,
+  outputLimitNotice,
   resolveCacheRoot,
   type ModelConfigRead,
   type ModelConfigReaderOptions,
@@ -1114,4 +1115,41 @@ test("the model line shows the profile as the source of every overridden value",
   ]) {
     assert.ok(line.includes(part), `${part} in ${line}`);
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The output-limit notice (MOD-03; D-08, D-09)
+
+const infoWithLimit = (maxTokens: number, source: string): ModelInfo => ({
+  ...deriveModelInfo({ id: "org/Plain-Instruct", config: readableConfig(131072) }),
+  maxTokens,
+  maxTokensSource: source,
+});
+
+test("outputLimitNotice names both numbers and the source of the limit, in the exact words", () => {
+  assert.equal(
+    outputLimitNotice(16384, infoWithLimit(8192, "default")),
+    "sampling.maxTokens 16384 is above the output limit pi is told about, 8192 (default); pi sizes its context for 8192. Set limits.maxTokens in the profile to match.",
+  );
+  assert.equal(
+    outputLimitNotice(16384, infoWithLimit(8192, "profile think")),
+    "sampling.maxTokens 16384 is above the output limit pi is told about, 8192 (profile think); pi sizes its context for 8192. Set limits.maxTokens in the profile to match.",
+  );
+});
+
+test("outputLimitNotice is undefined when the requested value is at or below the limit", () => {
+  assert.equal(outputLimitNotice(8192, infoWithLimit(8192, "default")), undefined);
+  assert.equal(outputLimitNotice(4096, infoWithLimit(8192, "default")), undefined);
+  assert.equal(outputLimitNotice(1, infoWithLimit(8192, "default")), undefined);
+});
+
+test("outputLimitNotice cleans, redacts and clips the source text", () => {
+  const hostile = `profile \u001b[31mred\u0007 https://user:secret@host/path ${"y".repeat(300)}`;
+  const text = outputLimitNotice(16384, infoWithLimit(8192, hostile));
+  assert.ok(text !== undefined);
+  assert.equal(/[\u0000-\u001f\u007f-\u009f]/.test(text), false, JSON.stringify(text));
+  assert.equal(text.includes("secret"), false);
+  const part = /^sampling\.maxTokens 16384 is above the output limit pi is told about, 8192 \((.*)\); pi sizes its context for 8192\. /.exec(text);
+  assert.ok(part, `unexpected shape: ${text}`);
+  assert.ok(part[1].length > 0 && part[1].length <= 80, `the source is clipped to 80 characters: ${part[1].length}`);
 });
