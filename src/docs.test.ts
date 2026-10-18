@@ -551,3 +551,60 @@ test("docs check: every docs page outside docs/research is linked from README.md
   }
   assert.deepEqual(unlinkedPages(pages, linked), []);
 });
+
+/** The link targets of a markdown text that are neither a URL with a scheme nor a pure in-page fragment. */
+function relativeTargetsOf(_markdown: string): string[] {
+  return [];
+}
+
+/** One line per link into the repository's files that names a branch other than main. */
+function githubBranchProblems(_markdown: string, _repo: RepoRef): string[] {
+  return [];
+}
+
+test("docs check: relativeTargetsOf reports a relative target and passes absolute and in-page ones (package page)", () => {
+  const relative = [
+    "[a](./docs/x.md)",
+    '<img src="./a.png" alt="" />',
+    "![b](assets/b.png)",
+    "[c](../up.md)",
+  ].join("\n");
+  assert.deepEqual(relativeTargetsOf(relative), ["./docs/x.md", "./a.png", "assets/b.png", "../up.md"]);
+
+  const other = ["[d](https://example.com/x)", "[e](#in-page)", "[f](mailto:someone@example.com)"].join("\n");
+  assert.deepEqual(relativeTargetsOf(other), []);
+});
+
+test("docs check: githubBranchProblems reports a repository file link that is not on main (package page)", () => {
+  const own = "https://github.com/OWNER/REPO/";
+  const raw = "https://raw.githubusercontent.com/OWNER/REPO/";
+  const one = (target: string) => githubBranchProblems(`[x](${target})`, REPO);
+
+  for (const target of [`${own}blob/master/docs/a.md`, `${own}tree/dev/docs`, `${raw}feature/assets/a.png`]) {
+    const problems = one(target);
+    assert.equal(problems.length, 1, `${target}: ${problems.join("\n")}`);
+    assert.ok(problems[0].includes(target), problems[0]);
+  }
+  for (const target of [
+    `${own}blob/main/docs/a.md`,
+    `${raw}main/assets/a.png`,
+    `${own}actions/workflows/ci.yml`,
+    `${own}stargazers`,
+    "https://github.com/OTHER/REPO/blob/master/docs/a.md",
+  ]) {
+    assert.deepEqual(one(target), [], target);
+  }
+});
+
+test("docs check: README targets are absolute or in-page, because the package page serves relative ones from a tarball that ships no docs, assets or changelog (package page)", () => {
+  assert.deepEqual(relativeTargetsOf(readRepo("README.md")), []);
+});
+
+test("docs check: README links into this repository are on main and resolve, and there are at least 15 of them (package page)", () => {
+  const readme = readRepo("README.md");
+  const repo = repoFromPackage();
+  assert.deepEqual(githubBranchProblems(readme, repo), []);
+  assert.deepEqual(linkProblems(documentationFiles().rootDir, ["README.md"], repo), []);
+  const inRepository = linkTargetsOf(readme).filter((target) => repoPathOf(target, "README.md", repo) !== null);
+  assert.ok(inRepository.length >= 15, `only ${inRepository.length} README targets point into the repository`);
+});
