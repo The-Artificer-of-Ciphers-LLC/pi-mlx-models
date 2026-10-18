@@ -1,7 +1,7 @@
 import { writeFileAtomic } from "./atomicfile.js";
 import { isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
-import { type LayerFile, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
+import { type LayerFile, MAX_FILE_BYTES, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
 
 /**
  * The pure editing core of /mlx-config (CMD-02, D-17, D-20). An edit reads the global config fresh, changes one key in a
@@ -126,6 +126,14 @@ export function editConfig(path: string, change: (draft: ConfigTree) => ConfigTr
   }
 
   const text = `${JSON.stringify(result, null, 2)}\n`;
+  // Counted in bytes, as the reader counts them: a result over the cap would be refused by the reader on the next read.
+  if (Buffer.byteLength(text) > MAX_FILE_BYTES) {
+    return {
+      ok: false,
+      kind: "too-large",
+      message: `the change was not saved because the config file ${shownPath(path)} would be larger than 256 KiB and could no longer be read; it was not changed.`,
+    };
+  }
   const written = writeFileAtomic(path, text, { keepMode: true, followSymlink: true });
   if (!written.ok) {
     return {
@@ -361,7 +369,70 @@ export function validateProfileName(text: string): Checked {
   return PROFILE_NAME.test(value) ? { ok: true, value } : { ok: false, message: `the profile name must be ${PROFILE_NAME_SHORT_RULE}` };
 }
 
-/** The current config file as text for viewing. */
-export function renderConfig(_file: LayerFile, _path: string): string {
-  throw new Error("not implemented");
+/** The longest value the viewer prints, in characters. */
+const VIEW_VALUE_MAX = 200;
+/** The most model lines and problem lines the viewer prints. */
+const MAX_VIEW_LINES = 20;
+
+/** Text from the file as the viewer prints it: cleaned, then credentials hidden, then clipped, in that order. */
+const viewText = (text: string): string => clipDiagnostic(redactCredentials(cleanLabel(text)), VIEW_VALUE_MAX, "start");
+
+/** A value as JSON text, shown with `viewText`. */
+function viewValue(value: unknown): string {
+  try {
+    return viewText(JSON.stringify(value) ?? String(value));
+  } catch {
+    return "(a value that cannot be shown)";
+  }
+}
+
+/**
+ * The current config file as text for viewing (D-17, D-23): the keys that are set, the models with their profile names and the
+ * problems validation finds. Every value is cleaned, has credentials hidden and is clipped; a key the table does not know is
+ * reported by the validation problems and never printed as a value (T-06-18). The same text is what the no-UI mode prints.
+ */
+export function renderConfig(file: LayerFile, path: string): string {
+  const where = shownPath(path);
+  if (file.state === "absent") return `The config file ${where} does not exist yet; the first edit creates it.`;
+  if (file.state === "unusable") {
+    return `The config file ${where} cannot be used: ${clipDiagnostic(cleanLabel(file.reason), VIEW_VALUE_MAX, "start")}. /mlx-config will not change it until it is fixed or removed.`;
+  }
+
+  const setLine = (row: SettingDef): string[] => {
+    const value = getAt(file.data, row.path.split("."));
+    return value === undefined ? [] : [`  ${row.path}: ${viewValue(value)}`];
+  };
+  const lines = [`Config file ${where}`];
+  const general = SETTINGS.filter((row) => row.perModel !== true).flatMap(setLine);
+  const block = SETTINGS.filter((row) => row.perModel === true && !row.path.startsWith(LIMITS_PREFIX)).flatMap(setLine);
+  if (general.length > 0) lines.push("Settings", ...general);
+  if (block.length > 0) lines.push("Model defaults (the model block)", ...block);
+
+  const keys = modelKeys(file.data);
+  if (keys.length > 0) {
+    lines.push(`Models (${keys.length})`);
+    for (const key of keys.slice(0, MAX_VIEW_LINES)) {
+      const profiles = profileNames(file.data, key).map(viewText);
+      const defaultProfile = getAt(file.data, ["models", key, "defaultProfile"]);
+      const parts = [
+        defaultProfile === undefined ? undefined : `defaultProfile ${viewValue(defaultProfile)}`,
+        profiles.length === 0 ? undefined : `profiles: ${profiles.join(", ")}`,
+      ].filter((part): part is string => part !== undefined);
+      lines.push(`  ${viewValue(key)}${parts.length === 0 ? "" : `: ${parts.join("; ")}`}`);
+    }
+    if (keys.length > MAX_VIEW_LINES) lines.push(`  and ${keys.length - MAX_VIEW_LINES} more`);
+  }
+  if (lines.length === 1) lines.push("Nothing is set in this file.");
+
+  const checked = prepareSettings({ global: file, env: {} });
+  if (checked.ok) {
+    lines.push("No problems found.");
+  } else {
+    lines.push("Problems");
+    // These lines already have credentials hidden by the validation; hiding them again by position would damage them.
+    for (const error of checked.errors.slice(0, MAX_VIEW_LINES)) lines.push(`  ${clipDiagnostic(cleanLabel(error), 300, "start")}`);
+    const more = checked.errors.length - MAX_VIEW_LINES;
+    if (more > 0) lines.push(`  and ${more} more problem${more === 1 ? "" : "s"}`);
+  }
+  return lines.join("\n");
 }
