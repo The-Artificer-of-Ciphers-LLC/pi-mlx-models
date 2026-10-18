@@ -1,7 +1,7 @@
 import { writeFileAtomic } from "./atomicfile.js";
 import { isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
-import { PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
+import { type LayerFile, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
 
 /**
  * The pure editing core of /mlx-config (CMD-02, D-17, D-20). An edit reads the global config fresh, changes one key in a
@@ -359,4 +359,9 @@ export function validateModelKey(text: string): Checked {
 export function validateProfileName(text: string): Checked {
   const value = text.trim();
   return PROFILE_NAME.test(value) ? { ok: true, value } : { ok: false, message: `the profile name must be ${PROFILE_NAME_SHORT_RULE}` };
+}
+
+/** The current config file as text for viewing. */
+export function renderConfig(_file: LayerFile, _path: string): string {
+  throw new Error("not implemented");
 }

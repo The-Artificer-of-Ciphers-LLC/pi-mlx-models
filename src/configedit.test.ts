@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,13 +13,14 @@ import {
   getAt,
   modelKeys,
   profileNames,
+  renderConfig,
   segmentsFor,
   setAt,
   unsetAt,
   validateModelKey,
   validateProfileName,
 } from "./configedit.js";
-import { PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, prepareSettings, readLayerFile } from "./settings.js";
+import { MAX_FILE_BYTES, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, prepareSettings, readLayerFile } from "./settings.js";
 
 /** A fresh directory under the system temp directory, removed when the test ends. */
 function tempDir(t: { after(fn: () => void): void }): string {
@@ -419,3 +420,184 @@ function readLayerFileData(path: string): ConfigTree {
   assert.equal(file.state, "ok");
   return file.state === "ok" ? file.data : {};
 }
+
+const POSIX_MODES = process.platform === "win32" ? "file modes and links are not enforced on win32" : false;
+
+test("editConfig never overwrites what it cannot read: six unreadable shapes come back unreadable and stay as they were", (t) => {
+  const dir = tempDir(t);
+  const shapes: Array<[string, string]> = [
+    ["empty", ""],
+    ["spaces", "   \n  "],
+    ["not json", "{ nope"],
+    ["array", "[1, 2]"],
+    ["over the cap", `{"defaultModel": "${"x".repeat(MAX_FILE_BYTES)}"}`],
+  ];
+  for (const [name, text] of shapes) {
+    const path = join(dir, `${name}.json`);
+    writeFileSync(path, text);
+    const outcome = editConfig(path, (draft) => setAt(draft, ["server", "port"], 8081));
+    assert.equal(outcome.ok, false, name);
+    if (!outcome.ok) {
+      assert.equal(outcome.kind, "unreadable", name);
+      assert.ok(outcome.message.includes(path), name);
+    }
+    assert.equal(readFileSync(path, "utf8"), text, name);
+  }
+  const directory = join(dir, "a-directory.json");
+  mkdirSync(directory);
+  const outcome = editConfig(directory, (draft) => setAt(draft, ["server", "port"], 8081));
+  assert.equal(outcome.ok === false && outcome.kind, "unreadable");
+  assert.equal(statSync(directory).isDirectory(), true);
+});
+
+/** A valid file made of one long model key, so its size is set by the key's length. */
+function paddedTree(size: number): ConfigTree {
+  const overhead = Buffer.byteLength(pretty({ models: { "": {} } }));
+  return { models: { [ "k".repeat(size - overhead) ]: {} } };
+}
+
+test("editConfig too large: a result over 256 KiB is refused before writing, and a result exactly at the cap is written", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  const base = paddedTree(MAX_FILE_BYTES - 3000);
+  writeFileSync(path, pretty(base));
+  const sizeWith = (k: number) => Buffer.byteLength(pretty(setAt(base, ["defaultModel"], "x".repeat(k))));
+  const exact = MAX_FILE_BYTES - sizeWith(1) + 1;
+  assert.equal(sizeWith(exact), MAX_FILE_BYTES);
+
+  const over = editConfig(path, (draft) => setAt(draft, ["defaultModel"], "x".repeat(exact + 1)));
+  assert.equal(over.ok, false);
+  if (!over.ok) {
+    assert.equal(over.kind, "too-large");
+    assert.match(over.message, /256 KiB/);
+  }
+  assert.equal(readFileSync(path, "utf8"), pretty(base));
+
+  const at = editConfig(path, (draft) => setAt(draft, ["defaultModel"], "x".repeat(exact)));
+  assert.deepEqual(at, { ok: true, created: false, changed: true });
+  assert.equal(statSync(path).size, MAX_FILE_BYTES);
+  assert.equal(readLayerFile(path).state, "ok");
+});
+
+test("editConfig too large is judged in bytes: text under the cap in characters but over it in bytes is refused", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  const base = paddedTree(MAX_FILE_BYTES - 3000);
+  writeFileSync(path, pretty(base));
+  const outcome = editConfig(path, (draft) => setAt(draft, ["defaultModel"], "\u00e9".repeat(2000)));
+  assert.equal(outcome.ok === false && outcome.kind, "too-large");
+  assert.equal(readFileSync(path, "utf8"), pretty(base));
+});
+
+test("editConfig keeps a link: the file behind a symlinked config changes and the link stays a link", { skip: POSIX_MODES }, (t) => {
+  const dir = tempDir(t);
+  mkdirSync(join(dir, "real"));
+  const real = join(dir, "real", "config.json");
+  const link = join(dir, "config.json");
+  writeFileSync(real, pretty({ server: { port: 8080 } }));
+  symlinkSync(real, link);
+  const outcome = editConfig(link, (draft) => setAt(draft, ["server", "port"], 8081));
+  assert.deepEqual(outcome, { ok: true, created: false, changed: true });
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  assert.equal(readFileSync(real, "utf8"), pretty({ server: { port: 8081 } }));
+});
+
+test("editConfig keeps the mode of an existing file and creates a new one private", { skip: POSIX_MODES }, (t) => {
+  const dir = tempDir(t);
+  const existing = join(dir, "existing.json");
+  writeFileSync(existing, pretty({ server: { port: 8080 } }));
+  chmodSync(existing, 0o640);
+  assert.equal(editConfig(existing, (draft) => setAt(draft, ["server", "port"], 8081)).ok, true);
+  assert.equal(statSync(existing).mode & 0o777, 0o640);
+  const created = join(dir, "created.json");
+  assert.equal(editConfig(created, (draft) => setAt(draft, ["server", "port"], 8081)).ok, true);
+  assert.equal(statSync(created).mode & 0o777, 0o600);
+});
+
+test("editConfig write failure: a directory that cannot be created is write-failed with a fixed phrase and an error code", (t) => {
+  const dir = tempDir(t);
+  const blocker = join(dir, "blocker");
+  writeFileSync(blocker, "a regular file where a directory is needed");
+  const path = join(blocker, "config.json");
+  const outcome = editConfig(path, (draft) => setAt(draft, ["server", "port"], 8081));
+  assert.equal(outcome.ok, false);
+  if (outcome.ok) return;
+  assert.equal(outcome.kind, "write-failed");
+  assert.ok(outcome.message.includes(path), outcome.message);
+  assert.match(outcome.message, /^the config file .* could not be written \([A-Z]+\); it was not changed\.$/);
+  assert.equal(readFileSync(blocker, "utf8"), "a regular file where a directory is needed");
+});
+
+test("editConfig validates the whole draft: an unknown key already in the file refuses an edit of another key", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  const before = pretty({ bogus: 1, server: { port: 8080 } });
+  writeFileSync(path, before);
+  const outcome = editConfig(path, (draft) => setAt(draft, ["server", "port"], 8081));
+  assert.equal(outcome.ok, false);
+  if (!outcome.ok) {
+    assert.equal(outcome.kind, "invalid");
+    assert.match(outcome.message, /bogus \(global config\.json\): unknown key/);
+  }
+  assert.equal(readFileSync(path, "utf8"), before);
+});
+
+test("renderConfig absent: says the file does not exist yet and that the first edit creates it", () => {
+  const text = renderConfig({ state: "absent" }, "/home/user/.pi/agent/pi-mlx-models/config.json");
+  assert.match(text, /does not exist yet/);
+  assert.match(text, /first edit creates it/);
+  assert.ok(text.includes("/home/user/.pi/agent/pi-mlx-models/config.json"));
+});
+
+test("renderConfig ok: lists the keys that are set, the models with their profiles, and the problems", () => {
+  const data: ConfigTree = {
+    server: { port: 8081, logLevel: "INFO" },
+    defaultModel: "org/model",
+    model: { sampling: { temperature: 0.7 } },
+    models: { "org/model": { defaultProfile: "fast", profiles: { zeta: {}, fast: {} } } },
+    bogus: true,
+  };
+  const text = renderConfig({ state: "ok", data }, "/cfg/config.json");
+  assert.match(text, /server\.port: 8081/);
+  assert.match(text, /server\.logLevel: "INFO"/);
+  assert.match(text, /defaultModel: "org\/model"/);
+  assert.match(text, /model\.sampling\.temperature: 0.7/);
+  assert.match(text, /"org\/model".*defaultProfile "fast".*fast, zeta/);
+  assert.match(text, /bogus \(global config\.json\): unknown key/);
+  assert.equal(text.includes("server.host"), false);
+});
+
+test("renderConfig ok with no problem says so", () => {
+  const text = renderConfig({ state: "ok", data: { server: { port: 8081 } } }, "/cfg/config.json");
+  assert.match(text, /no problems/i);
+});
+
+test("renderConfig hides the credentials of a pip index, cleans an escape sequence and clips a long string", () => {
+  const data: ConfigTree = {
+    mlxLm: { pipIndex: "https://alice:hunter2@pypi.example.org/simple" },
+    defaultModel: `org/\u001b[31mred${"y".repeat(500)}`,
+  };
+  const text = renderConfig({ state: "ok", data }, "/cfg/config.json");
+  assert.equal(text.includes("hunter2"), false, text);
+  assert.equal(text.includes("alice"), false, text);
+  assert.equal(text.includes("\u001b"), false);
+  assert.equal(text.includes("y".repeat(250)), false);
+  assert.ok(text.includes("***"));
+});
+
+test("renderConfig caps 30 models at 20 lines and counts the rest", () => {
+  const models: Record<string, unknown> = {};
+  for (let index = 0; index < 30; index += 1) models[`org/model-${String(index).padStart(2, "0")}`] = {};
+  const text = renderConfig({ state: "ok", data: { models } }, "/cfg/config.json");
+  const lines = text.split("\n").filter((line) => line.includes("org/model-"));
+  assert.equal(lines.length, 20);
+  assert.match(text, /and 10 more/);
+});
+
+test("renderConfig unusable: says the file cannot be used, gives the reason and that /mlx-config will not change it", () => {
+  const text = renderConfig({ state: "unusable", reason: "is not valid JSON (Unexpected token)" }, "/cfg/config.json");
+  assert.match(text, /cannot be used/);
+  assert.ok(text.includes("is not valid JSON (Unexpected token)"));
+  assert.match(text, /\/mlx-config will not change it/);
+  assert.equal(existsSync("/cfg"), false);
+});
