@@ -562,3 +562,18 @@ test("kvBits in the global file reaches the process and the flags line, with one
   await h.stop();
   assert.equal(await connectRefused(port), true, "stop must wait on the launch's own port");
 });
+
+test("all three KV flags typed on /mlx-start reach the process in schema order, each labelled with the command", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port } });
+
+  await h.start("qwen3_4b --quantized-kv-start 0 --kv-group-size 32 --kv-bits 4");
+
+  assert.deepEqual(h.argv().slice(-3), ["--kv-bits=4", "--kv-group-size=32", "--quantized-kv-start=0"]);
+  assert.equal(
+    startNotes(h.notes)[0].message,
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --port ${port} (global file), --kv-bits 4 (/mlx-start), --kv-group-size 32 (/mlx-start), --quantized-kv-start 0 (/mlx-start)`,
+  );
+  assert.equal(h.notes.filter((n) => n.type === "warning").length, 1);
+});

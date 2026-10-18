@@ -1035,7 +1035,7 @@ test("mlx-start with an unknown flag is refused, with the valid flags listed, an
   await h.commands.get("mlx-start")!("--bogus 1", h.ctx);
 
   assert.deepEqual(errors(h.notes), [
-    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --kv-bits, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
+    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --kv-bits, --kv-group-size, --quantized-kv-start, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
   ]);
   assert.equal(h.notes.length, 1);
   assertNothingHappened(h);
@@ -2199,4 +2199,57 @@ test("a failed probe shows the could-not-check warning and the batching warning,
 
   assert.deepEqual(warningTexts(h.notes), ["Could not check which flags mlx-lm supports (boom); passing every configured flag.", KV_BATCHING_4]);
   assert.deepEqual(h.server.launches[0]?.extraArgs, ["--kv-bits=4"]);
+});
+
+test("kvBits with decodeConcurrency launches with both flags and the warning says the concurrency has no effect", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { kvBits: 4, decodeConcurrency: 2 } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--decode-concurrency=2", "--kv-bits=4"], "nothing is dropped");
+  assert.deepEqual(warningTexts(h.notes), [`${KV_BATCHING_4} --decode-concurrency 2 has no effect while --kv-bits is set.`]);
+  assert.deepEqual(errors(h.notes), []);
+});
+
+test("kvGroupSize alone launches with its flag and shows one info note that it has no effect without kvBits", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { kvGroupSize: 32 } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--kv-group-size=32"]);
+  assert.deepEqual(warningTexts(h.notes), []);
+  assert.deepEqual(
+    h.notes.filter((n) => n.message.includes("has no effect")),
+    [{ message: "--kv-group-size 32 has no effect without --kv-bits.", type: "info" }],
+  );
+  assert.equal(flagsLineOf(h.notes, 0), "flags: --kv-group-size 32 (global file)");
+});
+
+test("mlx-lm 0.31.1 has no KV flags: all three are skipped with one notice and neither the batching warning nor the info note appears", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { kvBits: 4, kvGroupSize: 32, quantizedKvStart: 0 } });
+  const h = await setup({ settings, probe: async () => probeFromHelp("0.31.1", "mlx-server-help-0.31.1.txt") });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), ["Skipped --kv-bits, --kv-group-size, --quantized-kv-start: not supported by mlx-lm 0.31.1 (run /mlx-init to upgrade)"]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, []);
+  assert.ok(!h.notes.some((n) => n.message.includes("Disables batching") || n.message.includes("has no effect")));
+  assert.equal(h.server.startCalls.length, 1);
+});
+
+test("an install that lists every KV flag passes all three in schema order with only the batching warning", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { quantizedKvStart: 0, kvGroupSize: 32, kvBits: 4 } });
+  const h = await setup({ settings, probe: async () => ALL_SUPPORTED });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--kv-bits=4", "--kv-group-size=32", "--quantized-kv-start=0"]);
+  assert.deepEqual(warningTexts(h.notes), [KV_BATCHING_4]);
+  assert.ok(!h.notes.some((n) => n.message.includes("has no effect")));
 });

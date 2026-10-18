@@ -895,6 +895,8 @@ test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order; only the
     { flag: "--prompt-cache-size", path: "server.promptCacheSize", takesValue: true },
     { flag: "--prompt-cache-bytes", path: "server.promptCacheBytes", takesValue: true },
     { flag: "--kv-bits", path: "server.kvBits", takesValue: true },
+    { flag: "--kv-group-size", path: "server.kvGroupSize", takesValue: true },
+    { flag: "--quantized-kv-start", path: "server.quantizedKvStart", takesValue: true },
     { flag: "--adapter-path", path: "model.adapterPath", takesValue: true },
     { flag: "--draft-model", path: "model.draftModel", takesValue: true },
     { flag: "--num-draft-tokens", path: "model.numDraftTokens", takesValue: true },
@@ -2434,4 +2436,107 @@ test("kvNotices: kvBits from the global file gives mlx-lm's own batching sentenc
 test("kvNotices: without kvBits there is neither a warning nor an info note", () => {
   assert.deepEqual(kvNotices(launchOf({})), {});
   assert.deepEqual(kvNotices(launchOf({ global: ok({ server: { logLevel: "DEBUG" } }) })), {});
+});
+
+// ---- kvGroupSize, quantizedKvStart and the interaction notes (SRV-05, D-10, D-12) ----
+
+test("server.kvGroupSize: 1 and 64 in the global file are accepted and emitted as --kv-group-size=N", () => {
+  for (const value of [1, 64]) {
+    const { prepared } = resolved({ global: ok({ server: { kvGroupSize: value } }) });
+    assert.deepEqual(prepared.flags.map((flag) => flag.args), [[`--kv-group-size=${value}`]]);
+    assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [`--kv-group-size=${value}`]);
+  }
+});
+
+for (const [value, shown] of [[0, "0"], [-1, "-1"], [1.5, "1.5"], ["64", '"64"'], [true, "true"]] as const) {
+  test(`server.kvGroupSize: ${shown} in the global file is refused naming the minimum`, () => {
+    assert.deepEqual(refused({ global: ok({ server: { kvGroupSize: value } }) }), [
+      `server.kvGroupSize (${GLOBAL}): ${shown} is not an integer of at least 1 (flag --kv-group-size)`,
+    ]);
+  });
+}
+
+test("server.quantizedKvStart: 0 and 5000 in the global file are accepted, 0 included", () => {
+  for (const value of [0, 5000]) {
+    const { prepared } = resolved({ global: ok({ server: { quantizedKvStart: value } }) });
+    assert.deepEqual(prepared.flags.map((flag) => flag.args), [[`--quantized-kv-start=${value}`]]);
+    assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [`--quantized-kv-start=${value}`]);
+  }
+});
+
+for (const [value, shown] of [[-1, "-1"], [1.5, "1.5"], ["0", '"0"'], [true, "true"]] as const) {
+  test(`server.quantizedKvStart: ${shown} in the global file is refused naming the minimum`, () => {
+    assert.deepEqual(refused({ global: ok({ server: { quantizedKvStart: value } }) }), [
+      `server.quantizedKvStart (${GLOBAL}): ${shown} is not an integer of at least 0 (flag --quantized-kv-start)`,
+    ]);
+  });
+}
+
+test("the three KV rows follow the performance rows in the order of the flags and stay server-wide", () => {
+  const paths = SETTINGS.map((row) => row.path);
+  const start = paths.indexOf("server.promptCacheBytes") + 1;
+  assert.deepEqual(paths.slice(start, start + 3), ["server.kvBits", "server.kvGroupSize", "server.quantizedKvStart"]);
+  for (const path of paths.slice(start, start + 3)) {
+    const row = SETTINGS.find((setting) => setting.path === path)!;
+    assert.equal(row.perModel, undefined, path);
+    assert.equal(row.env, undefined, path);
+    assert.equal(row.default, undefined, path);
+  }
+});
+
+const KV_WARNING = `KV quantization (--kv-bits 4, global file): ${BATCHING}`;
+
+test("kvNotices: decodeConcurrency above 1 adds a clause to the warning and nothing is dropped", () => {
+  const launch = launchOf({ global: ok({ server: { decodeConcurrency: 2, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch), { warning: `${KV_WARNING} --decode-concurrency 2 has no effect while --kv-bits is set.` });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--decode-concurrency=2", "--kv-bits=4"]);
+});
+
+test("kvNotices: promptConcurrency above 1 adds the matching clause", () => {
+  const launch = launchOf({ global: ok({ server: { promptConcurrency: 4, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch), { warning: `${KV_WARNING} --prompt-concurrency 4 has no effect while --kv-bits is set.` });
+});
+
+test("kvNotices: both concurrency settings above 1 share one clause in row order", () => {
+  const launch = launchOf({ global: ok({ server: { promptConcurrency: 4, decodeConcurrency: 2, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch), {
+    warning: `${KV_WARNING} --decode-concurrency 2 and --prompt-concurrency 4 have no effect while --kv-bits is set.`,
+  });
+});
+
+test("kvNotices: concurrency values of 1 add no clause", () => {
+  const launch = launchOf({ global: ok({ server: { decodeConcurrency: 1, promptConcurrency: 1, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch), { warning: KV_WARNING });
+});
+
+test("kvNotices: a concurrency flag the install does not list adds no clause", () => {
+  const launch = launchOf({ global: ok({ server: { decodeConcurrency: 2, kvBits: 4 } }) });
+  assert.deepEqual(kvNotices(launch, new Set(["--decode-concurrency"])), { warning: KV_WARNING });
+});
+
+test("kvNotices: kvGroupSize without kvBits gives one info note and no warning", () => {
+  const launch = launchOf({ global: ok({ server: { kvGroupSize: 32 } }) });
+  assert.deepEqual(kvNotices(launch), { info: "--kv-group-size 32 has no effect without --kv-bits." });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--kv-group-size=32"]);
+});
+
+test("kvNotices: quantizedKvStart 0 without kvBits gives the matching info note", () => {
+  const launch = launchOf({ global: ok({ server: { quantizedKvStart: 0 } }) });
+  assert.deepEqual(kvNotices(launch), { info: "--quantized-kv-start 0 has no effect without --kv-bits." });
+});
+
+test("kvNotices: both without kvBits share one info note", () => {
+  const launch = launchOf({ global: ok({ server: { quantizedKvStart: 0, kvGroupSize: 32 } }) });
+  assert.deepEqual(kvNotices(launch), { info: "--kv-group-size 32 and --quantized-kv-start 0 have no effect without --kv-bits." });
+});
+
+test("kvNotices: kvBits together with kvGroupSize gives the warning and no info note", () => {
+  const launch = launchOf({ global: ok({ server: { kvBits: 4, kvGroupSize: 32 } }) });
+  assert.deepEqual(kvNotices(launch), { warning: KV_WARNING });
+});
+
+test("kvNotices: when kvBits is skipped by the probe neither notice is given, because the skip notice covers it", () => {
+  const launch = launchOf({ global: ok({ server: { kvBits: 4, kvGroupSize: 32 } }) });
+  assert.deepEqual(kvNotices(launch, new Set(["--kv-bits", "--kv-group-size"])), {});
+  assert.deepEqual(kvNotices(launch, new Set(["--kv-bits"])), {});
 });
