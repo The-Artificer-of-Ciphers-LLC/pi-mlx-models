@@ -132,11 +132,14 @@ test("writeFileAtomic failure keeps the previous content of an existing target w
   const target = join(dir, "state.json");
   writeFileSync(target, "previous");
   chmodSync(dir, 0o500);
-  t.after(() => chmodSync(dir, 0o700));
-  const result = writeFileAtomic(target, "replacement");
+  let result: ReturnType<typeof writeFileAtomic>;
+  try {
+    result = writeFileAtomic(target, "replacement");
+  } finally {
+    chmodSync(dir, 0o700);
+  }
   assert.equal(result.ok, false);
   assert.equal(readFileSync(target, "utf8"), "previous");
-  chmodSync(dir, 0o700);
   assert.deepEqual(readdirSync(dir), ["state.json"]);
 });
 
