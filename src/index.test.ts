@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROVIDER_ID, VENV_PYTHON } from "./config.js";
+import { ACTION, MENU } from "./configmenu.js";
 import { createExtension } from "./index.js";
 import { parseHelpFlags, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { lastLaunchPath, writeLastLaunch } from "./laststate.js";
@@ -13,7 +14,7 @@ import { SETTINGS, initFlagSpecs } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
 import type { ModelConfigRead, ReadModelConfig } from "./modelinfo.js";
 import type { HealthProbe, ProbeHealth } from "./status.js";
-import { makeCtx, makeFakeModelConfig, makeFakePi, makeFakeRegistry, type CtxOptions } from "./testkit.js";
+import { makeCtx, makeFakeModelConfig, makeFakePi, makeFakeRegistry, scriptInput, scriptSelect, type CtxOptions } from "./testkit.js";
 
 type ProviderCall = { name: string; config: any };
 type Note = { message: string; type: string };
@@ -5414,4 +5415,235 @@ test("mlx-restart during a start in flight starts again, and the first start fin
   assert.ok(block.startsWith("status: ready"), block);
   assert.ok(block.includes("profile: b (/mlx-restart)"), block);
   assert.equal(block.includes("profile: a"), false, block);
+});
+
+// ---- /mlx-config: the command's contract over the real menu (plan 06-10: CMD-02, D-17 to D-23) ----
+
+const configCommand = (h: Harness, args = "") => h.commands.get("mlx-config")!(args, h.ctx);
+/** One edit of server.logLevel in the general menu, as a script: the entry, the key, the action, then Done. The text is the input. */
+const LOG_LEVEL_EDIT = [MENU.general, "server.logLevel", ACTION.set, MENU.done];
+const savedNotices = (notes: Note[]) => notes.filter((n) => n.message.startsWith("Saved ")).map((n) => n.message);
+
+/** A harness whose ctx answers the menu from a script: `steps` for select, `texts` for input; the global file is written first. */
+async function configSetup(
+  options: {
+    global?: unknown;
+    raw?: string;
+    steps?: Array<string | number | undefined>;
+    texts?: string[];
+    settings?: ReturnType<typeof freshSettings>;
+    setup?: Parameters<typeof setup>[0];
+  } = {},
+) {
+  const settings = options.settings ?? freshSettings({});
+  if (options.raw !== undefined) writeFileSync(settings.globalConfigPath, options.raw);
+  else if (options.global !== undefined) writeGlobal(settings, options.global);
+  const select = scriptSelect(...(options.steps ?? []));
+  const input = scriptInput(...(options.texts ?? []));
+  const h = await setup({ ...options.setup, settings, select, ctx: { ...options.setup?.ctx, input } });
+  return { h, settings, select, input };
+}
+
+test("mlx-config takes no arguments: a key, a flag or a model is refused before any dialog and the file is untouched", async () => {
+  const { h, settings } = await configSetup({ global: { server: { port: 18080 } }, steps: [MENU.done] });
+  const bytes = readFileSync(settings.globalConfigPath, "utf8");
+
+  await configCommand(h, "set server.port 1");
+  assert.equal(h.notes.length, 1);
+  assert.equal(h.notes[0].type, "error");
+  assert.ok(/^mlx-config failed: unexpected argument .*\(\/mlx-config takes no model\)/.test(h.notes[0].message), h.notes[0].message);
+  for (const args of ["--port 1", "--profile fast", "qwen3_4b", "--port=1 --log-level DEBUG"]) {
+    const before = h.notes.length;
+    await configCommand(h, args);
+    const added = h.notes.slice(before);
+    assert.equal(added.length, 1, args);
+    assert.equal(added[0].type, "error", args);
+    assert.ok(added[0].message.startsWith("mlx-config failed: "), added[0].message);
+  }
+
+  assert.equal(h.prompts.length, 0, "no dialog opened");
+  assert.equal(readFileSync(settings.globalConfigPath, "utf8"), bytes);
+  assert.equal(h.server.startCalls.length, 0);
+});
+
+test("mlx-config without a UI prints the config and says editing needs an interactive session, opens no dialog and writes nothing", async () => {
+  const { h, settings, select } = await configSetup({
+    global: { server: { port: 18080, logLevel: "WARNING" } },
+    steps: LOG_LEVEL_EDIT,
+    texts: ["DEBUG"],
+    setup: { ctx: { hasUI: false } },
+  });
+  const bytes = readFileSync(settings.globalConfigPath, "utf8");
+  const files = readdirSync(join(settings.globalConfigPath, ".."));
+
+  await configCommand(h);
+
+  assert.deepEqual(h.prompts, [], "no dialog opened");
+  assert.equal(select.remaining(), LOG_LEVEL_EDIT.length, "the script was never asked");
+  assert.equal(h.notes.length, 2);
+  assert.equal(h.notes[0].type, "info");
+  assert.ok(h.notes[0].message.includes("logLevel"), h.notes[0].message);
+  assert.equal(h.notes[1].type, "warning");
+  assert.ok(h.notes[1].message.includes("interactive"), h.notes[1].message);
+  assert.equal(readFileSync(settings.globalConfigPath, "utf8"), bytes);
+  assert.deepEqual(readdirSync(join(settings.globalConfigPath, "..")), files);
+  assert.equal(h.server.startCalls.length, 0);
+});
+
+test("mlx-config points to /mlx-restart only when a launch of this session exists", async () => {
+  const { h, select } = await configSetup({ steps: [...LOG_LEVEL_EDIT, ...LOG_LEVEL_EDIT], texts: ["DEBUG", "ERROR"] });
+
+  await configCommand(h);
+  const first = savedNotices(h.notes);
+  assert.equal(first.length, 1);
+  assert.ok(first[0].includes("server.logLevel"), first[0]);
+  assert.ok(first[0].includes("takes effect on the next /mlx-start"), first[0]);
+  assert.equal(first[0].includes("/mlx-restart"), false, first[0]);
+
+  await startMlx(h, "qwen3_4b");
+  await configCommand(h);
+
+  const all = savedNotices(h.notes);
+  assert.equal(all.length, 2);
+  assert.ok(all[1].includes("/mlx-restart"), all[1]);
+  assert.deepEqual(select.errors, []);
+  assert.equal(select.remaining(), 0);
+});
+
+test("mlx-config never restarts: an edit after a ready start leaves one start, no stop and the running flags", async () => {
+  const { h } = await configSetup({ steps: LOG_LEVEL_EDIT, texts: ["DEBUG"], setup: { probeHealth: async () => PROBE_ANSWERS() } });
+  await startMlx(h, "qwen3_4b");
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(h.server.startCalls.length, 1, "premise: one start");
+
+  await configCommand(h);
+
+  assert.equal(savedNotices(h.notes).length, 1);
+  assert.equal(h.server.startCalls.length, 1, "the command started nothing");
+  assert.equal(h.server.stopCalls, 0, "the command stopped nothing");
+  const block = await statusBlock(h);
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.equal(block.includes("--log-level"), false, "the running server keeps the flags it was started with");
+});
+
+test("mlx-config then start: a setting edited in the menu reaches the next /mlx-start of the same extension instance", async () => {
+  const { h } = await configSetup({ steps: [...LOG_LEVEL_EDIT, ...LOG_LEVEL_EDIT], texts: ["DEBUG", "ERROR"] });
+
+  await configCommand(h);
+  await startMlx(h, "qwen3_4b");
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--log-level=DEBUG"]);
+  assert.equal(flagsLineOf(h.notes, 0), "flags: --log-level DEBUG (global file)");
+
+  await configCommand(h);
+  await startMlx(h, "qwen3_4b");
+  assert.deepEqual(h.server.launches[1]?.extraArgs, ["--log-level=ERROR"]);
+  assert.equal(flagsLineOf(h.notes, 1), "flags: --log-level ERROR (global file)");
+  assert.deepEqual(errors(h.notes), []);
+});
+
+test("mlx-config edits the global file only: a project file stays byte for byte, is never offered, and its trustRemoteCode does not stop the command", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { trustRemoteCode: true, logLevel: "DEBUG" } });
+  const projectFile = join(cwd, ".pi", "pi-mlx-models.json");
+  const projectBytes = readFileSync(projectFile);
+  const { h, settings } = await configSetup({
+    global: { server: { port: 18080 } },
+    steps: [MENU.view, ...LOG_LEVEL_EDIT],
+    texts: ["WARNING"],
+    setup: { ctx: { cwd } },
+  });
+
+  await configCommand(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(JSON.parse(readFileSync(settings.globalConfigPath, "utf8")), { server: { port: 18080, logLevel: "WARNING" } });
+  assert.ok(readFileSync(projectFile).equals(projectBytes), "the project file is byte for byte what it was");
+  assert.deepEqual(readdirSync(cwd), [".pi"]);
+  assert.deepEqual(readdirSync(join(cwd, ".pi")), ["pi-mlx-models.json"]);
+  assert.deepEqual(readdirSync(join(settings.globalConfigPath, "..")), ["config.json"]);
+  assert.equal(h.confirms.length, 0, "no dialog was opened for the project file");
+  const shown = [...h.notes.map((n) => n.message), ...h.prompts.flatMap((p) => [p.title, ...(p.options ?? [])])];
+  assert.deepEqual(
+    shown.filter((text) => text.includes("pi-mlx-models.json") && !text.includes(settings.globalConfigPath)),
+    [],
+    "nothing names the project file",
+  );
+});
+
+test("mlx-config creates the global file and its directory on the first confirmed edit and says so", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-mlx-settings-"));
+  const settings = { env: {}, globalConfigPath: join(dir, "data", "config.json"), home: dir };
+  const { h } = await configSetup({ settings, steps: LOG_LEVEL_EDIT, texts: ["DEBUG"] });
+  assert.equal(existsSync(join(dir, "data")), false, "premise: no data directory yet");
+
+  await configCommand(h);
+
+  assert.deepEqual(JSON.parse(readFileSync(settings.globalConfigPath, "utf8")), { server: { logLevel: "DEBUG" } });
+  const saved = savedNotices(h.notes);
+  assert.equal(saved.length, 1);
+  assert.ok(saved[0].includes("was created"), saved[0]);
+  assert.ok(saved[0].includes(settings.globalConfigPath), saved[0]);
+});
+
+test("mlx-config reports a config file that is not JSON, leaves it byte for byte and returns", async () => {
+  const raw = "{ this is not json";
+  const { h, settings, select } = await configSetup({ raw, steps: [MENU.general, "server.logLevel", ACTION.set], texts: ["DEBUG"] });
+
+  await configCommand(h);
+
+  assert.equal(readFileSync(settings.globalConfigPath, "utf8"), raw);
+  const refusals = errors(h.notes);
+  assert.equal(refusals.length, 1);
+  assert.ok(refusals[0].startsWith("Not saved: "), refusals[0]);
+  assert.ok(refusals[0].includes(settings.globalConfigPath), refusals[0]);
+  assert.deepEqual(savedNotices(h.notes), []);
+  assert.equal(select.remaining(), 0, "the command ended with the file, it did not ask for another round");
+});
+
+test("mlx-config refuses an edit with the same problem lines /mlx-start prints for the same file", async () => {
+  const { h, settings } = await configSetup({ global: { server: { port: 99999 } }, steps: LOG_LEVEL_EDIT, texts: ["DEBUG"] });
+  const bytes = readFileSync(settings.globalConfigPath, "utf8");
+  await startMlx(h, "qwen3_4b");
+  const [startError] = errors(h.notes);
+  assert.ok(startError.startsWith("mlx-start failed: "), startError);
+  const problem = startError.slice("mlx-start failed: ".length);
+  const before = h.notes.length;
+
+  await configCommand(h);
+
+  const refusals = errors(h.notes.slice(before));
+  assert.equal(refusals.length, 1);
+  assert.ok(refusals[0].startsWith("Not saved: "), refusals[0]);
+  assert.ok(refusals[0].includes(problem), `the notice repeats the start's problem lines:\n${problem}\n---\n${refusals[0]}`);
+  assert.equal(readFileSync(settings.globalConfigPath, "utf8"), bytes);
+  assert.equal(h.server.startCalls.length, 0);
+});
+
+test("mlx-config asks through the ctx before autoStart is turned on, and a no leaves the file unchanged", async () => {
+  const { h, settings } = await configSetup({
+    global: { server: { port: 18080 } },
+    steps: [MENU.general, "autoStart", "true", MENU.done],
+    setup: { ctx: { confirm: false } },
+  });
+  const bytes = readFileSync(settings.globalConfigPath, "utf8");
+
+  await configCommand(h);
+
+  assert.equal(h.confirms.length, 1, "the dialog reached the real ctx");
+  assert.equal(readFileSync(settings.globalConfigPath, "utf8"), bytes);
+  assert.deepEqual(savedNotices(h.notes), []);
+});
+
+test("mlx-config writes autoStart only after a yes from the ctx dialog", async () => {
+  const { h, settings } = await configSetup({
+    global: { server: { port: 18080 } },
+    steps: [MENU.general, "autoStart", "true", MENU.done],
+    setup: { ctx: { confirm: true } },
+  });
+
+  await configCommand(h);
+
+  assert.equal(h.confirms.length, 1);
+  assert.deepEqual(JSON.parse(readFileSync(settings.globalConfigPath, "utf8")), { server: { port: 18080 }, autoStart: true });
+  assert.equal(savedNotices(h.notes).length, 1);
 });
