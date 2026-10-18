@@ -439,6 +439,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     listAll: boolean,
   ) {
     const isStale = () => startEpoch !== mine;
+    // The server of this start exited. That does not move the start epoch, so the awaits after the launch check it too: a
+    // dead server must not be announced as ready, described or registered.
+    let serverExited = false;
+    const isAbandoned = () => isStale() || serverExited;
     active = null;
     loaded = null;
     const { modelId: model, presetKey } = launch.model;
@@ -561,6 +565,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             progress.done(3, "Model loaded");
             break;
           case "exited":
+            serverExited = true;
             active = null; // a dead server's values must never apply to a later server on the same port (A7)
             loaded = null;
             progress.stop();
@@ -580,12 +585,12 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       } catch {
         read = { ok: false, reason: "the model reader failed" };
       }
-      if (isStale()) return;
+      if (isAbandoned()) return;
       // The local value, never the closure's, after an await.
       const info = deriveModelInfo({ id: model, config: read });
       loaded = { id: model, info };
-      await registerProvider(pi, { includeFallback: true, ctx, abandon: isStale });
-      if (isStale()) return;
+      await registerProvider(pi, { includeFallback: true, ctx, abandon: isAbandoned });
+      if (isAbandoned()) return;
       // A window that could not be read is registered as the fallback and said so once per model and reason (D-03). The
       // once-per-text set means "once per model id and reason" for the life of this extension instance.
       if (info.fallbackReason !== undefined) showConfigWarnings(ctx, [fallbackNotice(model, info.fallbackReason)]);
