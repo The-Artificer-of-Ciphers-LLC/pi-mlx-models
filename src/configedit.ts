@@ -1,6 +1,7 @@
 import { writeFileAtomic } from "./atomicfile.js";
-import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
-import { formatConfigErrors, prepareSettings, readLayerFile, type SettingDef } from "./settings.js";
+import { isLoopbackHost } from "./config.js";
+import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import { PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
 
 /**
  * The pure editing core of /mlx-config (CMD-02, D-17, D-20). An edit reads the global config fresh, changes one key in a
@@ -146,34 +147,216 @@ export interface EditableKey {
   label: string;
 }
 
-export function editableKeys(_scope: ConfigScope): EditableKey[] {
-  throw new Error("not implemented");
+/** The rows written inside a profile only (D-11). The settings module keeps this prefix private. */
+const LIMITS_PREFIX = "model.limits.";
+
+/** The segments of a row path below the `model` block: `sampling.temperature` for `model.sampling.temperature`. */
+const belowModel = (row: SettingDef): string[] => row.path.split(".").slice(1);
+
+/**
+ * The keys a scope offers, taken from the SETTINGS table so a row added there appears without a change here (D-19).
+ * Global is every row that is not a per-model option; a `model` block and a `models` entry take the per-model rows except the
+ * limits rows, which the file reader accepts inside a profile only; a profile takes every per-model row (Pitfall 5).
+ */
+export function editableKeys(scope: ConfigScope): EditableKey[] {
+  const rows = SETTINGS.filter((row) => {
+    if (scope === "global") return row.perModel !== true;
+    if (row.perModel !== true) return false;
+    return scope === "profile" || !row.path.startsWith(LIMITS_PREFIX);
+  });
+  return rows.map((row) => ({ row, path: row.path, label: scope === "modelEntry" || scope === "profile" ? belowModel(row).join(".") : row.path }));
 }
 
-export function segmentsFor(_scope: ConfigScope, _row: SettingDef, _target?: { model?: string; profile?: string }): string[] {
-  throw new Error("not implemented");
+/**
+ * Where a scope writes a row in the file. A `models` entry holds the keys of the `model` block directly, and a profile holds
+ * them inside `profiles`; `target` names the model key and the profile name.
+ */
+export function segmentsFor(scope: ConfigScope, row: SettingDef, target: { model?: string; profile?: string } = {}): string[] {
+  if (scope === "global" || scope === "modelBlock") return row.path.split(".");
+  if (target.model === undefined) throw new Error("segmentsFor needs a model key for this scope");
+  if (scope === "modelEntry") return ["models", target.model, ...belowModel(row)];
+  if (target.profile === undefined) throw new Error("segmentsFor needs a profile name for this scope");
+  return ["models", target.model, "profiles", target.profile, ...belowModel(row)];
 }
 
-export function convertInput(_row: SettingDef, _text: string): { ok: true; value: unknown } | { ok: false; message: string } {
-  throw new Error("not implemented");
+/** Plain decimal or exponent syntax: no hex, no `Infinity`, and no empty text, which `Number()` would read as 0. */
+const NUMBER_TEXT = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+const INTEGER_TEXT = /^[+-]?\d+$/;
+
+type Converted = { ok: true; value: unknown } | { ok: false; message: string };
+
+/** The text parsed as JSON, or undefined when it is not JSON. */
+function parseJson(text: string): { value: unknown } | undefined {
+  try {
+    return { value: JSON.parse(text) };
+  } catch {
+    return undefined;
+  }
 }
 
-export function confirmationFor(_row: SettingDef, _value: unknown): { title: string; message: string } | undefined {
-  throw new Error("not implemented");
+/**
+ * Typed text as the file form of a row's value, by the row's kind and not by its `parseText` (the environment path is lossy
+ * for file kinds). The result is checked with the row's own check. A failure carries a message built from the row path and
+ * its expected text; nothing the user typed is echoed (Pitfall 7).
+ */
+export function convertInput(row: SettingDef, text: string): Converted {
+  const fail: Converted = { ok: false, message: `${cleanLabel(row.path)} must be ${cleanLabel(row.expected)}` };
+  const trimmed = text.trim();
+  let value: unknown;
+  switch (row.kind) {
+    case "integer": {
+      if (!INTEGER_TEXT.test(trimmed)) return fail;
+      const number = Number(trimmed);
+      if (!Number.isSafeInteger(number)) return fail;
+      value = number === 0 ? 0 : number;
+      break;
+    }
+    case "number": {
+      if (!NUMBER_TEXT.test(trimmed)) return fail;
+      const number = Number(trimmed);
+      if (!Number.isFinite(number)) return fail;
+      value = number === 0 ? 0 : number;
+      break;
+    }
+    case "bool":
+      if (trimmed !== "true" && trimmed !== "false") return fail;
+      value = trimmed === "true";
+      break;
+    case "string":
+    case "path":
+    case "enum":
+      if (trimmed === "") return fail;
+      value = trimmed;
+      break;
+    case "list": {
+      if (trimmed.startsWith("[")) {
+        const parsed = parseJson(trimmed);
+        if (parsed === undefined || !Array.isArray(parsed.value)) return fail;
+        value = parsed.value;
+      } else if (row.path === "model.sampling.stop") {
+        // The file accepts one string here, so text that is not a JSON array is a single stop sequence.
+        if (trimmed === "") return fail;
+        value = trimmed;
+      } else {
+        const entries = trimmed.split(",").map((entry) => entry.trim());
+        if (entries.some((entry) => entry === "")) return fail;
+        value = entries;
+      }
+      break;
+    }
+    case "jsonObject": {
+      const parsed = parseJson(trimmed);
+      if (parsed === undefined || !isObject(parsed.value)) return fail;
+      value = parsed.value;
+      break;
+    }
+  }
+  return row.check(value).ok ? { ok: true, value } : fail;
 }
 
-export function modelKeys(_tree: ConfigTree): string[] {
-  throw new Error("not implemented");
+/** The sentence every confirmation ends with, spelled the same as the launch-time trust dialogs. */
+const SAFE_CHOICE_NOTE = "Yes allows this. No or Esc cancels. Check which option is highlighted before pressing Enter.";
+
+/** A value as a dialog shows it: one line, credentials hidden, at most 300 characters, in that order. */
+function shownValue(value: unknown): string {
+  const text = Array.isArray(value) ? value.map(String).join(", ") : String(value);
+  return clipDiagnostic(redactCredentials(cleanLabel(text)), 300, "start");
 }
 
-export function profileNames(_tree: ConfigTree, _model: string): string[] {
-  throw new Error("not implemented");
+/** True when a base URL does not point at this machine; text that is not a URL counts as not loopback. */
+function isNonLoopbackUrl(value: string): boolean {
+  try {
+    return !isLoopbackHost(new URL(value).hostname);
+  } catch {
+    return true;
+  }
 }
 
-export function validateModelKey(_text: string): { ok: true; value: string } | { ok: false; message: string } {
-  throw new Error("not implemented");
+/**
+ * The confirmation an edit needs before it is written, or undefined when it needs none. The settings that run code, open the
+ * network, choose where mlx-lm is installed from or start a model when pi opens are marked (D-19, T-06-17): trustRemoteCode
+ * true, a non-loopback host, any allowedOrigins, a non-loopback baseUrl, any pipIndex and autoStart true. Turning one off or
+ * removing it needs none, so a caller asks only when it is about to write a value.
+ */
+export function confirmationFor(row: SettingDef, value: unknown): { title: string; message: string } | undefined {
+  if (value === undefined) return undefined;
+  const shown = shownValue(value);
+  const note = ` ${SAFE_CHOICE_NOTE}`;
+  switch (row.path) {
+    case "server.trustRemoteCode":
+      if (value !== true) return undefined;
+      return {
+        title: "Allow remote code from model repositories?",
+        message: `trustRemoteCode lets a model repository run Python code on this machine every time a model starts. Only continue for repositories you trust.${note}`,
+      };
+    case "server.host":
+      if (typeof value !== "string" || isLoopbackHost(value)) return undefined;
+      return {
+        title: "Listen on a non-loopback address?",
+        message: `The MLX server will listen on ${shown}, reachable from your network. mlx_lm.server has no authentication.${note}`,
+      };
+    case "server.allowedOrigins":
+      return {
+        title: "Allow browser origins to reach the server?",
+        message: `Web pages from ${shown} will be allowed to call the MLX server from a browser on this machine.${note}`,
+      };
+    case "baseUrl":
+      if (typeof value !== "string" || !isNonLoopbackUrl(value)) return undefined;
+      return {
+        title: "Send prompts to a non-loopback address?",
+        message: `pi will send your conversation to ${shown}, which is not on this machine.${note}`,
+      };
+    case "mlxLm.pipIndex":
+      return {
+        title: "Install mlx-lm from a different package index?",
+        message: `/mlx-init will download and run Python packages from ${shown}. Only continue for an index you trust.${note}`,
+      };
+    case "autoStart":
+      if (value !== true) return undefined;
+      return {
+        title: "Start the last model when pi opens?",
+        message: `pi will start the last model by itself every time it opens, which uses memory and can take several minutes.${note}`,
+      };
+    default:
+      return undefined;
+  }
 }
 
-export function validateProfileName(_text: string): { ok: true; value: string } | { ok: false; message: string } {
-  throw new Error("not implemented");
+/** Own keys of a plain object, sorted; empty for anything else. */
+function sortedKeys(value: unknown): string[] {
+  return isObject(value) ? Object.keys(value).sort() : [];
+}
+
+/** The model keys under `models`, sorted. */
+export function modelKeys(tree: ConfigTree): string[] {
+  return sortedKeys(getAt(tree, ["models"]));
+}
+
+/** The profile names of one model entry, sorted. */
+export function profileNames(tree: ConfigTree, model: string): string[] {
+  return sortedKeys(getAt(tree, ["models", model, "profiles"]));
+}
+
+type Checked = { ok: true; value: string } | { ok: false; message: string };
+
+const MAX_MODEL_KEY_LENGTH = 4096;
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
+
+/**
+ * A model key the user types for `models`: one line, not empty after trimming, at most 4096 characters, no control character
+ * and no leading dash, the rule the settings module puts on a model id. Any other text, `__proto__` included, is a plain key.
+ */
+export function validateModelKey(text: string): Checked {
+  const value = text.trim();
+  if (value === "") return { ok: false, message: "a model id must not be empty" };
+  if (value.length > MAX_MODEL_KEY_LENGTH) return { ok: false, message: `a model id must be at most ${MAX_MODEL_KEY_LENGTH} characters` };
+  if (CONTROL_CHARACTER.test(value)) return { ok: false, message: "a model id must be one line without control characters" };
+  if (value.startsWith("-")) return { ok: false, message: "a model id must not start with a dash" };
+  return { ok: true, value };
+}
+
+/** A profile name the user types: the profile rule of the settings module. */
+export function validateProfileName(text: string): Checked {
+  const value = text.trim();
+  return PROFILE_NAME.test(value) ? { ok: true, value } : { ok: false, message: `the profile name must be ${PROFILE_NAME_SHORT_RULE}` };
 }

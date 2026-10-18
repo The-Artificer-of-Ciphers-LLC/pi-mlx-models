@@ -152,6 +152,9 @@ function rowOf(path: string): SettingDef {
   return row;
 }
 
+/** Spelled out here, not imported, so changing the sentence is a deliberate edit of both places. */
+const SAFE_CHOICE_NOTE = "Yes allows this. No or Esc cancels. Check which option is highlighted before pressing Enter.";
+
 const SCOPES: readonly ConfigScope[] = ["global", "modelBlock", "modelEntry", "profile"];
 const LIMITS = "model.limits.";
 
@@ -319,7 +322,8 @@ test("confirmationFor: the settings that run code, open the network, choose an i
     const confirmation = confirmationFor(rowOf(path), value);
     assert.ok(confirmation, `${path} ${JSON.stringify(value)}`);
     assert.ok(confirmation.title.length > 0);
-    assert.match(confirmation.message, /No or Esc cancels\.[^.]*$/);
+    assert.ok(confirmation.message.endsWith(SAFE_CHOICE_NOTE), confirmation.message);
+    assert.ok(confirmation.message.includes("No or Esc cancels"));
   }
   const unmarked: Array<[string, unknown]> = [
     ["server.trustRemoteCode", false],
