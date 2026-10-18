@@ -1046,13 +1046,16 @@ function projectViolationsOf(project: ReadonlyMap<string, SettingValue>): Projec
 /**
  * Merge the layers into one launch preparation. Precedence is fixed (D-12): `/mlx-start` flags, pi flags,
  * environment, project file, global file, built-in default. A file that is unusable, has an unknown key or
- * a value failing its check refuses the start (errors); a bad environment value is dropped with a warning
- * and resolution continues with the next lower layer.
+ * a value failing its check refuses the start (errors). A bad environment value is dropped with a warning and
+ * resolution continues with the next lower layer, except for a row marked `failClosedEnv` (the pip index): the
+ * next layer down is not what the user asked for, so a bad value there refuses the command. The extension-load
+ * caller may leave the install rows out altogether with `ignoreInstall`.
  */
 export function prepareSettings(input: PrepareInput): PrepareResult {
   const warnings: string[] = [];
   const ignoreInstall = input.ignoreInstall === true;
-  // Problems are collected per layer and reported highest precedence first (the environment only warns).
+  // Problems are collected per layer and reported highest precedence first. The environment only warns, except for a
+  // fail-closed row (the pip index), whose bad environment value is a problem of the `env` layer and refuses.
   const problems: Record<LayerName, string[]> = { args: [], piFlags: [], env: [], project: [], global: [] };
   const files = {
     global: readFileLayer(input.global, "global", problems.global, ignoreInstall),
@@ -1479,6 +1482,17 @@ export function pinNotice(install: InstallSettings, installed: string): string |
   if (install.version === "latest" || sameVersion(install.version, installed)) return undefined;
   const source = install.versionSource === undefined ? "" : ` (${show(install.versionSource)})`;
   return `mlx-lm pinned ${show(install.version)}${source}, installed ${show(installed)}; run /mlx-init to apply`;
+}
+
+/**
+ * The one warning /mlx-start shows when an exact pin is configured and the installed version could not be read, so
+ * the pin was not compared (D-07). Undefined when the policy floats. Every part is cleaned and clipped again, so a
+ * test double or a future caller cannot put a raw reason on screen.
+ */
+export function pinUnreadableNotice(install: InstallSettings, reason: string): string | undefined {
+  if (install.version === "latest") return undefined;
+  const source = install.versionSource === undefined ? "" : ` (${show(install.versionSource)})`;
+  return `mlx-lm pinned ${show(install.version)}${source} was not compared with the installed version: ${show(reason)}`;
 }
 
 /**

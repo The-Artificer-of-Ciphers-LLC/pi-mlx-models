@@ -30,6 +30,7 @@ import {
   initFlagSpecs,
   kvNotices,
   pinNotice,
+  pinUnreadableNotice,
   prepareSettings,
   readLayerFile,
   toLaunchSpec,
@@ -371,6 +372,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         if (installed.ok) {
           const mismatch = pinNotice(installSettings, installed.version);
           if (mismatch !== undefined) ctx.ui.notify(mismatch, "warning");
+        } else {
+          // The pin could not be compared: say so, and start what is installed (D-07).
+          const unread = pinUnreadableNotice(installSettings, installed.reason);
+          if (unread !== undefined) ctx.ui.notify(unread, "warning");
         }
       }
 
