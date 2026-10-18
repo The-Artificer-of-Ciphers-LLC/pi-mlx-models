@@ -394,27 +394,30 @@ export function defaultMaxTokens(contextWindow: number, reasoning: boolean): num
 /**
  * Everything pi is told about one model, and where each value came from. Pure: the same read always gives the same
  * record. The reasoning flag is the preset's when the id is a preset's model id, else the curated name rule's (D-04);
- * input is text for every model (D-05). A later plan lets the profile override both.
+ * input is text for every model (D-05). A value the profile sets in `limits` wins over all of that (D-04, D-11): its label
+ * is the source, a context window it sets replaces the one in `config.json`, and the default output limit is worked out
+ * from the final window and the final reasoning flag.
  */
 export function deriveModelInfo(input: { id: string; config?: ModelConfigRead; limits?: LaunchLimits }): ModelInfo {
-  const { config } = input;
-  const declared = config?.ok ? contextWindowOf(config.config) : undefined;
-  const contextWindow = declared ?? FALLBACK_CONTEXT_WINDOW;
+  const { config, limits } = input;
+  const declared = limits?.contextWindow === undefined && config?.ok ? contextWindowOf(config.config) : undefined;
+  const contextWindow = limits?.contextWindow?.value ?? declared ?? FALLBACK_CONTEXT_WINDOW;
   const preset = MODEL_PRESETS.find((p) => p.modelId === input.id);
-  // Only the preset and the id decide. The chat template is deliberately not consulted: a template can mention thinking
-  // for a model that does not think (Qwen3 Instruct 2507), so as a hint it could never change a correct outcome (D-04).
-  const reasoning: boolean = preset ? preset.reasoning : isReasoningModelId(input.id);
+  // Only the profile, the preset and the id decide. The chat template is deliberately not consulted: a template can
+  // mention thinking for a model that does not think (Qwen3 Instruct 2507), so as a hint it could never change a correct
+  // outcome (D-04).
+  const reasoning: boolean = limits?.reasoning?.value ?? (preset ? preset.reasoning : isReasoningModelId(input.id));
   const info: ModelInfo = {
     contextWindow,
-    contextSource: declared === undefined ? "fallback" : "config.json",
-    maxTokens: defaultMaxTokens(contextWindow, reasoning),
-    maxTokensSource: "default",
+    contextSource: limits?.contextWindow?.label ?? (declared === undefined ? "fallback" : "config.json"),
+    maxTokens: limits?.maxTokens?.value ?? defaultMaxTokens(contextWindow, reasoning),
+    maxTokensSource: limits?.maxTokens?.label ?? "default",
     reasoning,
-    reasoningSource: preset ? "preset" : reasoning ? "model name" : "default",
-    input: ["text"],
-    inputSource: "default",
+    reasoningSource: limits?.reasoning?.label ?? (preset ? "preset" : reasoning ? "model name" : "default"),
+    input: limits?.input === undefined ? ["text"] : [...limits.input.value],
+    inputSource: limits?.input?.label ?? "default",
   };
-  if (declared === undefined) {
+  if (declared === undefined && limits?.contextWindow === undefined) {
     info.fallbackReason =
       config === undefined
         ? "config.json was not read"

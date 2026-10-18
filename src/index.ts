@@ -580,16 +580,19 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       active = { modelId: model, request: launch.request };
       activate(5, "Refreshing provider model list");
       // By now the server has downloaded the model, so its config.json is normally in the cache. A reader that fails gives
-      // the fallback window and never fails the start (D-03).
-      let read: ModelConfigRead;
-      try {
-        read = await deps.readModelConfig(model, { hub: true });
-      } catch {
-        read = { ok: false, reason: "the model reader failed" };
+      // the fallback window and never fails the start (D-03). A profile that sets limits.contextWindow supplies the window
+      // itself, so nothing is read: no config.json lookup, no Hub request and no fallback notice (D-03).
+      let read: ModelConfigRead | undefined;
+      if (launch.limits.contextWindow === undefined) {
+        try {
+          read = await deps.readModelConfig(model, { hub: true });
+        } catch {
+          read = { ok: false, reason: "the model reader failed" };
+        }
       }
       if (isAbandoned()) return;
       // The local value, never the closure's, after an await.
-      const info = deriveModelInfo({ id: model, config: read });
+      const info = deriveModelInfo({ id: model, ...(read === undefined ? {} : { config: read }), limits: launch.limits });
       loaded = { id: model, info };
       await registerProvider(pi, { includeFallback: true, ctx, abandon: isAbandoned });
       if (isAbandoned()) return;

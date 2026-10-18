@@ -3900,15 +3900,15 @@ for (const key of ["profiles", "extends", "defaultProfile"]) {
   });
 }
 
-test("a key inside the reserved limits object of a project profile is refused with the reserved wording", () => {
-  assert.deepEqual(refusedLines({ project: withProfile({ limits: { contextWindow: 1 } }) }), [
-    `${PROFILE_PATH}.limits.contextWindow (${PROJECT}): unknown key (limits is reserved and accepts no keys yet)`,
+test("a key limits does not define inside a project profile is refused as an unknown key", () => {
+  assert.deepEqual(refusedLines({ project: withProfile({ limits: { thinkingTokens: 1 } }) }), [
+    `${PROFILE_PATH}.limits.thinkingTokens (${PROJECT}): unknown key`,
   ]);
 });
 
 test("a nested object inside limits names only its key and never echoes the value", () => {
   const lines = refusedLines({ global: withProfile({ limits: { a: { secret: "ZZZ-NESTED-VALUE" } } }) });
-  assert.deepEqual(lines, [`${PROFILE_PATH}.limits.a (${GLOBAL}): unknown key (limits is reserved and accepts no keys yet)`]);
+  assert.deepEqual(lines, [`${PROFILE_PATH}.limits.a (${GLOBAL}): unknown key`]);
   assert.ok(!lines[0].includes("ZZZ-NESTED-VALUE"));
 });
 

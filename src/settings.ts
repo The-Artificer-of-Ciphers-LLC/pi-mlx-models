@@ -2,7 +2,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
-import type { LaunchLimits } from "./modelinfo.js";
+import type { InputKind, LaunchLimits } from "./modelinfo.js";
 import type { RequestOverrides, SamplingValues } from "./request.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
 import type { CliFlagSpec } from "./startargs.js";
@@ -411,6 +411,18 @@ function checkTemplateArgs(value: unknown): CheckResult {
   return ok(copy.value as SettingObject);
 }
 
+const INPUT_KINDS: readonly string[] = ["text", "image"];
+
+/**
+ * The input kinds pi is told a model takes (D-10): a non-empty list of `text` and `image` entries that includes `text`.
+ * A repeated entry collapses to one, keeping the first order, and the result is a copy.
+ */
+function checkInputKinds(value: unknown): CheckResult {
+  if (!Array.isArray(value) || value.length < 1) return bad;
+  if (!value.every((entry) => typeof entry === "string" && INPUT_KINDS.includes(entry)) || !value.includes("text")) return bad;
+  return ok([...new Set(value as string[])]);
+}
+
 /** The same value typed as text, in mlx-lm's own form: a JSON string of an object. */
 function parseTemplateArgs(raw: string): CheckResult {
   const text = raw.trim();
@@ -442,6 +454,7 @@ const PHRASES = {
     `${shown} must be a non-empty string or a list of 1 to ${MAX_STOP_STRINGS} non-empty strings of at most ${MAX_STOP_LENGTH} characters`,
   oneOf: (members: readonly string[]) => (shown: string) => `${shown} must be one of ${members.join(", ")}`,
   boolean: (shown: string) => `${shown} must be true or false`,
+  input: (shown: string) => `${shown} must be a list of "text" and "image" that includes "text"`,
   string: (shown: string) => `${shown} must be a non-empty string`,
   host: (shown: string) => `${shown} is not a valid host name or address`,
   url: (shown: string) => `${shown} must be an http or https URL`,
@@ -764,6 +777,52 @@ export const SETTINGS: readonly SettingDef[] = [
     emit: () => [],
   },
   {
+    // The four `limits` rows tell pi about the model (D-10). They are profile-only: `limits` is read inside a profile and
+    // nowhere else (D-11), and no row has a server flag, a request field, an environment variable or a default, so
+    // nothing here ever reaches argv or a request body.
+    path: "model.limits.contextWindow",
+    kind: "integer",
+    perModel: true,
+    expected: "an integer of at least 1",
+    check: checkIntegerAtLeast(1),
+    problem: PHRASES.integerAtLeast(1),
+    parseText: parseDigits(checkIntegerAtLeast(1)),
+    emit: () => [],
+  },
+  {
+    path: "model.limits.maxTokens",
+    kind: "integer",
+    perModel: true,
+    expected: "an integer of at least 1",
+    check: checkIntegerAtLeast(1),
+    problem: PHRASES.integerAtLeast(1),
+    parseText: parseDigits(checkIntegerAtLeast(1)),
+    emit: () => [],
+  },
+  {
+    path: "model.limits.reasoning",
+    kind: "bool",
+    perModel: true,
+    expected: "true or false",
+    check: checkBoolean,
+    problem: PHRASES.boolean,
+    parseText: (raw) => {
+      const text = raw.trim();
+      return text === "true" ? ok(true) : text === "false" ? ok(false) : bad;
+    },
+    emit: () => [],
+  },
+  {
+    path: "model.limits.input",
+    kind: "list",
+    perModel: true,
+    expected: 'a list of "text" and "image" that includes "text"',
+    check: checkInputKinds,
+    problem: PHRASES.input,
+    parseText: () => bad,
+    emit: () => [],
+  },
+  {
     // Which models the provider registers with pi: false lists only the launched one, true lists everything the server
     // reports (D-12). It changes only which already-reported ids pi shows, so a project file may set it. It has no
     // environment variable, flag or default: it can only be written in a file, and it never reaches argv or a request.
@@ -880,7 +939,7 @@ const SAMPLING_CANDIDATES: readonly Candidate[] = [...SAMPLING_ROWS.keys()].map(
 const PROFILES_KEY = "profiles";
 /** The key of a `models` entry that names the profile used when `/mlx-start` gives none (D-02). */
 const DEFAULT_PROFILE_KEY = "defaultProfile";
-/** The key of the reserved object inside a profile (D-17) and the path prefix of the rows Phase 5 adds for it. */
+/** The key of the `limits` object inside a profile (D-10) and the path prefix of its four rows. */
 const LIMITS_KEY = "limits";
 const LIMITS_PREFIX = `${MODEL_BLOCK}.${LIMITS_KEY}.`;
 /** A profile name: 1 to 64 characters, a letter or digit first, then letters, digits, `.`, `_` and `-` (T-04-15). */
@@ -908,6 +967,8 @@ const TOP_LEVEL: readonly Candidate[] = [...new Set([...SETTINGS.map((row) => ro
 function nestedKeys(filter: { inBlock?: string; exceptBlock?: string }): Candidate[] {
   const seen = new Set<string>();
   return SETTINGS.filter((row) => row.path.includes(".")).flatMap((row) => {
+    // The `limits` rows are written inside a profile only, so `model.limits` is never a place a mistyped key could belong.
+    if (row.path.startsWith(LIMITS_PREFIX)) return [];
     const [block, name] = row.path.split(".");
     if (filter.inBlock !== undefined && block !== filter.inBlock) return [];
     if (filter.exceptBlock !== undefined && block === filter.exceptBlock) return [];
@@ -1198,10 +1259,10 @@ function readSampling(target: Map<string, SettingValue>, prefix: string, label: 
 }
 
 /**
- * Read the reserved `limits` object of one profile (D-17). Phase 5 defines its keys by adding rows whose paths start with
- * `model.limits.`; they are looked up in the table when this runs, so a row added later is found with no change here.
- * Until then every key is an error. Values land in `target` under their row's path, so they overlay and merge like every
- * other profile value; they have no server flag and no request field. Keys are only compared as text, never assigned.
+ * Read the `limits` object of one profile (D-10). Its keys are the rows whose paths start with `model.limits.`
+ * (`contextWindow`, `maxTokens`, `reasoning` and `input`); they are looked up in the table when this runs. Values land in
+ * `target` under their row's path, so they overlay and merge like every other profile value; they have no server flag and
+ * no request field. Keys are only compared as text, never assigned, so a key such as `__proto__` is just an unknown key.
  */
 function readLimits(target: Map<string, SettingValue>, prefix: string, label: string, value: unknown, problems: string[]): void {
   const where = `${prefix}.${LIMITS_KEY}`;
@@ -1215,7 +1276,7 @@ function readLimits(target: Map<string, SettingValue>, prefix: string, label: st
     const row = rows.find((candidate) => candidate.path === `${LIMITS_PREFIX}${key}`);
     if (row === undefined) {
       const meant = nearest(key, candidates);
-      const hint = rows.length === 0 ? " (limits is reserved and accepts no keys yet)" : meant === undefined ? "" : ` (did you mean ${meant}?)`;
+      const hint = meant === undefined ? "" : ` (did you mean ${meant}?)`;
       problems.push(`${where}.${showKey(key)} (${label}): unknown key${hint}`);
       continue;
     }
@@ -1226,8 +1287,8 @@ function readLimits(target: Map<string, SettingValue>, prefix: string, label: st
 }
 
 /**
- * Read one profile body (D-03, D-05): the per-model keys of the `model` block, the `sampling` object and the reserved
- * `limits` object, nothing else. A server-wide key, a nested `profiles` or any other key is a line naming the key, the
+ * Read one profile body (D-03, D-05): the per-model keys of the `model` block, the `sampling` object and the `limits`
+ * object, nothing else. A server-wide key, a nested `profiles` or any other key is a line naming the key, the
  * profile and the file layer (T-04-13). The values go into a fresh Map keyed by row path.
  */
 function readProfile(profilePath: string, label: string, body: Record<string, unknown>, problems: string[]): Map<string, SettingValue> {
@@ -1806,6 +1867,22 @@ export function buildLaunch(
   if (isSettingObject(templateArgs) && Object.keys(templateArgs).length > 0) {
     request.chatTemplateArgs = JSON.parse(JSON.stringify(templateArgs)) as SettingObject;
   }
+  // What a profile tells pi about the model (D-10) is read from the folded values and goes into `limits` only: no flag,
+  // no request field. The label says which profile supplied each value; a list is copied so the record shares nothing.
+  const limits: LaunchLimits = {};
+  const limitOf = (key: string) => {
+    const row = ROWS_BY_PATH.get(`${LIMITS_PREFIX}${key}`);
+    const hit = folded.get(`${LIMITS_PREFIX}${key}`);
+    return row === undefined || hit === undefined ? undefined : { value: hit.value, label: sourceLabel(hit, row) };
+  };
+  const contextWindow = limitOf("contextWindow");
+  if (typeof contextWindow?.value === "number") limits.contextWindow = { value: contextWindow.value, label: contextWindow.label };
+  const maxTokens = limitOf("maxTokens");
+  if (typeof maxTokens?.value === "number") limits.maxTokens = { value: maxTokens.value, label: maxTokens.label };
+  const reasoning = limitOf("reasoning");
+  if (typeof reasoning?.value === "boolean") limits.reasoning = { value: reasoning.value, label: reasoning.label };
+  const input = limitOf("input");
+  if (Array.isArray(input?.value)) limits.input = { value: [...input.value] as InputKind[], label: input.label };
   return {
     ok: true,
     launch: {
@@ -1815,7 +1892,7 @@ export function buildLaunch(
       flags: [...prepared.flags, ...modelFlags],
       request,
       requestNotes,
-      limits: {},
+      limits,
       ...(selected === undefined ? {} : { profile: { name: selected, source } }),
     },
   };
