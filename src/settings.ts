@@ -115,6 +115,12 @@ export interface SettingDef {
   blankEnvInvalid?: boolean;
   /** The flag spelling `/mlx-start` accepts for this row, for example `--port`; a row without one cannot be set there. */
   cli?: string;
+  /**
+   * The flag spelling `/mlx-init` accepts for this row, for example `--mlx-lm-version`. Kept separate from `cli` on
+   * purpose: `cliFlagSpecs()` derives the `/mlx-start` flags from `cli`, and the install settings must not become
+   * `/mlx-start` flags.
+   */
+  initCli?: string;
   /** The pi flag that sets this row, without its dashes, for example `mlx-port`. */
   piFlag?: string;
   /** The mlx_lm.server flag this row becomes. */
@@ -580,6 +586,8 @@ export const SETTINGS: readonly SettingDef[] = [
     check: checkPin,
     problem: PHRASES.pin,
     parseText: (raw) => checkPin(raw.trim()),
+    env: "PI_MLX_MODELS_MLX_LM_VERSION",
+    initCli: "--mlx-lm-version",
     emit: () => [],
   },
 ];
@@ -605,6 +613,11 @@ export const PI_FLAGS: readonly PiFlagDef[] = [
 /** The flags `/mlx-start` accepts, derived from the rows that declare one; all take a value except the bare ones. */
 export function cliFlagSpecs(): CliFlagSpec[] {
   return SETTINGS.flatMap((row) => (row.cli === undefined ? [] : [{ flag: row.cli, path: row.path, takesValue: row.bare !== true }]));
+}
+
+/** The flags `/mlx-init` accepts, derived from the rows that declare an `initCli`; all of them take a value. */
+export function initFlagSpecs(): CliFlagSpec[] {
+  return SETTINGS.flatMap((row) => (row.initCli === undefined ? [] : [{ flag: row.initCli, path: row.path, takesValue: true }]));
 }
 
 const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
@@ -725,6 +738,9 @@ const showValue = (value: unknown): string => {
   }
 };
 
+/** The command a typed flag of this row belongs to: `/mlx-init` for an install setting, else `/mlx-start`. */
+const commandOf = (row: SettingDef): string => (row.initCli === undefined ? "/mlx-start" : "/mlx-init");
+
 /** The layer name as it appears in the flags line. */
 function displayLabel(layer: LayerName, row: SettingDef): string {
   switch (layer) {
@@ -733,7 +749,7 @@ function displayLabel(layer: LayerName, row: SettingDef): string {
     case "project":
       return "project file";
     case "args":
-      return "/mlx-start";
+      return commandOf(row);
     case "piFlags":
       return `pi flag --${row.piFlag}`;
     case "env":
@@ -743,7 +759,7 @@ function displayLabel(layer: LayerName, row: SettingDef): string {
 
 /** The layer as a problem line labels it. A command-line or pi flag label already names the flag. */
 function problemLabel(layer: "args" | "piFlags", row: SettingDef): string {
-  return layer === "args" ? `/mlx-start ${row.cli}` : displayLabel(layer, row);
+  return layer === "args" ? `${commandOf(row)} ${row.initCli ?? row.cli}` : displayLabel(layer, row);
 }
 
 /** What names the value in a base URL warning. */
@@ -753,7 +769,7 @@ function sourceName(layer: LayerName, row: SettingDef): string {
     case "project":
       return `${row.path} in ${FILE_LABEL[layer]}`;
     case "args":
-      return String(row.cli);
+      return String(row.cli ?? row.initCli);
     case "piFlags":
       return `--${row.piFlag}`;
     case "env":
@@ -975,7 +991,7 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
       case "piFlags": {
         // Only a row that declares a flag for this layer can be set by it; anything else is never looked at.
         let raw: string | true | undefined;
-        if (layer === "args") raw = row.cli === undefined ? undefined : input.args?.[row.path];
+        if (layer === "args") raw = row.cli === undefined && row.initCli === undefined ? undefined : input.args?.[row.path];
         else raw = row.piFlag === undefined ? undefined : input.piFlags?.[row.piFlag];
         // A pi flag that was given no text is the same as one that was not given.
         if (raw === undefined || (raw !== true && layer === "piFlags" && raw.trim() === "")) return undefined;
