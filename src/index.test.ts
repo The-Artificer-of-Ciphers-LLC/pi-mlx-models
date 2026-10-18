@@ -135,7 +135,7 @@ async function setup(
     /** What the port probe of auto-start finds (true: something answers); default: nothing does. No test opens a socket. */
     probePort?: (host: string, port: number) => Promise<boolean>;
     /** What the runtime precheck of auto-start finds; default: a usable runtime. */
-    runtimeInstalled?: () => Promise<boolean>;
+    runtimeInstalled?: () => Promise<boolean | "timed out">;
   } = {},
 ) {
   const fakeModelConfig = makeFakeModelConfig();
@@ -5884,6 +5884,18 @@ test("auto-start with the runtime missing shows one warning that names /mlx-init
 
   assert.equal(h.runtimeChecks, 1);
   assert.deepEqual(h.notes, [{ message: "auto-start skipped: the MLX runtime is not installed; run /mlx-init, then /mlx-start", type: "warning" }]);
+  assertAutoStartIdle(h);
+});
+
+test("auto-start with a runtime check that timed out says so instead of claiming the runtime is not installed", async () => {
+  const { h } = await autoSetup({ setup: { runtimeInstalled: async () => "timed out" } });
+
+  await sessionStart(h);
+
+  assert.equal(h.runtimeChecks, 1);
+  assert.deepEqual(h.notes, [
+    { message: "auto-start skipped: the check that mlx-lm can be imported timed out; run /mlx-start to start by hand", type: "warning" },
+  ]);
   assertAutoStartIdle(h);
 });
 

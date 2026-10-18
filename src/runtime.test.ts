@@ -4,7 +4,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { VENV_DIR, VENV_PYTHON } from "./config.js";
-import { ensureInstalled, findPython, pythonCandidates, run, runtimeInstalled, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
+import { RunTimeoutError, ensureInstalled, findPython, pythonCandidates, run, runtimeCheck, runtimeInstalled, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
 
 function fakeHost(overrides: Partial<RuntimeHost> & { venv?: boolean } = {}) {
   const calls: string[][] = [];
@@ -607,6 +607,26 @@ test("runtimeInstalled: a run that rejects is not installed", async () => {
     },
   });
   assert.equal(await runtimeInstalled(host), false);
+});
+
+test("runtimeCheck tells a timed-out import check from a missing runtime, and runtimeInstalled still answers false for both", async () => {
+  const timedOut = fakeHost({
+    venv: true,
+    run: async () => {
+      throw new RunTimeoutError("python", 60_000);
+    },
+  });
+  const missing = fakeHost({
+    venv: true,
+    run: async () => {
+      throw new Error("No module named mlx_lm");
+    },
+  });
+  assert.equal(await runtimeCheck(timedOut.host), "timed out");
+  assert.equal(await runtimeCheck(missing.host), "missing");
+  assert.equal(await runtimeCheck(fakeHost({ venv: false }).host), "missing");
+  assert.equal(await runtimeCheck(fakeHost({ venv: true }).host), "installed");
+  assert.equal(await runtimeInstalled(timedOut.host), false);
 });
 
 test("runtimeInstalled: a run that throws before it returns a promise is not installed", async () => {
