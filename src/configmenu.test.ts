@@ -286,6 +286,67 @@ test("configmenu typed model key that can match asks nothing: a preset key, org/
   }
 });
 
+test("configmenu a typed model key is asked about only when it is new: a key picked from the list and a typed key already in the file ask nothing", async (t) => {
+  const file = { models: { careful: {} } };
+  const picked = session(t, { file, select: [MENU.modelEntry, "1. careful", "numDraftTokens", ACTION.set, MENU.done], input: ["2"] });
+  await picked.run();
+  assert.deepEqual(picked.json(), { models: { careful: { numDraftTokens: 2 } } });
+  assert.equal(picked.confirms.length, 0);
+  picked.assertScriptsUsed();
+
+  const retyped = session(t, { file, select: [MENU.modelEntry, NEW_ENTRY, "numDraftTokens", ACTION.set, MENU.done], input: ["careful", "2"] });
+  await retyped.run();
+  assert.deepEqual(retyped.json(), { models: { careful: { numDraftTokens: 2 } } });
+  assert.equal(retyped.confirms.length, 0);
+  retyped.assertScriptsUsed();
+
+  const other = session(t, { file, confirm: false, select: [MENU.modelEntry, NEW_ENTRY, MENU.done], input: ["fast"] });
+  await other.run();
+  assert.equal(other.confirms.length, 1);
+  assert.deepEqual(other.json(), file);
+  other.assertScriptsUsed();
+});
+
+test("configmenu the Add anyway question fails closed: no, undefined and a throw add nothing, a yes adds the entry", async (t) => {
+  const answers: Array<[string, Partial<ConfigMenuUi>, boolean]> = [
+    ["no", { confirm: async () => false }, false],
+    ["undefined", { confirm: async () => undefined as unknown as boolean }, false],
+    ["throw", { confirm: async () => { throw new Error("dialog failed"); } }, false],
+    ["yes", { confirm: async () => true }, true],
+  ];
+  for (const [answer, ui, writes] of answers) {
+    const select = writes ? [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done] : [MENU.profiles, NEW_ENTRY, MENU.done];
+    const s = session(t, { select, input: writes ? ["careful", "fast"] : ["careful"], ui });
+    await s.run();
+    s.assertScriptsUsed();
+    if (writes) {
+      assert.deepEqual(s.json(), { models: { careful: { profiles: { fast: {} } } } }, answer);
+    } else {
+      assert.equal(existsSync(s.path), false, answer);
+    }
+  }
+});
+
+test("configmenu the Add anyway question shows a hostile key safely: credentials hidden, long text clipped, no control character", async (t) => {
+  const secret = session(t, { confirm: false, select: [MENU.profiles, NEW_ENTRY, MENU.done], input: ["user:secret@host"] });
+  await secret.run();
+  assert.equal(secret.confirms.length, 1);
+  const { title, message } = secret.confirms[0];
+  assert.equal(title.includes("secret"), false, title);
+  assert.equal(message.includes("secret"), false, message);
+  assert.ok(title.includes("***") && message.includes("***"), `${title} | ${message}`);
+  assert.equal(secret.notes.some((note) => note.message.includes("secret")), false, JSON.stringify(secret.notes));
+  secret.assertScriptsUsed();
+
+  const long = session(t, { confirm: false, select: [MENU.profiles, NEW_ENTRY, MENU.done], input: ["a".repeat(4000)] });
+  await long.run();
+  assert.equal(long.confirms.length, 1);
+  assert.ok(long.confirms[0].title.length < 140, String(long.confirms[0].title.length));
+  assert.ok(long.confirms[0].message.length < 1200, String(long.confirms[0].message.length));
+  assert.equal(long.notes.some((note) => /[\u0000-\u001f\u007f-\u009f]/.test(note.message)), false);
+  long.assertScriptsUsed();
+});
+
 test("configmenu add a profile: an empty profile is created, then its keys land in sampling and limits objects, and the file validates", async (t) => {
   const start = { models: { qwen3_4b: {} } };
   const created = session(t, { file: start, select: [MENU.profiles, "qwen3_4b", NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: ["fast"] });

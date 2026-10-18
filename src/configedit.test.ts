@@ -613,3 +613,14 @@ test("isPlausibleModelKey: a preset key, an id with a slash and a local path can
     assert.equal(isPlausibleModelKey(key), false, key);
   }
 });
+
+test("configedit the validateModelKey comment tells the truth: it names isPlausibleModelKey and no longer credits the shape rules to the settings module", () => {
+  const text = readFileSync(new URL("../src/configedit.ts", import.meta.url), "utf8");
+  const end = text.indexOf("export function validateModelKey");
+  assert.ok(end > 0, "validateModelKey not found in src/configedit.ts");
+  const start = text.lastIndexOf("/**", end);
+  assert.ok(start >= 0 && text.indexOf("*/", start) < end, "no doc comment above validateModelKey");
+  const block = text.slice(start, end);
+  assert.ok(block.includes("isPlausibleModelKey"), block);
+  assert.equal(block.includes("rule the settings module puts on a model id"), false, block);
+});
