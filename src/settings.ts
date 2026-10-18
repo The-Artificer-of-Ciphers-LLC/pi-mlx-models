@@ -763,6 +763,21 @@ export const SETTINGS: readonly SettingDef[] = [
     emit: () => [],
   },
   {
+    // Which models the provider registers with pi: false lists only the launched one, true lists everything the server
+    // reports (D-12). It changes only which already-reported ids pi shows, so a project file may set it. It has no
+    // environment variable, flag or default: it can only be written in a file, and it never reaches argv or a request.
+    path: "provider.listAllModels",
+    kind: "bool",
+    expected: "true or false",
+    check: checkBoolean,
+    problem: PHRASES.boolean,
+    parseText: (raw) => {
+      const text = raw.trim();
+      return text === "true" ? ok(true) : text === "false" ? ok(false) : bad;
+    },
+    emit: () => [],
+  },
+  {
     path: "baseUrl",
     kind: "string",
     expected: "an http or https URL",
@@ -1524,7 +1539,7 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
         ...(sources.has("mlxLm.version") ? { versionSource: sources.get("mlxLm.version")!.label } : {}),
         ...(sources.has("mlxLm.pipIndex") ? { pipIndexSource: sources.get("mlxLm.pipIndex")!.label } : {}),
       },
-      listAllModels: false,
+      listAllModels: value("provider.listAllModels") === true,
       modelSettings: {
         layers: (["global", "project"] as const).map((layer) => ({
           layer,

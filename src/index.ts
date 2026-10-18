@@ -171,12 +171,15 @@ function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
 export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   const deps = withDefaults(overrides);
   const { server } = deps;
-  let currentModel = DEFAULT_MODEL_ID;
   /** The base URL the provider is registered with and discovery polls: the latest launch's, or the ambient one before any. */
   let activeBaseUrl = deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT);
   let activeProgress: Progress | null = null;
   /** The launch made in this session and what to write into its requests; null before any start and while a start is under way (D-12). */
   let active: ActiveLaunch | null = null;
+  /** `provider.listAllModels` of the latest launch (the ambient value before any): whether the provider lists every model the server reports. */
+  let listAllModels = false;
+  /** The model the running server has loaded: set when a start becomes ready, null before any start, while one is under way and after a stop. */
+  let loaded: { id: string } | null = null;
   /** Config warnings already shown, so each distinct text appears once per extension instance. */
   const shownWarnings = new Set<string>();
   /** Whether the bad-payload notice has been shown in this extension instance (D-11). */
@@ -267,10 +270,24 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     }
   }
 
+  /**
+   * Register the provider with the models pi should list (MOD-04, D-12, D-13). By default that is the model the server has
+   * loaded and nothing else, so nothing is listed before the first start, while one is under way and after a stop; the
+   * model discovery is not asked at all. With `provider.listAllModels` true it is every model the server reports, or the
+   * loaded model when discovery finds none and the caller asks for the fallback. Registering again replaces the provider's
+   * earlier list; pi's unregisterProvider is never used, so a stop or a shutdown registers an empty list instead.
+   * A user of an external server (PI_MLX_MODELS_BASE_URL) has no loaded model and so sees no models until
+   * `provider.listAllModels` is true.
+   */
   async function registerProvider(pi: PiHost, options?: { includeFallback?: boolean }) {
-    const discovered = await deps.discoverModelIds(activeBaseUrl);
     const includeFallback = options?.includeFallback ?? false;
-    const modelIds = discovered.length ? discovered : includeFallback ? [currentModel] : [];
+    let modelIds: string[];
+    if (listAllModels) {
+      const discovered = await deps.discoverModelIds(activeBaseUrl);
+      modelIds = discovered.length ? discovered : includeFallback && loaded !== null ? [loaded.id] : [];
+    } else {
+      modelIds = loaded === null ? [] : [loaded.id];
+    }
 
     pi.registerProvider(PROVIDER_ID, {
       name: "PI MLX Models",
@@ -291,6 +308,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   async function stopServer(ctx: any) {
     cancelStarts(); // cancels an in-flight start or init, including one still waiting on the installer
     active = null; // the values end with the launch (D-12)
+    loaded = null;
     activeProgress?.clear();
     activeProgress = null;
     await server.stop();
@@ -356,18 +374,26 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     initEpoch += 1;
     startInFlight = mine;
     try {
-      await runStart(pi, ctx, built.launch, prepared.install, mine);
+      await runStart(pi, ctx, built.launch, prepared.install, mine, prepared.listAllModels);
     } finally {
       if (startInFlight === mine) startInFlight = null;
     }
   }
 
-  async function runStart(pi: PiHost, ctx: any, launch: ResolvedLaunch, installSettings: InstallSettings, mine: number) {
+  async function runStart(
+    pi: PiHost,
+    ctx: any,
+    launch: ResolvedLaunch,
+    installSettings: InstallSettings,
+    mine: number,
+    listAll: boolean,
+  ) {
     const isStale = () => startEpoch !== mine;
     active = null;
+    loaded = null;
     const { modelId: model, presetKey } = launch.model;
-    currentModel = model;
     activeBaseUrl = launch.baseUrl;
+    listAllModels = listAll;
     await registerProvider(pi, { includeFallback: false });
     if (isStale()) return;
 
@@ -486,6 +512,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             break;
           case "exited":
             active = null; // a dead server's values must never apply to a later server on the same port (A7)
+            loaded = null;
             progress.stop();
             ctx.ui.setStatus(PROVIDER_ID, "mlx: stopped");
             break;
@@ -494,6 +521,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
       if (isStale()) return;
       active = { modelId: model, request: launch.request };
+      loaded = { id: model };
       activate(5, "Refreshing provider model list");
       await registerProvider(pi, { includeFallback: true });
       if (isStale()) return;
@@ -520,7 +548,6 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
     const ambient = ambientSettings();
     activeBaseUrl = ambient.baseUrl;
-    currentModel = ambient.defaultModel;
     await registerProvider(pi, { includeFallback: false });
 
     pi.registerCommand("mlx-init", {
@@ -680,6 +707,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     pi.on("session_shutdown", async () => {
       cancelStarts(); // a start still waiting on the installer must not launch a server after shutdown
       active = null; // the values end with the launch, before any await (D-12)
+      loaded = null;
       activeProgress?.stop();
       // Wait for the child to exit so a quitting pi does not leave it holding the port, but never
       // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.

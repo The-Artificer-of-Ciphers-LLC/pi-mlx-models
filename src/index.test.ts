@@ -646,7 +646,11 @@ test("a failed install also leaves a failed status rather than an empty one", as
 // WR-06: discovered model ids come from the local server and are rendered as the model name.
 test("a discovered model id with control characters is cleaned in the display name only", async () => {
   const hostile = "org/model\u001b]0;pwned\u0007\u009b31m";
-  const { providerCalls } = await setup({ discovered: [hostile] });
+  // Only the all-models list shows ids the server reports without their being launched (MOD-04, D-12).
+  const settings = freshSettings({});
+  writeFileSync(settings.globalConfigPath, '{"provider":{"listAllModels":true}}');
+  const { commands, ctx, providerCalls } = await setup({ discovered: [hostile], settings });
+  await commands.get("mlx-start")!("qwen3_4b", ctx);
 
   const [model] = providerCalls.at(-1)!.config.models as Array<{ id: string; name: string }>;
 
