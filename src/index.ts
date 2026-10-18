@@ -1151,7 +1151,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           ctx.ui.notify(failed("mlx-status", parsed.error), "error");
           return;
         }
-        const snapshot = launchRecord;
+        let snapshot = launchRecord;
         let address: ServerAddress;
         let baseUrl: string;
         if (snapshot !== null) {
@@ -1183,7 +1183,14 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           ({ address, baseUrl } = result.prepared);
         }
 
-        const probe = await deps.probeHealth(address, baseUrl);
+        let probe = await deps.probeHealth(address, baseUrl);
+        // A launch that replaced this one during the probe (/mlx-restart, /mlx-last) listens somewhere else, possibly: look again,
+        // once, at the current one. A record that was only cleared (/mlx-stop, an exit) is reported as before.
+        if (snapshot !== null && recordOf(snapshot.epoch) === null && launchRecord !== null) {
+          snapshot = launchRecord;
+          ({ address, baseUrl } = snapshot);
+          probe = await deps.probeHealth(address, baseUrl);
+        }
         // Health is observed, never stored. A record that was cleared or replaced during the probe no longer describes it.
         const record = snapshot !== null && recordOf(snapshot.epoch) !== null ? snapshot : null;
         const session: SessionState = record === null ? "none" : record.ready ? "ready" : "starting";
