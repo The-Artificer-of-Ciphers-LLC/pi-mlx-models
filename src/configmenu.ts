@@ -40,6 +40,20 @@ export const ACTION = {
   back: "Back",
 } as const;
 
+/** The list entry that adds a model entry by name. */
+export const NEW_ENTRY = "New model entry...";
+/** The list entry that adds a profile by name. */
+export const NEW_PROFILE = "New profile...";
+/** The list entry that clears a model's default profile. */
+export const NO_DEFAULT = "(no default profile)";
+
+/** What can be done with one profile. */
+export const PROFILE_ACTION = {
+  edit: "Edit a key of this profile",
+  delete: "Delete this profile",
+  back: "Back",
+} as const;
+
 /** The parts of pi's `ctx.ui` the menu uses, with pi's signatures. */
 export interface ConfigMenuUi {
   select(title: string, options: string[], opts?: unknown): Promise<string | undefined>;
