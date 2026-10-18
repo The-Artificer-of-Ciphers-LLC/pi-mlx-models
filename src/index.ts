@@ -55,6 +55,7 @@ import {
   type ResolvedLaunch,
   type SettingsSource,
 } from "./settings.js";
+import { lastLaunchPath, readLastLaunch, writeLastLaunch } from "./laststate.js";
 import { parseStartArgs, type CliFlagValue } from "./startargs.js";
 
 const PROGRESS_WIDGET = "mlx-progress";
@@ -73,9 +74,16 @@ interface LaunchRun {
   command: LaunchCommand;
   /** The profile selection handed to `buildLaunch`; absent means the model's own default applies. */
   profile?: string;
-  /** Whether `profile` was typed in this command or kept from an earlier launch. Not read until a later plan. */
+  /** Whether `profile` was typed in this command or kept from an earlier launch; it words the profile source in the start message. */
   profileOrigin?: "typed" | "kept";
 }
+
+/** The slash form of each launch command, as `buildLaunch` words its profile lines. A fixed map: no user text is ever looked up in it. */
+const SLASH_FORM: Record<LaunchCommand, "/mlx-start" | "/mlx-last" | "/mlx-restart"> = {
+  "mlx-start": "/mlx-start",
+  "mlx-last": "/mlx-last",
+  "mlx-restart": "/mlx-restart",
+};
 
 /**
  * Shown once per session when a request for this provider's launched model has a payload the rewrite cannot read (D-11).
@@ -322,6 +330,9 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     return promise;
   }
 
+  /** Where the last launch is remembered: next to the global config file (D-01). */
+  const statePath = (): string => lastLaunchPath(deps.settings.globalConfigPath);
+
   /** Show each configuration warning once per extension instance, however many commands read the same files. */
   function showConfigWarnings(ctx: any, warnings: readonly string[]) {
     for (const warning of warnings) {
@@ -520,7 +531,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       prepared,
       { modelId: selected.modelId, ...(selected.preset ? { presetKey: selected.preset.key } : {}) },
       { home: deps.settings.home, cwd: workingDirectory(ctx) },
-      run.profile === undefined ? {} : { profile: run.profile },
+      run.profile === undefined ? {} : { profile: run.profile, command: SLASH_FORM[run.command], origin: run.profileOrigin ?? "typed" },
     );
     if (!built.ok) {
       ctx.ui.notify(failed(run.command, formatConfigErrors(built.errors)), "error");
@@ -707,6 +718,15 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       }, toLaunchSpec(launch, skipped));
 
       if (isStale()) return;
+      // Remembered here and nowhere else: the server has answered a completion and the start is neither stopped, superseded
+      // nor over, so a failed or abandoned start can never overwrite a good record (D-03). Every route that starts a model
+      // passes through this point (D-04). Only the model id and the profile that applied are kept (D-02).
+      if (!serverExited) {
+        const remembered = writeLastLaunch(statePath(), { model, profile: launch.profile?.name ?? null });
+        if (!remembered.ok) {
+          showConfigWarnings(ctx, [`pi-mlx-models: could not remember this launch (${remembered.reason}); /mlx-last keeps using the previous one.`]);
+        }
+      }
       active = { modelId: model, request: launch.request };
       activate(5, "Refreshing provider model list");
       // By now the server has downloaded the model, so its config.json is normally in the cache. A reader that fails gives
@@ -872,6 +892,45 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         }
 
         await startModelFromInput(pi, ctx, modelInput, prepared, run);
+      },
+    });
+
+    pi.registerCommand("mlx-last", {
+      description: "Start the model of the last launch again, with its profile. Usage: /mlx-last [--profile name] [--flag value ...]",
+      handler: async (args, ctx) => {
+        // The same flags as /mlx-start and no model: the model comes from the record (D-07).
+        const parsed = parseStartArgs(args ?? "", [...cliFlagSpecs(), PROFILE_FLAG_SPEC], { command: "/mlx-last", takesModel: false });
+        if (!parsed.ok) {
+          ctx.ui.notify(failed("mlx-last", parsed.error), "error");
+          return;
+        }
+        // The record is read before any configuration, so a user with nothing to relaunch gets that answer first (D-06).
+        const record = readLastLaunch(statePath());
+        if (record.state === "absent") {
+          ctx.ui.notify("mlx-last: nothing is remembered yet. Run /mlx-start to pick a model; the next successful start is remembered.", "info");
+          return;
+        }
+        if (record.state === "unreadable") {
+          ctx.ui.notify(
+            failed(
+              "mlx-last",
+              `the remembered launch file ${record.reason}; treating it as nothing remembered. Run /mlx-start to choose a model; a successful start replaces the file.`,
+            ),
+            "error",
+          );
+          return;
+        }
+        const settings = readLaunchSettings(pi, ctx, "mlx-last", parsed.flags);
+        if (settings === undefined) return;
+        const { prepared, profile: typedProfile } = settings;
+        // A typed --profile beats the remembered one; a remembered profile the model no longer defines is refused by
+        // buildLaunch, with no fallback to another profile or to the bare model (D-06).
+        const profile = typedProfile ?? record.value.profile ?? undefined;
+        const run: LaunchRun = {
+          command: "mlx-last",
+          ...(profile === undefined ? {} : { profile, profileOrigin: typedProfile !== undefined ? "typed" : "kept" }),
+        };
+        await startModelFromInput(pi, ctx, record.value.model, prepared, run);
       },
     });
 

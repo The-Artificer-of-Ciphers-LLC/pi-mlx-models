@@ -184,10 +184,10 @@ async function setup(
 
 const errors =(notes: Note[]) => notes.filter((n) => n.type === "error").map((n) => n.message);
 
-test("the extension registers mlx-init, mlx-start and mlx-stop, a session_shutdown handler and one initial provider", async () => {
+test("the extension registers mlx-init, mlx-last, mlx-start and mlx-stop, a session_shutdown handler and one initial provider", async () => {
   const { commands, handlers, providerCalls } = await setup();
 
-  assert.deepEqual([...commands.keys()].sort(), ["mlx-init", "mlx-start", "mlx-stop"]);
+  assert.deepEqual([...commands.keys()].sort(), ["mlx-init", "mlx-last", "mlx-start", "mlx-stop"]);
   assert.ok(handlers.has("session_shutdown"));
   assert.equal(providerCalls.length, 1);
   assert.equal(providerCalls[0].name, PROVIDER_ID);

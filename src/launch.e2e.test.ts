@@ -1,7 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
@@ -384,7 +384,9 @@ test("a missing global file is simply absent and is never created", { timeout: 3
   assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
   assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port)]);
   assert.equal(existsSync(h.globalConfigPath), false);
-  assert.equal(existsSync(dirname(h.globalConfigPath)), false);
+  // The data directory now exists because a successful start remembers itself there (plan 06-06); the config file stays absent
+  // and the record is the only thing the extension put in the directory.
+  assert.deepEqual(readdirSync(dirname(h.globalConfigPath)), ["last-launch.json"]);
 });
 
 test("flags typed on /mlx-start reach the process, and the next start without them is back to the file and defaults", { timeout: 30_000 }, async (t) => {
