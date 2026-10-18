@@ -798,6 +798,39 @@ test("mlx-start with a model and flags launches that model on those flags, and t
   );
 });
 
+test("mlx-start passes the five performance flags in mlx-lm spelling, in schema order, each labelled with the command", async () => {
+  const { server, commands, ctx, notes } = await setup();
+
+  await commands.get("mlx-start")!(
+    "qwen3_4b --decode-concurrency 2 --prompt-concurrency=4 --prefill-step-size 1024 --prompt-cache-size 5 --prompt-cache-bytes 8589934592",
+    ctx,
+  );
+
+  assert.deepEqual(server.startCalls, [QWEN.modelId]);
+  assert.deepEqual(server.launches[0]?.extraArgs, [
+    "--decode-concurrency=2",
+    "--prompt-concurrency=4",
+    "--prefill-step-size=1024",
+    "--prompt-cache-size=5",
+    "--prompt-cache-bytes=8589934592",
+  ]);
+  assert.deepEqual(startingNotes(notes), [
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --decode-concurrency 2 (/mlx-start), --prompt-concurrency 4 (/mlx-start), --prefill-step-size 1024 (/mlx-start), --prompt-cache-size 5 (/mlx-start), --prompt-cache-bytes 8589934592 (/mlx-start)`,
+  ]);
+});
+
+test("mlx-start with a prefill step size of 0 is refused, naming the key and the flag, and nothing happens", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!("qwen3_4b --prefill-step-size 0", h.ctx);
+
+  const [message] = errors(h.notes);
+  assert.ok(message?.startsWith("mlx-start failed: invalid configuration"), message);
+  assert.ok(message.includes("server.prefillStepSize (/mlx-start --prefill-step-size)"), message);
+  assert.equal(errors(h.notes).length, 1);
+  assertNothingHappened(h);
+});
+
 test("mlx-start accepts --host and --allowed-origins as typed, in the flag spelling of mlx-lm", async () => {
   const { server, commands, ctx } = await setup();
 
@@ -1002,7 +1035,7 @@ test("mlx-start with an unknown flag is refused, with the valid flags listed, an
   await h.commands.get("mlx-start")!("--bogus 1", h.ctx);
 
   assert.deepEqual(errors(h.notes), [
-    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
+    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
   ]);
   assert.equal(h.notes.length, 1);
   assertNothingHappened(h);

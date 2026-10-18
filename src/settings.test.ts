@@ -2275,3 +2275,112 @@ test("server.decodeConcurrency: PI_MLX_MODELS_DECODE_CONCURRENCY has no effect a
   assert.deepEqual(prepared.flags, []);
   assert.deepEqual(warnings, []);
 });
+
+// ---- the other four performance rows (SRV-04) ----
+
+const PERFORMANCE_ROWS: ReadonlyArray<[key: string, flag: string]> = [
+  ["promptConcurrency", "--prompt-concurrency"],
+  ["prefillStepSize", "--prefill-step-size"],
+  ["promptCacheSize", "--prompt-cache-size"],
+  ["promptCacheBytes", "--prompt-cache-bytes"],
+];
+
+const BYTES_EXAMPLE = "an integer number of bytes of at least 1, for example 8589934592 for 8 GiB";
+
+for (const [key, flag] of PERFORMANCE_ROWS) {
+  test(`server.${key}: 1 and the largest safe integer are accepted and emitted as one ${flag}=N element`, () => {
+    for (const value of [1, 9007199254740991]) {
+      const { prepared } = resolved({ global: ok({ server: { [key]: value } }) });
+      assert.deepEqual(prepared.flags.map((flag) => flag.args), [[`${flag}=${value}`]]);
+      assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [`${flag}=${value}`]);
+    }
+  });
+
+  const cases: ReadonlyArray<[unknown, string]> = [
+    [0, "0"],
+    [-1, "-1"],
+    [1.5, "1.5"],
+    ["3", '"3"'],
+    [true, "true"],
+    [9007199254740992, "9007199254740992"],
+  ];
+  for (const [value, shown] of cases) {
+    test(`server.${key}: ${shown} in the global file is refused with one line`, () => {
+      const problem = key === "promptCacheBytes" ? `is not ${BYTES_EXAMPLE}` : "is not an integer of at least 1";
+      assert.deepEqual(refused({ global: ok({ server: { [key]: value } }) }), [
+        `server.${key} (${GLOBAL}): ${shown} ${problem} (flag ${flag})`,
+      ]);
+    });
+  }
+}
+
+test("server.promptCacheBytes: the refusal of 0 reads exactly, with the 8 GiB example", () => {
+  assert.deepEqual(refused({ global: ok({ server: { promptCacheBytes: 0 } }) }), [
+    "server.promptCacheBytes (global config.json): 0 is not an integer number of bytes of at least 1, for example 8589934592 for 8 GiB (flag --prompt-cache-bytes)",
+  ]);
+});
+
+const ALL_FIVE = {
+  decodeConcurrency: 2,
+  promptConcurrency: 4,
+  prefillStepSize: 1024,
+  promptCacheSize: 5,
+  promptCacheBytes: 8589934592,
+};
+
+test("a global file that sets all five lists them in schema order with their layer, and passes them in that order", () => {
+  const { prepared } = resolved({ global: ok({ server: ALL_FIVE }) });
+  assert.equal(
+    describeFlags(buildOk(prepared)),
+    "flags: --decode-concurrency 2 (global file), --prompt-concurrency 4 (global file), --prefill-step-size 1024 (global file), --prompt-cache-size 5 (global file), --prompt-cache-bytes 8589934592 (global file)",
+  );
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [
+    "--decode-concurrency=2",
+    "--prompt-concurrency=4",
+    "--prefill-step-size=1024",
+    "--prompt-cache-size=5",
+    "--prompt-cache-bytes=8589934592",
+  ]);
+});
+
+test("the five performance rows follow server.trustRemoteCode in the order of the flags", () => {
+  const paths = SETTINGS.map((row) => row.path);
+  const start = paths.indexOf("server.trustRemoteCode") + 1;
+  assert.deepEqual(paths.slice(start, start + 5), [
+    "server.decodeConcurrency",
+    "server.promptConcurrency",
+    "server.prefillStepSize",
+    "server.promptCacheSize",
+    "server.promptCacheBytes",
+  ]);
+});
+
+test("a value equal to the server's own default is still passed and shown", () => {
+  const { prepared } = resolved({ global: ok({ server: { prefillStepSize: 2048 } }) });
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--prefill-step-size=2048"]);
+  assert.equal(describeFlags(buildOk(prepared)), "flags: --prefill-step-size 2048 (global file)");
+});
+
+test("the project file may set all five: no violation, and the layer is the project file", () => {
+  const { prepared } = resolved({ project: ok({ server: ALL_FIVE }) });
+  assert.deepEqual(prepared.projectViolations, []);
+  assert.deepEqual(
+    prepared.flags.map((flag) => flag.label),
+    ["project file", "project file", "project file", "project file", "project file"],
+  );
+});
+
+test("none of the five rows has an environment variable or a pi flag, and the pi flags stay the four of phase 2", () => {
+  for (const key of ["decodeConcurrency", ...PERFORMANCE_ROWS.map(([name]) => name)]) {
+    const row = SETTINGS.find((setting) => setting.path === `server.${key}`);
+    assert.ok(row, key);
+    assert.equal(row.env, undefined, key);
+    assert.equal(row.piFlag, undefined, key);
+    assert.equal(row.default, undefined, key);
+    assert.equal(row.perModel, undefined, key);
+  }
+  assert.deepEqual(
+    PI_FLAGS.map((flag) => flag.name),
+    ["mlx-model", "mlx-port", "mlx-host", "mlx-log-level"],
+  );
+});
