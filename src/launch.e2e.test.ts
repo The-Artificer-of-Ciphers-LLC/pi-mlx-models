@@ -7,10 +7,22 @@ import { dirname, join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
 import type { ProbeResult } from "./flagprobe.js";
 import { createExtension } from "./index.js";
+import { createModelConfigReader, type ReadModelConfig } from "./modelinfo.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { createMlxServer, createSystemHost, type ServerHost } from "./server.js";
 import { SETTINGS } from "./settings.js";
-import { connectRefused, freePort, makeCtx, makeFakePi, readRequests, stubArgs, type CtxOptions } from "./testkit.js";
+import {
+  connectRefused,
+  freePort,
+  hfFixture,
+  makeCtx,
+  makeFakePi,
+  makeFakeModelConfig,
+  readRequests,
+  stubArgs,
+  writeHfCache,
+  type CtxOptions,
+} from "./testkit.js";
 
 /**
  * End-to-end proof of the layered-config path: a value written in the global config file reaches the
@@ -29,7 +41,18 @@ const ALL_SUPPORTED: ProbeResult = {
   flags: new Set(SETTINGS.flatMap((row) => (row.mlxFlag === undefined ? [] : [row.mlxFlag]))),
 };
 
-async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOptions = {}, probe: ProbeResult = ALL_SUPPORTED) {
+interface HarnessExtras {
+  /** What reads a model's config.json; default is a stand-in, so no test reaches the network or the real cache. */
+  readModelConfig?: ReadModelConfig;
+}
+
+async function harness(
+  t: TestContext,
+  env: Settings = {},
+  ctxOptions: CtxOptions = {},
+  probe: ProbeResult = ALL_SUPPORTED,
+  extras: HarnessExtras = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), "pi-mlx-e2e-"));
   const globalConfigPath = join(dir, "data", "config.json");
   const argvFile = join(dir, "argv.json");
@@ -64,6 +87,7 @@ async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOption
       installCalls += 1;
     },
     discoverModelIds: async () => [],
+    readModelConfig: extras.readModelConfig ?? makeFakeModelConfig().read,
     settings: { env, globalConfigPath, home: dir },
     probeFlags: async () => probe,
     shutdownWaitMs: 1000,
@@ -118,6 +142,40 @@ async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOption
 const startNotes = (notes: Array<{ message: string; type: string }>) =>
   notes.filter((n) => n.message.startsWith("Starting MLX server with"));
 const lastBaseUrl = (calls: Array<{ config: any }>) => calls.at(-1)?.config.baseUrl;
+
+test("a model whose config.json is in the cache is registered with that file's context window", { timeout: 30_000 }, async (t) => {
+  const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
+  t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
+  // The real layout: refs/main, a blob, and snapshots/<revision>/config.json as a symlink to the blob.
+  writeHfCache(cacheRoot, QWEN.modelId, hfFixture("qwen3-4b-instruct-2507-4bit"));
+  const h = await harness(t, {}, {}, ALL_SUPPORTED, { readModelConfig: createModelConfigReader({ cacheRoot }) });
+
+  await h.start();
+
+  const models = h.providerCalls.at(-1)?.config.models;
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, QWEN.modelId);
+  assert.equal(models[0].contextWindow, 262144);
+  assert.equal(models[0].maxTokens, 8192);
+  assert.equal(models[0].reasoning, false);
+  assert.deepEqual(models[0].input, ["text"]);
+  await h.stop();
+});
+
+test("a model with no config.json in the cache still starts, registered with the fallback window", { timeout: 30_000 }, async (t) => {
+  const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
+  t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
+  const h = await harness(t, {}, {}, ALL_SUPPORTED, { readModelConfig: createModelConfigReader({ cacheRoot }) });
+
+  await h.start();
+
+  assert.equal(h.notes.filter((n) => n.type === "error").length, 0);
+  assert.ok(h.notes.some((n) => n.message.startsWith("MLX server is ready for prompts. Use /model and pick pi-mlx-models/")));
+  const models = h.providerCalls.at(-1)?.config.models;
+  assert.equal(models.length, 1);
+  assert.equal(models[0].contextWindow, 32768);
+  await h.stop();
+});
 
 test("a port and log level in the global file reach the process, the provider and the start message", { timeout: 30_000 }, async (t) => {
   const port = await freePort();

@@ -16,6 +16,7 @@ import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
+import { createModelConfigReader, type ReadModelConfig } from "./modelinfo.js";
 import { createProgress, type Progress } from "./progress.js";
 import { applyRequestOverrides, type ActiveLaunch } from "./request.js";
 import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
@@ -91,6 +92,8 @@ export interface ExtensionDeps {
   ensureInstalled: typeof ensureInstalled;
   /** Lists the model ids the server at `baseUrl` serves; the base URL is the launch's own, not a constant. */
   discoverModelIds: (baseUrl: string) => Promise<string[]>;
+  /** Looks up a model's `config.json` (the Hugging Face cache, then a local path); it never throws or rejects. */
+  readModelConfig: ReadModelConfig;
   /** Where layered settings are read from; the global file is read again on every /mlx-start. */
   settings: SettingsSource;
   /** Asks the installed mlx-lm which server flags it supports (the venv must exist). */
@@ -159,6 +162,7 @@ function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
     server: overrides.server ?? createMlxServer(),
     ensureInstalled: overrides.ensureInstalled ?? ensureInstalled,
     discoverModelIds: overrides.discoverModelIds ?? ((baseUrl) => discoverModelIds({ baseUrl })),
+    readModelConfig: overrides.readModelConfig ?? createModelConfigReader(),
     settings: overrides.settings ?? { env: process.env, globalConfigPath: GLOBAL_CONFIG_PATH, home: homedir() },
     probeFlags: overrides.probeFlags ?? probe.probe,
     installedVersion: overrides.installedVersion ?? probe.installedVersion,

@@ -1,10 +1,12 @@
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PiHost } from "./index.js";
+import type { ModelConfigRead } from "./modelinfo.js";
 
 /**
  * Shared helpers for tests that need a real child process standing in for
@@ -220,4 +222,62 @@ export function waitForExit(child: ChildProcess): Promise<{ code: number | null;
   return new Promise((resolve) => {
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
+}
+
+/** The parsed `config.json` of a real model, committed under test/fixtures/hf-config (a name without the `.json` suffix). */
+export function hfFixture(name: string): any {
+  return JSON.parse(readFileSync(new URL(`../test/fixtures/hf-config/${name}.json`, import.meta.url), "utf8"));
+}
+
+export interface WriteHfCacheOptions {
+  /** The snapshot directory name; default is a fixed 40-character hexadecimal revision. */
+  revision?: string;
+  /** The text of `refs/main`; default is the revision. */
+  refsText?: string;
+  /** Leave `refs/main` out. */
+  omitRefs?: boolean;
+  /** Write `config.json` as a regular file in the snapshot instead of a symlink to a blob. */
+  regularFile?: boolean;
+  /** The exact text of `config.json`, written instead of the JSON of `config`. */
+  raw?: string;
+}
+
+/**
+ * Lay out one Hugging Face hub cache entry the way huggingface_hub does: `models--ORG--NAME/refs/main`, a blob named
+ * by a hash, and `snapshots/<revision>/config.json` as a relative symlink to that blob. Returns the snapshot directory.
+ */
+export function writeHfCache(cacheRoot: string, repoId: string, config: unknown, options: WriteHfCacheOptions = {}): string {
+  const revision = options.revision ?? "0123456789abcdef0123456789abcdef01234567";
+  const entry = join(cacheRoot, `models--${repoId.replace("/", "--")}`);
+  const snapshot = join(entry, "snapshots", revision);
+  mkdirSync(snapshot, { recursive: true });
+  const text = options.raw ?? JSON.stringify(config);
+  if (options.regularFile) {
+    writeFileSync(join(snapshot, "config.json"), text);
+  } else {
+    const blobs = join(entry, "blobs");
+    mkdirSync(blobs, { recursive: true });
+    const blobName = createHash("sha1").update(text).digest("hex");
+    writeFileSync(join(blobs, blobName), text);
+    symlinkSync(join("..", "..", "blobs", blobName), join(snapshot, "config.json"));
+  }
+  if (!options.omitRefs) {
+    mkdirSync(join(entry, "refs"), { recursive: true });
+    writeFileSync(join(entry, "refs", "main"), options.refsText ?? revision);
+  }
+  return snapshot;
+}
+
+/** A stand-in for the model-config reader: answers from `configs` by model id, else with `otherwise`, and records its calls. */
+export function makeFakeModelConfig(
+  configs: Record<string, unknown> = {},
+  otherwise: ModelConfigRead = { ok: true, config: { max_position_embeddings: 131072 }, source: "cache" },
+) {
+  const calls: Array<{ modelId: string; hub: boolean }> = [];
+  const read = async (modelId: string, options: { hub: boolean }): Promise<ModelConfigRead> => {
+    calls.push({ modelId, hub: options.hub });
+    if (Object.hasOwn(configs, modelId)) return { ok: true, config: configs[modelId], source: "cache" };
+    return otherwise;
+  };
+  return { read, calls };
 }
