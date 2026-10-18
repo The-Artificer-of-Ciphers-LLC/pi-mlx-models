@@ -3080,3 +3080,141 @@ test("a mistyped key inside the sampling object is reported with the key it was 
     `model.sampling.temprature (${GLOBAL}): unknown key (did you mean temperature?)`,
   ]);
 });
+
+// -- the other seven keys: exact validation (D-09) --
+
+const STOP_PHRASE = "must be a non-empty string or a list of 1 to 4 non-empty strings of at most 256 characters";
+
+const SAMPLING_BAD_VALUES: ReadonlyArray<[string, readonly unknown[], string, string]> = [
+  ["topP", [0, 1.5, -0.5, "0.9", null], "is not a number above 0 and at most 1", "OpenAI field top_p, flag --top-p"],
+  ["topK", [-1, 1.5, "40", true, 1e21], "is not an integer of at least 0", "OpenAI field top_k, flag --top-k"],
+  ["minP", [-0.1, 1.1, "0.05", null], "is not a number from 0 to 1", "OpenAI field min_p, flag --min-p"],
+  ["repetitionPenalty", [0, -1, "1.1", null], "is not a number above 0", "OpenAI field repetition_penalty"],
+  ["maxTokens", [0, -1, 1.5, "100", 1e21], "is not an integer of at least 1", "OpenAI field max_completion_tokens, flag --max-tokens"],
+  ["seed", [1.5, "7", true, null, 1e21], "is not an integer", "OpenAI field seed"],
+  ["stop", ["", [], ["a", ""], ["a", "b", "c", "d", "e"], "x".repeat(257), 5, null, {}, [1]], STOP_PHRASE, "OpenAI field stop"],
+];
+
+for (const [key, values, phrase, suffix] of SAMPLING_BAD_VALUES) {
+  for (const value of values) {
+    const name = JSON.stringify(value).length > 40 ? `${JSON.stringify(value).slice(0, 37)}...` : JSON.stringify(value);
+    test(`model.sampling.${key} with ${name} is refused: ${phrase}`, () => {
+      const lines = refused({ global: ok({ model: { sampling: { [key]: value } } }) });
+      assert.equal(lines.length, 1, JSON.stringify(lines));
+      assert.ok(lines[0].startsWith(`model.sampling.${key} (${GLOBAL}): `), lines[0]);
+      assert.ok(lines[0].endsWith(` ${phrase} (${suffix})`), lines[0]);
+      const shown = JSON.stringify(value);
+      if (shown.length <= 40) assert.equal(lines[0], `model.sampling.${key} (${GLOBAL}): ${shown} ${phrase} (${suffix})`);
+    });
+  }
+}
+
+// -- the other seven keys: accepted values --
+
+for (const [key, values, flag] of [
+  ["topP", [0.9, 1], "--top-p"],
+  ["topK", [0, 40], "--top-k"],
+  ["minP", [0, 0.05, 1], "--min-p"],
+  ["maxTokens", [1, 2048], "--max-tokens"],
+] as const) {
+  test(`model.sampling.${key} accepts ${values.join(", ")} and emits one ${flag}=N element each`, () => {
+    for (const value of values) {
+      assert.deepEqual(extraOf({ global: ok({ model: { sampling: { [key]: value } } }) }), [`${flag}=${value}`]);
+    }
+  });
+}
+
+for (const [key, values] of [
+  ["repetitionPenalty", [1.1]],
+  ["seed", [-1, 42]],
+  ["stop", ["END", ["a", "\n\n"]]],
+] as const) {
+  test(`model.sampling.${key} accepts ${JSON.stringify(values)} and holds it without any argv element`, () => {
+    for (const value of values) {
+      const input = { global: ok({ model: { sampling: { [key]: value } } }) };
+      assert.deepEqual(resolved(input).prepared.modelSettings.layers[0].model.get(`model.sampling.${key}`), value);
+      assert.deepEqual(extraOf(input), []);
+    }
+  });
+}
+
+test("a launch that sets repetitionPenalty, stop and seed has no argv element and an empty flags line (D-07)", () => {
+  const input = { global: ok({ model: { sampling: { repetitionPenalty: 1.1, stop: ["END"], seed: 7 } } }) };
+  assert.deepEqual(extraOf(input), []);
+  assert.equal(describeFlags(launchOf(input)), "");
+});
+
+// -- the sampling object of a models entry --
+
+test("a models entry holds the same sampling object and launches with it, labelled with the file", () => {
+  const launch = launchOf({ global: ok({ models: { qwen3_4b: { sampling: { temperature: 0.2 } } } }) });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.2"]);
+  assert.equal(describeFlags(launch), "flags: --temp 0.2 (global file)");
+});
+
+test("a bad value inside the sampling object of a models entry names the entry", () => {
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { sampling: { temperature: -1 } } } }) }), [
+    `models["qwen3_4b"].sampling.temperature (${GLOBAL}): -1 is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+  ]);
+});
+
+test("a mistyped key inside the sampling object of a models entry names the entry", () => {
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { sampling: { temprature: 0.2 } } } }) }), [
+    `models["qwen3_4b"].sampling.temprature (${GLOBAL}): unknown key (did you mean temperature?)`,
+  ]);
+});
+
+// -- a sampling key or the sampling container in the wrong place --
+
+test("a sampling key written directly in the model block says it belongs inside sampling", () => {
+  assert.deepEqual(refused({ global: ok({ model: { temperature: 0.2 } }) }), [
+    `model.temperature (${GLOBAL}): unknown key (temperature is a "sampling" key; write it inside "sampling")`,
+  ]);
+});
+
+test("a sampling key written directly in a models entry says it belongs inside sampling", () => {
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { temperature: 0.2 } } }) }), [
+    `models["qwen3_4b"].temperature (${GLOBAL}): unknown key (temperature is a "sampling" key; write it inside "sampling")`,
+  ]);
+});
+
+test("a sampling key spelled with an underscore names the real spelling", () => {
+  assert.deepEqual(refused({ global: ok({ model: { top_p: 0.9 } }) }), [
+    `model.top_p (${GLOBAL}): unknown key (topP is a "sampling" key; write it inside "sampling")`,
+  ]);
+});
+
+test("a mistyped sampling container in the model block suggests model.sampling", () => {
+  assert.deepEqual(refused({ global: ok({ model: { samplng: { temperature: 0.2 } } }) }), [
+    `model.samplng (${GLOBAL}): unknown key (did you mean model.sampling?)`,
+  ]);
+});
+
+test("a top-level sampling key is an unknown key that points to model.sampling (D-08)", () => {
+  assert.deepEqual(refused({ global: ok({ sampling: { temperature: 0.2 } }) }), [
+    `sampling (${GLOBAL}): unknown key (did you mean model.sampling?)`,
+  ]);
+});
+
+test("a top-level request key is an unknown key with no hint (D-08)", () => {
+  assert.deepEqual(refused({ global: ok({ request: { temperature: 0.2 } }) }), [`request (${GLOBAL}): unknown key`]);
+});
+
+// -- the order of the rows --
+
+test("the eight sampling rows follow model.chatTemplateArgs in key order, and the server flags come out in that order", () => {
+  const paths = SETTINGS.map((row) => row.path);
+  const first = paths.indexOf("model.chatTemplateArgs") + 1;
+  assert.deepEqual(paths.slice(first, first + 8), [
+    "model.sampling.temperature",
+    "model.sampling.topP",
+    "model.sampling.topK",
+    "model.sampling.minP",
+    "model.sampling.repetitionPenalty",
+    "model.sampling.maxTokens",
+    "model.sampling.stop",
+    "model.sampling.seed",
+  ]);
+  const sampling = { maxTokens: 2048, minP: 0.05, topK: 40, topP: 0.9, temperature: 0.2 };
+  assert.deepEqual(extraOf({ global: ok({ model: { sampling } }) }), ["--temp=0.2", "--top-p=0.9", "--top-k=40", "--min-p=0.05", "--max-tokens=2048"]);
+});
