@@ -553,13 +553,23 @@ test("docs check: every docs page outside docs/research is linked from README.md
 });
 
 /** The link targets of a markdown text that are neither a URL with a scheme nor a pure in-page fragment. */
-function relativeTargetsOf(_markdown: string): string[] {
-  return [];
+function relativeTargetsOf(markdown: string): string[] {
+  return linkTargetsOf(markdown).filter((target) => !URL_SCHEME.test(target) && !target.startsWith("#"));
 }
 
-/** One line per link into the repository's files that names a branch other than main. */
-function githubBranchProblems(_markdown: string, _repo: RepoRef): string[] {
-  return [];
+/** One line per link into the repository's files (a file or tree view, or a raw file) that names a branch other than main. */
+function githubBranchProblems(markdown: string, repo: RepoRef): string[] {
+  const own = `https://github.com/${repo.owner}/${repo.name}/`;
+  const raw = `https://raw.githubusercontent.com/${repo.owner}/${repo.name}/`;
+  const problems: string[] = [];
+  for (const target of linkTargetsOf(markdown)) {
+    let rest: string | undefined;
+    if (target.startsWith(own + "blob/")) rest = target.slice((own + "blob/").length);
+    else if (target.startsWith(own + "tree/")) rest = target.slice((own + "tree/").length);
+    else if (target.startsWith(raw)) rest = target.slice(raw.length);
+    if (rest !== undefined && rest.split(/[/?#]/)[0] !== "main") problems.push(`${target}: names a branch other than main`);
+  }
+  return problems;
 }
 
 test("docs check: relativeTargetsOf reports a relative target and passes absolute and in-page ones (package page)", () => {
