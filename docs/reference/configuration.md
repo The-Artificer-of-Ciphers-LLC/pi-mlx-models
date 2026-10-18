@@ -6,14 +6,14 @@ Every setting `@taoc/pi-mlx-models` reads, where it can be set, and how the sour
 
 | # | Source | Applies to |
 |---|--------|------------|
-| 1 | Flags typed after `/mlx-start` | one launch |
+| 1 | Flags typed after `/mlx-start`, `/mlx-last` or `/mlx-restart` | one launch |
 | 2 | pi flags (`--mlx-*`) | the pi session |
 | 3 | Environment variables (`PI_MLX_MODELS_*`) | the pi process |
 | 4 | Project file `.pi/pi-mlx-models.json` | the project directory |
 | 5 | Global file `config.json` | the user |
 | 6 | Built-in default | |
 
-The first source that sets a value wins. Each source is read at every `/mlx-start`, so an edit takes effect on the next start without reloading pi.
+The first source that sets a value wins. Every command reads the sources again when it runs, so an edit takes effect on the next start without reloading pi.
 
 Environment variables and pi flags only exist for the settings that have such a column entry below. Model options (`model` block and `models` entries) come from the two files and from `/mlx-start` flags; see [Model options](#model-options). The `mlxLm` block is read by `/mlx-init` and `/mlx-start` and has its own flags and variables; see [mlx-lm version and install source](#mlx-lm-version-and-install-source).
 
@@ -79,11 +79,12 @@ Values in files are checked strictly: a number must be a JSON number, a boolean 
     }
   },
   "baseUrl": "http://127.0.0.1:8080/v1",
-  "defaultModel": "qwen3_4b"
+  "defaultModel": "qwen3_4b",
+  "autoStart": false
 }
 ```
 
-`baseUrl`, `defaultModel` and `models` are top-level keys. Every other key lives inside its block. `mlxLm` is a block like `server`: it holds `version` and `pipIndex`. `provider` is a block too: it holds `listAllModels`. An unknown key stops the start; the message names the key and the file layer.
+`baseUrl`, `defaultModel`, `autoStart` and `models` are top-level keys. Every other key lives inside its block. `mlxLm` is a block like `server`: it holds `version` and `pipIndex`. `provider` is a block too: it holds `listAllModels`. An unknown key stops the start; the message names the key and the file layer.
 
 ## Settings
 
@@ -125,12 +126,15 @@ The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and po
 | `provider.listAllModels` | `true` or `false` | `false` | none | | | |
 | `baseUrl` | `http` or `https` URL; a trailing slash is removed | `http://<host>:<port>/v1` | | | | `PI_MLX_MODELS_BASE_URL` |
 | `defaultModel` | non-empty model id or preset key | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | | | | `PI_MLX_MODELS_DEFAULT_MODEL` |
+| `autoStart` | `true` or `false` | `false` | none | | | `PI_MLX_MODELS_AUTO_START` |
 | `mlxLm.version` | the word `latest` or an exact version such as `0.32.2` | `latest` | | | | `PI_MLX_MODELS_MLX_LM_VERSION` |
 | `mlxLm.pipIndex` | `https` URL without credentials, spaces, a query string or a fragment (`http` only for a loopback host) | `https://pypi.org/simple/` | | | | `PI_MLX_MODELS_PIP_INDEX` |
 
 The eight `model.sampling.*` rows can only be set in a file, either in a `model` block, a `models` entry or a profile; they have no `/mlx-start` flag, pi flag or environment variable. See [Sampling and profiles](#sampling-and-profiles).
 
 The four `model.limits.*` rows are written inside a profile only, as a `limits` object; they are not allowed in the `model` block or in a `models` entry, and they have no `/mlx-start` flag, pi flag or environment variable. They change what pi is told about a model and never reach the server's command line or a request. `provider.listAllModels` can only be set in a file, the global one or the project one, and has no flag or environment variable. See [Model metadata and the model list](#model-metadata-and-the-model-list).
+
+`autoStart` is read from the global file and the environment only. A project file may not set it, with either value; see [Settings that ask for permission](#settings-that-ask-for-permission) and [Auto-start](#auto-start).
 
 The two `mlxLm` rows are settings of `/mlx-init`, not of the server. Their command-line forms are the `/mlx-init` flags `--mlx-lm-version` and `--pip-index`, not `/mlx-start` flags. They have no pi flag. When pi loads the extension these two settings are not looked at: a bad value does not change the provider URL or the default model, and only `/mlx-init` and `/mlx-start` report it.
 
@@ -148,6 +152,7 @@ A valued flag is passed to the server as one argument, `--flag=value`. The `--ho
 | `PI_MLX_MODELS_HOST` | An empty value counts as unset. |
 | `PI_MLX_MODELS_BASE_URL` | An empty value counts as unset. |
 | `PI_MLX_MODELS_DEFAULT_MODEL` | |
+| `PI_MLX_MODELS_AUTO_START` | `true` or `false`. An invalid value is ignored with a warning. An empty value counts as unset. It beats the global file, so `false` turns auto-start off whatever the file says. See [Auto-start](#auto-start). |
 | `PI_MLX_MODELS_MLX_LM_VERSION` | `latest` or an exact version. An invalid value is ignored with a warning. An empty value counts as unset. |
 | `PI_MLX_MODELS_PIP_INDEX` | The pip index URL. An invalid value refuses `/mlx-init` and `/mlx-start` with an error, so an install never silently falls back to another index. When pi loads the extension this variable is not looked at, so a bad value does not change the provider URL or the default model. An empty value counts as unset. |
 | `PI_MLX_MODELS_PYTHON` | Path to the Python interpreter used to build the virtual environment. Must be Python 3.11 or newer. If it is set but unusable, `/mlx-init` fails and names it instead of choosing another Python. |
@@ -463,6 +468,7 @@ A server you started yourself, reached through `PI_MLX_MODELS_BASE_URL` or `base
 - A flag may appear once. An unknown flag, a missing value, a second model and an unterminated quote are errors.
 - The whole argument string is limited to 8192 characters.
 - Flags apply to that launch only; nothing is remembered.
+- `/mlx-last` and `/mlx-restart` take these flags and `--profile` and no model; see the [commands reference](commands.md#mlx-last).
 
 ## pi flags
 
@@ -485,12 +491,66 @@ A loopback host is `127.0.0.1`, `localhost` or `::1`. Everything else is non-loo
 | `server.host` that is non-loopback | The start is refused. | Asks for confirmation. |
 | `baseUrl` that is non-loopback | The start is refused. | Asks for confirmation. |
 | `mlxLm.pipIndex` | `/mlx-init` and `/mlx-start` are refused. | Accepted without a dialog from the global file, the environment or the `/mlx-init` flag. |
+| `autoStart` | Refused with either value, `true` or `false`. The message names the global file and `PI_MLX_MODELS_AUTO_START`. | Accepted without a dialog from the global file or the environment. `/mlx-config` asks before it saves `true`. See [Auto-start](#auto-start). |
 
 - A refused project file cannot be overridden, even when a higher source sets a different value, because the file is checked on its own content.
 - A confirmation is asked at every start, one dialog per risk, and nothing is remembered. Declining cancels the start. The dialog shows which source set the value.
 - With no interactive UI, a start that needs confirmation is refused.
 - `trustRemoteCode` has no environment variable and no pi flag.
+- `autoStart` is read from your own sources only. A project file that sets it is refused with any value, so a project file that says `autoStart: false` also refuses the launches made in that project. Leave the key out of project files.
 - The pip index decides which code `pip install` fetches, so a project file may not choose it. From your own sources it applies without confirmation, and `/mlx-init` always shows it. A project file may pin `mlxLm.version`.
+
+## Auto-start
+
+Auto-start starts the last model by itself when pi opens a session. It is off by default.
+
+**Turning it on.** Set `autoStart` to `true` in the global file, or set `PI_MLX_MODELS_AUTO_START=true`. The environment variable beats the file. `/mlx-config` can set the key and asks for confirmation before it saves `true`. Project files may not set it; see [Settings that ask for permission](#settings-that-ask-for-permission). Turning the option off, in the file or with `PI_MLX_MODELS_AUTO_START=false`, is the way to stop it.
+
+**What it does.** At the start of a pi session, whatever the reason, it starts the model and the profile of the [remembered launch](#the-remembered-launch) in the background. It returns at once, so pi is not held up. It shows the same progress widget and notices as `/mlx-start`, and it goes through the same checks. When the server is ready, the message is the usual hint to pick the model with `/model`:
+
+```
+MLX server is ready for prompts. Use /model and pick pi-mlx-models/...
+```
+
+It does not change the model that is selected in pi. A started launch is remembered like any other.
+
+**When it does nothing, or says why.** The conditions are checked in this order. Each one that is not met ends auto-start there.
+
+| # | Condition | What is shown |
+|---|-----------|---------------|
+| 1 | `autoStart` is off | Nothing at all. |
+| 2 | pi has no interactive UI | Nothing. |
+| 3 | A start is already under way, or this session already made a launch | Nothing. |
+| 4 | Nothing is remembered | Nothing. `defaultModel` is not used as a fallback. |
+| 5 | The remembered launch file cannot be read | One warning: `auto-start skipped: the remembered launch file REASON; run /mlx-start to choose a model`. |
+| 6 | The configuration is invalid, or a project file asks for something it may not | One notice with the same problem lines as `/mlx-start`, starting `auto-start skipped:`. |
+| 7 | Something already answers on the configured port | One info notice: `auto-start skipped: something already answers on port N`. The server is never registered, adopted or stopped. |
+| 8 | The runtime is not installed | One notice: `auto-start skipped: the MLX runtime is not installed; run /mlx-init, then /mlx-start`. Nothing is installed. |
+| 9 | The remembered profile is no longer defined for the model | One notice with the unknown-profile message, which lists the model's profiles, and the line `Run /mlx-start to start by hand.` |
+| 10 | The launch needs a confirmation: remote code, or a non-loopback host or base URL | One warning: `auto-start skipped: ... your confirmation; run /mlx-start to confirm`. |
+
+Auto-start never confirms. There is nobody to ask, so a launch that needs a [confirmation](#settings-that-ask-for-permission) is skipped, and `/mlx-start` is the command that asks. A failure after the server was launched is reported as `auto-start failed: ...`.
+
+**Things to know.**
+
+- A `/mlx-start` or `/mlx-stop` that you make while auto-start is still checking ends it quietly: whoever acted last owns the server.
+- `/mlx-stop` is not remembered. With the option on, the next pi session starts the last model again when nothing answers.
+- A project file can still set options that are not trust settings, for example a draft model, an adapter path or a chat template inside the project directory. They apply to the unprompted launch as they apply to any launch in that project. Trust settings in a project file are refused, not confirmed.
+
+## The remembered launch
+
+Every successful start leaves a record of itself, so that `/mlx-last`, `/mlx-restart` with nothing running and [auto-start](#auto-start) can start the same model again. The file is `last-launch.json`, next to the global `config.json`:
+
+```json
+{"version":1,"model":"mlx-community/Qwen3-4B-Instruct-2507-4bit","profile":"careful"}
+```
+
+- **Content.** A format version, the model id, and the name of the profile that applied or `null` when none did. Nothing else is stored. Flags typed on a command, the port and every other setting are not remembered, so a replay reads them from the configuration as it is then. The profile is the one that applied to the start, whether `--profile` or `defaultProfile` chose it.
+- **When it is written.** When the server is ready, by every command that starts a model: `/mlx-start`, `/mlx-last`, `/mlx-restart` and auto-start. A start that fails, is stopped or is replaced does not write it, so a good record is never overwritten by a failed start. `/mlx-stop` does not write or delete it.
+- **How.** The file is replaced as a whole, in one atomic step. The last writer wins: when two pi sessions share the same agent directory, the one that started last is remembered. There is no lock.
+- **If it cannot be written.** The start still succeeds. A warning says `pi-mlx-models: could not remember this launch (REASON); /mlx-last keeps using the previous one.`, once for each reason while pi runs.
+- **If it cannot be read.** The file is read strictly: exactly the three fields, a known version, a valid model id and profile name, and at most 8 KiB. Anything else is treated as nothing remembered, and the commands say the file cannot be read. `/mlx-last` and `/mlx-restart` start nothing, auto-start shows one warning, and the next successful start replaces the file.
+- **Forgetting.** Deleting the file forgets the launch.
 
 ## Flags the installed mlx-lm does not support
 
@@ -519,7 +579,7 @@ flags: --port 8080 (global file), --temp 0.2 (profile careful), --top-p 0.9 (pro
 request: repetition_penalty 1.1 (profile careful), stop ["###"] (profile careful), seed 42 (profile careful)
 ```
 
-The place after `profile:` is `/mlx-start` when `--profile` chose it, otherwise the layer of the `defaultProfile` key (`global file` or `project file`). A launch with no profile and no request-only value shows neither line, and its message is unchanged.
+The place after `profile:` is the command when `--profile` was typed on it (`/mlx-start`, `/mlx-last` or `/mlx-restart`), `previous launch` when `/mlx-last` or `/mlx-restart` kept the profile of an earlier launch, otherwise the layer of the `defaultProfile` key (`global file` or `project file`). Flags typed on `/mlx-last` or `/mlx-restart` are labelled `/mlx-start`. A launch with no profile and no request-only value shows neither line, and its message is unchanged.
 
 Before the start message, a start can show a [pin warning](#when-the-pin-and-the-install-differ) (the pin differs from the install, or the installed version could not be read) and the [skipped-flag warning](#flags-the-installed-mlx-lm-does-not-support). After it, a launch with `kvBits` shows the [batching warning](#quantized-kv-cache), and a launch with `kvGroupSize` or `quantizedKvStart` but no `kvBits` shows the no-effect note. These are shown on every start, not once.
 
@@ -551,4 +611,5 @@ The server is started with `PYTHONSAFEPATH=1`, so that the project directory is 
 | `<agent dir>/pi-mlx-models/venv` | Python virtual environment with mlx-lm |
 | `<agent dir>/pi-mlx-models/models` | Downloaded model files |
 | `<agent dir>/pi-mlx-models/models/hub` | The Hugging Face cache the server writes to, and where each model's `config.json` is looked for first (`HF_HUB_CACHE` replaces this path for the lookup) |
-| `<agent dir>/pi-mlx-models/config.json` | Global configuration file |
+| `<agent dir>/pi-mlx-models/config.json` | Global configuration file. `/mlx-config` creates it on a first edit; nothing else creates it. |
+| `<agent dir>/pi-mlx-models/last-launch.json` | The model and profile of the last successful start; see [The remembered launch](#the-remembered-launch) |
