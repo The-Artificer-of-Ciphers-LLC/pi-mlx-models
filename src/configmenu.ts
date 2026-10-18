@@ -9,6 +9,7 @@ import {
   editableKeys,
   getAt,
   isPlausibleModelKey,
+  modelEntrySummary,
   modelKeys,
   profileNames,
   renderConfig,
@@ -380,14 +381,38 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     );
   }
 
-  /** Delete a whole model entry after a confirmation: its options, its profiles and its default profile go with it. */
+  /** The most profile names or option keys a delete confirm lists before it counts the rest. */
+  const LISTED_MAX = 8;
+  const listed = (names: string[]): string => {
+    const first = names.slice(0, LISTED_MAX).map((name) => shown(name)).join(", ");
+    return names.length > LISTED_MAX ? `${first} and ${names.length - LISTED_MAX} more` : first;
+  };
+
+  /** What deleting a model entry takes with it, as one sentence for the confirm; an entry that holds nothing says so. */
+  function lostByEntry(model: string): string {
+    const summary = modelEntrySummary(currentTree(), model);
+    const parts: string[] = [];
+    if (summary.profiles.length > 0) parts.push(`the ${summary.profiles.length === 1 ? "profile" : "profiles"} ${listed(summary.profiles)}`);
+    if (summary.defaultProfile !== undefined) parts.push(`the defaultProfile ${shownValue(summary.defaultProfile)}`);
+    if (summary.options.length > 0) parts.push(`the ${summary.options.length === 1 ? "option" : "options"} ${listed(summary.options)}`);
+    if (parts.length === 0) return "The entry holds nothing, so no setting is lost.";
+    return `This removes the model entry from the config file together with ${parts.join("; ")}.`;
+  }
+
+  /** Delete a whole model entry after a confirmation that names what is lost; nothing else in the file is touched. */
   async function deleteEntryFlow(): Promise<Flow> {
+    if (modelKeys(currentTree()).length === 0) {
+      // A file that cannot be read has no entries to list; say so the way a write would, and stop.
+      if (readLayerFile(path).state === "unusable") return flowOf(write((draft) => draft, "", ""));
+      dialogs.notify("The config file lists no model entries: there is nothing to delete.", "info");
+      return "menu";
+    }
     const model = await chooseModel("Choose the model entry to delete", false);
     if (model === undefined) return "menu";
     const name = `model entry ${shown(model)}`;
     const confirmed = await dialogs.confirm(
       `Delete ${name}?`,
-      `This removes the model entry and everything set in it from the config file. Yes deletes it. No or Esc cancels.`,
+      `${lostByEntry(model)} Other model entries and settings are not touched. Yes deletes it. No or Esc cancels.`,
     );
     if (!confirmed) {
       dialogs.notify(`Nothing was deleted: ${name} was not confirmed.`, "info");

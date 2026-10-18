@@ -354,8 +354,15 @@ export interface ModelEntrySummary {
   defaultProfile: string | undefined;
 }
 
-export function modelEntrySummary(_tree: ConfigTree, _model: string): ModelEntrySummary {
-  return { profiles: [], options: [], defaultProfile: undefined };
+export function modelEntrySummary(tree: ConfigTree, model: string): ModelEntrySummary {
+  const entry = getAt(tree, ["models", model]);
+  if (!isObject(entry)) return { profiles: [], options: [], defaultProfile: undefined };
+  const chosen = getAt(tree, ["models", model, "defaultProfile"]);
+  return {
+    profiles: profileNames(tree, model),
+    options: sortedKeys(entry).filter((key) => key !== "profiles" && key !== "defaultProfile"),
+    defaultProfile: typeof chosen === "string" ? chosen : undefined,
+  };
 }
 
 type Checked = { ok: true; value: string } | { ok: false; message: string };
