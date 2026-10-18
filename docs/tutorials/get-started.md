@@ -96,5 +96,7 @@ We have installed the extension, built the runtime, started a model and talked t
 
 ## Where to go next
 
+- [How to restart, check and re-launch a model](../how-to/restart-check-and-relaunch.md) for the day-to-day commands.
+- [How to start a model automatically when pi opens](../how-to/start-a-model-automatically.md).
 - [How to configure the MLX server](../how-to/configure-the-server.md) to change the port, the log level and more.
 - [Commands reference](../reference/commands.md) for every command and the other presets.
