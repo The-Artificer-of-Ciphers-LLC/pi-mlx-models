@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -195,6 +195,21 @@ export async function waitForHttp(url: string, options: WaitForHttpOptions = {})
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   throw new Error(`no HTTP response from ${url} within ${timeoutMs} ms: ${String(lastError)}`);
+}
+
+/** One request the stub recorded: the URL it was posted to and the body, parsed when it was JSON and raw text otherwise. */
+export interface RecordedRequest {
+  url: string;
+  body: unknown;
+}
+
+/** The requests the stub wrote to its STUB_REQUEST_FILE, oldest first; empty when the file does not exist. */
+export function readRequests(file: string): RecordedRequest[] {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as RecordedRequest);
 }
 
 /** Resolve with the exit code/signal once the child has exited. */

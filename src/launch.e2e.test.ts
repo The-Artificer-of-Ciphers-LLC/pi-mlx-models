@@ -1,7 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
@@ -10,7 +10,7 @@ import { createExtension } from "./index.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { createMlxServer, createSystemHost, type ServerHost } from "./server.js";
 import { SETTINGS } from "./settings.js";
-import { connectRefused, freePort, makeCtx, makeFakePi, stubArgs, type CtxOptions } from "./testkit.js";
+import { connectRefused, freePort, makeCtx, makeFakePi, readRequests, stubArgs, type CtxOptions } from "./testkit.js";
 
 /**
  * End-to-end proof of the layered-config path: a value written in the global config file reaches the
@@ -33,11 +33,12 @@ async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOption
   const dir = mkdtempSync(join(tmpdir(), "pi-mlx-e2e-"));
   const globalConfigPath = join(dir, "data", "config.json");
   const argvFile = join(dir, "argv.json");
+  const requestFile = join(dir, "requests.jsonl");
 
   const base = createSystemHost({
     command: process.execPath,
     buildArgs: stubArgs,
-    env: { STUB_MODE: "ok", STUB_ARGV_FILE: argvFile },
+    env: { STUB_MODE: "ok", STUB_ARGV_FILE: argvFile, STUB_REQUEST_FILE: requestFile },
   });
   const children: ChildProcess[] = [];
   const host: ServerHost = {
@@ -76,6 +77,26 @@ async function harness(t: TestContext, env: Settings = {}, ctxOptions: CtxOption
     ...fakeCtx,
     globalConfigPath,
     argvFile,
+    requestFile,
+    /** Every request the stand-in server received so far, oldest first. */
+    requests: () => readRequests(requestFile),
+    /** What the registered before_provider_request handler answers for a payload of the given provider and model id. */
+    runHook(payload: unknown, provider: string = PROVIDER_ID, modelId: string = QWEN.modelId) {
+      const hook = fakePi.handlers.get("before_provider_request");
+      assert.ok(hook, "the extension registers a before_provider_request handler");
+      return hook({ payload }, { model: { provider, id: modelId } });
+    },
+    /** POST a payload to the stand-in server's chat completions path, under the base URL of the latest launch. */
+    async postToServer(port: number, payload: unknown): Promise<number> {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      await res.arrayBuffer();
+      return res.status;
+    },
+    shutdown: () => fakePi.handlers.get("session_shutdown")!(),
     get installCalls() {
       return installCalls;
     },
@@ -736,4 +757,107 @@ test("the hook never throws: a hostile payload, a missing ctx.model and a missin
   assert.equal(await hook(undefined, ctx), undefined);
   assert.equal(await hook({ payload: piPayload(QWEN.modelId) }, {}), undefined, "no ctx.model: nothing is applied");
   assert.equal(await hook({ payload: piPayload(QWEN.modelId) }, undefined), undefined);
+});
+
+// ---- what the stand-in server receives (GEN-01, GEN-02, roadmap criterion 3): the hook's output posted to a real child ----
+
+const LAUNCH_CONFIG = (port: number, temperature = 0.2) => ({
+  server: { port, logLevel: "DEBUG" },
+  model: {
+    sampling: { temperature, maxTokens: 2048, seed: 7, stop: ["###"] },
+    chatTemplateArgs: { enable_thinking: false },
+  },
+});
+
+test("the stand-in server receives the configured values and the one template source for the launched model", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(LAUNCH_CONFIG(port));
+  await h.start();
+  const payload = piPayload(QWEN.modelId);
+
+  const rewritten = await h.runHook(payload);
+  assert.equal(await h.postToServer(port, rewritten), 200);
+
+  const received = h.requests().at(-1);
+  assert.equal(received?.url, "/v1/chat/completions");
+  assert.deepEqual(received?.body, {
+    model: QWEN.modelId,
+    messages: [{ role: "user", content: "hi" }],
+    stream: true,
+    temperature: 0.2,
+    max_completion_tokens: 2048,
+    seed: 7,
+    stop: ["###"],
+    chat_template_kwargs: { enable_thinking: false },
+  });
+  assert.deepEqual((received?.body as Record<string, unknown>).chat_template_kwargs, { enable_thinking: false });
+});
+
+test("a request for another provider reaches the stand-in server exactly as pi built it", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(LAUNCH_CONFIG(port));
+  await h.start();
+  const payload = piPayload(QWEN.modelId);
+
+  const result = await h.runHook(payload, "openai");
+  assert.equal(result, undefined);
+  assert.equal(await h.postToServer(port, payload), 200);
+
+  assert.deepEqual(h.requests().at(-1)?.body, payload);
+});
+
+test("after /mlx-stop the hook leaves a request for the former model untouched", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(LAUNCH_CONFIG(port));
+  await h.start();
+  assert.notEqual(await h.runHook(piPayload(QWEN.modelId)), undefined, "applied while the launch lives");
+
+  await h.stop();
+
+  assert.equal(await h.runHook(piPayload(QWEN.modelId)), undefined);
+});
+
+test("after session_shutdown the hook leaves a request for the former model untouched", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(LAUNCH_CONFIG(port));
+  await h.start();
+  assert.notEqual(await h.runHook(piPayload(QWEN.modelId)), undefined, "applied while the launch lives");
+
+  await h.shutdown();
+
+  assert.equal(await h.runHook(piPayload(QWEN.modelId)), undefined);
+});
+
+test("editing or deleting the config after the start changes nothing until the next start (D-12)", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(LAUNCH_CONFIG(port, 0.2));
+  await h.start();
+  const temperatureOf = async () => ((await h.runHook(piPayload(QWEN.modelId))) as Record<string, unknown>).temperature;
+  assert.equal(await temperatureOf(), 0.2);
+
+  h.writeConfig(LAUNCH_CONFIG(port, 0.9));
+  assert.equal(await temperatureOf(), 0.2, "an edited file is not read per request");
+
+  rmSync(h.globalConfigPath);
+  assert.equal(await temperatureOf(), 0.2, "a deleted file is not missed per request");
+});
+
+test("a second /mlx-start picks up the edited config (D-12)", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(LAUNCH_CONFIG(port, 0.2));
+  await h.start();
+  h.writeConfig(LAUNCH_CONFIG(port, 0.9));
+
+  await h.start();
+
+  const result = (await h.runHook(piPayload(QWEN.modelId))) as Record<string, unknown>;
+  assert.equal(result.temperature, 0.9);
+  assert.equal(await h.postToServer(port, result), 200);
+  assert.equal((h.requests().at(-1)?.body as Record<string, unknown>).temperature, 0.9);
 });

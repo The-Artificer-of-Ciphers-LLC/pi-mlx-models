@@ -1,7 +1,10 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { freePort, spawnStub, waitForExit, waitForHttp } from "./testkit.js";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -174,4 +177,45 @@ test("stub with an unknown mode exits with code 2 and names the mode on stderr",
 
   assert.equal(code, 2);
   await waitForText(stderr.text, "no-such-mode");
+});
+
+test("stub with STUB_REQUEST_FILE records each POST body with its URL as one JSON line", { timeout: 20_000 }, async (t) => {
+  const port = await freePort();
+  const dir = mkdtempSync(join(tmpdir(), "pi-mlx-stub-"));
+  const file = join(dir, "requests.jsonl");
+  startStub(t, { mode: "ok", port, env: { STUB_REQUEST_FILE: file } });
+  const base = `http://127.0.0.1:${port}`;
+  await waitForHttp(`${base}/v1/models`);
+  const sent = { model: "stub/model", messages: [{ role: "user", content: "hi" }], temperature: 0.2 };
+
+  const chat = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(sent),
+  });
+
+  assert.equal(chat.status, 200);
+  const lines = readFileSync(file, "utf8").split("\n").filter((line) => line !== "");
+  assert.equal(lines.length, 1);
+  assert.deepEqual(JSON.parse(lines[0]), { url: "/v1/chat/completions", body: sent });
+});
+
+test("stub with STUB_REQUEST_FILE empty writes no file and answers as before", { timeout: 20_000 }, async (t) => {
+  const port = await freePort();
+  const dir = mkdtempSync(join(tmpdir(), "pi-mlx-stub-"));
+  startStub(t, { mode: "ok", port, env: { STUB_REQUEST_FILE: "" } });
+  const base = `http://127.0.0.1:${port}`;
+  await waitForHttp(`${base}/v1/models`);
+
+  const chat = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "stub/model", messages: [] }),
+  });
+
+  assert.equal(chat.status, 200);
+  const body = (await chat.json()) as { object: string; choices: unknown[] };
+  assert.equal(body.object, "chat.completion");
+  assert.equal(body.choices.length, 1);
+  assert.deepEqual(readdirSync(dir), [], "an empty STUB_REQUEST_FILE means recording is off and nothing is written");
 });
