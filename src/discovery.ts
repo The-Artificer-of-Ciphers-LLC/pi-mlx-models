@@ -13,18 +13,8 @@ export interface DiscoverModelIdsOptions {
  * non-200, bad JSON, wrong shape) yields an empty list so pi still loads.
  */
 export async function discoverModelIds(options: DiscoverModelIdsOptions): Promise<string[]> {
-  const doFetch = options.fetch ?? fetch;
-  try {
-    // One signal for the request and the body read, so a server that stalls mid-body is aborted too.
-    const signal = AbortSignal.timeout(options.timeoutMs ?? DISCOVERY_TIMEOUT_MS);
-    const res = await doFetch(`${options.baseUrl}/models`, { signal });
-    if (!res.ok) return [];
-    const body = (await res.json()) as { data?: Array<{ id?: unknown }> };
-    if (!Array.isArray(body.data)) return [];
-    return body.data.map((m) => m?.id).filter((id): id is string => typeof id === "string" && id.length > 0);
-  } catch {
-    return [];
-  }
+  const probe = await probeModels(options);
+  return probe.answers ? probe.ids : [];
 }
 
 /** What a probe of the models endpoint learned: whether the server answered, and the ids when it did. */

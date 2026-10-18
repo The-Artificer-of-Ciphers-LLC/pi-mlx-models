@@ -2,7 +2,7 @@ import { readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { writeFileAtomic } from "./atomicfile.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
-import { PROFILE_NAME } from "./settings.js";
+import { CONTROL_CHARACTER, MAX_TEXT_LENGTH, PROFILE_NAME } from "./settings.js";
 
 /**
  * The remembered last launch (CMD-06, D-01, D-02, D-05, D-06). One small extension-owned file next to the global config.json, so
@@ -26,10 +26,6 @@ export interface LastLaunch {
 
 export type LastLaunchRead = { state: "absent" } | { state: "unreadable"; reason: string } | { state: "ok"; value: LastLaunch };
 
-/** The same limits the settings module puts on a model id or a path: one line, at most 4096 characters. */
-const MAX_MODEL_LENGTH = 4096;
-/** C0 controls, DEL and the C1 range: nothing that could steer a terminal. */
-const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
 /** The three keys of a record, in the order the writer produces them. */
 const KEYS = ["version", "model", "profile"];
 
@@ -44,7 +40,7 @@ function validModel(model: unknown): model is string {
     typeof model === "string" &&
     model !== "" &&
     model === model.trim() &&
-    model.length <= MAX_MODEL_LENGTH &&
+    model.length <= MAX_TEXT_LENGTH &&
     !CONTROL_CHARACTER.test(model) &&
     !model.startsWith("-")
   );

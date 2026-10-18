@@ -216,10 +216,11 @@ function checkBoolean(value: unknown): CheckResult {
 
 const valued = (flag: string) => (value: SettingValue) => [`${flag}=${value}`];
 
-const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
+/** C0 controls, DEL and the C1 range. Exported so the config editor and the last-launch record test the same set. */
+export const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
 
-/** The longest path or model id a setting may hold; real ones are far shorter. */
-const MAX_TEXT_LENGTH = 4096;
+/** The longest path or model id a setting may hold; real ones are far shorter. Exported for the same reason. */
+export const MAX_TEXT_LENGTH = 4096;
 
 /**
  * A model id or a file system path: not empty after trimming, one line, no control characters (a NUL would make the

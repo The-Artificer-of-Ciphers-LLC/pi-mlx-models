@@ -12,6 +12,7 @@ import {
   VENV_PYTHON,
   deriveBaseUrl,
 } from "./config.js";
+import { SAFE_CHOICE_NOTE } from "./configedit.js";
 import { runConfigMenu } from "./configmenu.js";
 import { cleanLabel, clipDiagnostic, redactCredentials, redactIdCredentials } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
@@ -221,17 +222,6 @@ const workingDirectory = (ctx: any): string => (typeof ctx.cwd === "string" && c
 /** "a", "a and b", "a, b and c". */
 const joinPhrases = (phrases: readonly string[]): string =>
   phrases.length > 1 ? `${phrases.slice(0, -1).join(", ")} and ${phrases[phrases.length - 1]}` : (phrases[0] ?? "");
-
-/**
- * The last line of every trust dialog (CFG-06, GAP-02). pi's `ctx.ui.confirm(title, message, opts?)` takes options of
- * type `ExtensionUIDialogOptions`, which carries only `signal` and `timeout` (checked in @earendil-works/pi-coding-agent
- * 0.73.0 and @earendil-works/pi-coding-agent 1.3.0). An extension therefore cannot choose which choice is highlighted,
- * and interactive pi opens the dialog with Yes highlighted. This sentence is the only protection available while the
- * call stays `ctx.ui.confirm` (D-13); pressing Enter without reading still selects Yes. The real fix is a default option
- * in pi, or a decision to amend D-13 and ask with `ctx.ui.select` with No first. A constant on purpose: no text from a
- * file, the environment or a flag is ever added to it (T-02-31).
- */
-const SAFE_CHOICE_NOTE = "Yes allows this. No or Esc cancels. Check which option is highlighted before pressing Enter.";
 
 async function pickPreset(ctx: any): Promise<ModelPreset | undefined> {
   const options = MODEL_PRESETS.map((p, i) => `${i + 1}. ${p.key} — ${p.tags.slice(0, 2).join(", ")}`);

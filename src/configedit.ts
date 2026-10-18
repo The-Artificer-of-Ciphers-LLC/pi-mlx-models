@@ -2,7 +2,7 @@ import { writeFileAtomic } from "./atomicfile.js";
 import { isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { MODEL_PRESETS } from "./presets.js";
-import { type LayerFile, MAX_FILE_BYTES, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
+import { CONTROL_CHARACTER, type LayerFile, MAX_FILE_BYTES, MAX_TEXT_LENGTH, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
 
 /**
  * The pure editing core of /mlx-config (CMD-02, D-17, D-20). An edit reads the global config fresh, changes one key in a
@@ -276,8 +276,16 @@ export function convertInput(row: SettingDef, text: string): Converted {
   return row.check(value).ok ? { ok: true, value } : fail;
 }
 
-/** The sentence every confirmation ends with, spelled the same as the launch-time trust dialogs. */
-const SAFE_CHOICE_NOTE = "Yes allows this. No or Esc cancels. Check which option is highlighted before pressing Enter.";
+/**
+ * The last line of every trust dialog and every /mlx-config confirmation (CFG-06, GAP-02); index.ts imports it from here,
+ * so there is one copy. pi's `ctx.ui.confirm(title, message, opts?)` takes options of type `ExtensionUIDialogOptions`, which carries only `signal` and `timeout` (checked in @earendil-works/pi-coding-agent
+ * 0.73.0 and @earendil-works/pi-coding-agent 1.3.0). An extension therefore cannot choose which choice is highlighted,
+ * and interactive pi opens the dialog with Yes highlighted. This sentence is the only protection available while the
+ * call stays `ctx.ui.confirm` (D-13); pressing Enter without reading still selects Yes. The real fix is a default option
+ * in pi, or a decision to amend D-13 and ask with `ctx.ui.select` with No first. A constant on purpose: no text from a
+ * file, the environment or a flag is ever added to it (T-02-31).
+ */
+export const SAFE_CHOICE_NOTE = "Yes allows this. No or Esc cancels. Check which option is highlighted before pressing Enter.";
 
 /** A value as a dialog shows it: one line, credentials hidden, at most 300 characters, in that order. */
 function shownValue(value: unknown): string {
@@ -382,8 +390,7 @@ export function modelEntrySummary(tree: ConfigTree, model: string): ModelEntrySu
 
 type Checked = { ok: true; value: string } | { ok: false; message: string };
 
-const MAX_MODEL_KEY_LENGTH = 4096;
-const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
+const MAX_MODEL_KEY_LENGTH = MAX_TEXT_LENGTH;
 
 /**
  * A model key the user types for `models`. This checks only the shape: one line, not empty after trimming, at most 4096
