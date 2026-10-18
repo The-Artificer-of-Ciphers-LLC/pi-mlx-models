@@ -1,6 +1,8 @@
 import { writeFileAtomic } from "./atomicfile.js";
 import { isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import { isLocalPath } from "./modelinfo.js";
+import { MODEL_PRESETS } from "./presets.js";
 import { type LayerFile, MAX_FILE_BYTES, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
 
 /**
@@ -363,9 +365,12 @@ export function validateModelKey(text: string): Checked {
   return { ok: true, value };
 }
 
-/** Whether a typed model key could match a start (advisory; never rejects a key). */
+/**
+ * Whether a typed model key could ever match a start: a preset key, an id with a slash such as `org/name`, or a local path.
+ * Advisory only: it never rejects a key, and a bare name such as a profile name typed by mistake is the case it exists for.
+ */
 export function isPlausibleModelKey(key: string): boolean {
-  return key.length >= 0;
+  return MODEL_PRESETS.some((preset) => preset.key === key) || key.includes("/") || isLocalPath(key);
 }
 
 /** A profile name the user types: the profile rule of the settings module. */

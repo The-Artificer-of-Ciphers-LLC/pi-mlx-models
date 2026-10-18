@@ -8,6 +8,7 @@ import {
   editConfig,
   editableKeys,
   getAt,
+  isPlausibleModelKey,
   modelKeys,
   profileNames,
   renderConfig,
@@ -252,6 +253,16 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     if (!checked.ok) {
       dialogs.notify(`Not added: ${checked.message}.`, "error");
       return undefined;
+    }
+    if (!isPlausibleModelKey(checked.value)) {
+      const confirmed = await dialogs.confirm(
+        `Add ${shown(checked.value)} anyway?`,
+        `${shown(checked.value)} is not a preset key (${presets}), has no slash like org/name and is not a local path, so no start will use settings stored under it. A common cause is typing a profile name where the model key belongs: choose the model first, then add the profile. Yes adds it anyway. No or Esc cancels.`,
+      );
+      if (!confirmed) {
+        dialogs.notify(`Nothing was added: the model key ${shown(checked.value)} was not confirmed.`, "info");
+        return undefined;
+      }
     }
     return checked.value;
   }
