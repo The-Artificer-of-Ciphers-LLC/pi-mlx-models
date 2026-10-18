@@ -18,14 +18,18 @@ Local MLX model launcher for [pi](https://pi.dev) on Apple Silicon.
 
 ## What you get
 
-- Interactive preset selector via `/mlx-start`
-- Local runtime bootstrap via `/mlx-init` (virtual environment and `mlx-lm`)
+- A preset selector with `/mlx-start`, or any Hugging Face model id
+- A local runtime built by `/mlx-init` (virtual environment and `mlx-lm`), with an optional mlx-lm version pin and pip index
+- Day-to-day commands: `/mlx-last` starts the last model again, `/mlx-restart` applies a changed setting, `/mlx-status` shows the server
+- `/mlx-config`, a menu to edit the global config file without leaving pi
+- Optional auto-start of the last model when pi opens (off by default)
 - Layered configuration: a global file, a project file, environment variables and flags
-- Server and model options: allowed origins, log level, draft model, adapter, chat template
+- Named profiles per model, and sampling values that also reach the requests pi sends
+- The context window pi is told about each model is read from the model's own `config.json`
+- Server tuning: concurrency, prompt cache and KV cache options, draft model, adapter, chat template
 - A permission check for settings that run code or open the network
 - Startup progress with stage and status updates and a warm-up timer
 - Provider models appear only when the server is actually ready
-- Stop and cleanup via `/mlx-stop`
 
 ## Requirements
 
@@ -55,7 +59,7 @@ In pi:
 /mlx-start
 ```
 
-`/mlx-init` builds the runtime the first time. `/mlx-start` with no arguments opens a selector: pick a preset with the arrow keys and Enter.
+`/mlx-init` builds the runtime the first time. `/mlx-start` with no arguments opens a selector: pick a preset with the arrow keys and Enter. When the server is ready, pi says so. A step-by-step walk-through is in [Get started](./docs/tutorials/get-started.md).
 
 To start a model directly, give a preset number or key, or any Hugging Face model id:
 
@@ -64,7 +68,23 @@ To start a model directly, give a preset number or key, or any Hugging Face mode
 /mlx-start mlx-community/Qwen3-4B-Instruct-2507-4bit
 ```
 
-When the server is ready, pi says so. Use `/model` and pick `pi-mlx-models/...`. Stop it with `/mlx-stop`.
+Stop it with `/mlx-stop`.
+
+## Commands
+
+Details, arguments and the preset list are in the [commands reference](./docs/reference/commands.md).
+
+- `/mlx-init`: create or update the local runtime (Python virtual environment and mlx-lm)
+- `/mlx-start`: start the server for a preset, a model id or a profile
+- `/mlx-last`: start the model and profile of the last successful start
+- `/mlx-restart`: start the running model again through the settings as they are now
+- `/mlx-stop`: stop the server
+- `/mlx-status`: show the server's health, model, profile and flags
+- `/mlx-config`: view and edit the global config file in a menu
+
+## The default port
+
+The server listens on `127.0.0.1:8080` by default, not on 11434. Set `PI_MLX_MODELS_PORT` (or `server.port` in a config file) to change it.
 
 ## Configure it
 
@@ -74,24 +94,39 @@ Create `~/.pi/agent/pi-mlx-models/config.json` to set a port, allowed origins or
 { "server": { "port": 8090, "logLevel": "INFO" } }
 ```
 
+## Security
+
+`--trust-remote-code` lets a model repository run Python on your machine, and a non-loopback `host` makes the server, which has no authentication, reachable from your network. Both ask for confirmation at every start, and a project file may not turn either on. See [How to allow remote code or network access](./docs/how-to/allow-remote-code-or-network-access.md).
+
 ## Documentation
 
-**Guides**
+**Tutorials**
+
+- [Get started](./docs/tutorials/get-started.md): install, build the runtime, start a model and send a first prompt
+
+**How-to guides**
 
 - [How to configure the MLX server](./docs/how-to/configure-the-server.md)
+- [How to edit the configuration from inside pi](./docs/how-to/edit-the-config-in-pi.md)
 - [How to set model options](./docs/how-to/set-model-options.md) (draft model, adapter, chat template)
+- [How to use profiles and sampling](./docs/how-to/use-profiles-and-sampling.md)
+- [How to set a model's context window, thinking flag and output limit](./docs/how-to/set-model-limits.md)
+- [How to restart, check and re-launch a model](./docs/how-to/restart-check-and-relaunch.md)
+- [How to start a model automatically when pi opens](./docs/how-to/start-a-model-automatically.md)
 - [How to allow remote code or network access](./docs/how-to/allow-remote-code-or-network-access.md)
+- [How to release a new version](./docs/how-to/release-a-new-version.md) (maintainers)
 
 **Reference**
 
 - [Commands](./docs/reference/commands.md), including the presets
 - [Configuration](./docs/reference/configuration.md): files, settings, flags, environment variables and precedence
 
-**Background**
+**Explanation**
 
+- [About how a launch is built](./docs/explanation/how-a-launch-is-built.md)
 - [About layered configuration and trust](./docs/explanation/layered-configuration-and-trust.md)
 
-See the [changelog](./CHANGELOG.md) for what changed in each release. Maintainers: [How to release a new version](./docs/how-to/release-a-new-version.md).
+See the [changelog](./CHANGELOG.md) for what changed in each release.
 
 ## Development
 

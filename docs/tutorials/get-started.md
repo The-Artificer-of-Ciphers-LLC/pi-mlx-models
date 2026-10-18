@@ -100,3 +100,4 @@ We have installed the extension, built the runtime, started a model and talked t
 - [How to start a model automatically when pi opens](../how-to/start-a-model-automatically.md).
 - [How to configure the MLX server](../how-to/configure-the-server.md) to change the port, the log level and more.
 - [Commands reference](../reference/commands.md) for every command and the other presets.
+- [About how a launch is built](../explanation/how-a-launch-is-built.md) for what happens between a preset and a request.
