@@ -25,6 +25,7 @@ import {
   describeFlags,
   formatConfigErrors,
   formatProjectRefusal,
+  kvNotices,
   prepareSettings,
   readLayerFile,
   toLaunchSpec,
@@ -347,6 +348,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...${flagsLine ? `\n${flagsLine}` : ""}`,
         "info",
       );
+      // KV quantization turns batching off. Told on every launch, through no once-per-text set and with no state kept (D-09).
+      const kv = kvNotices(launch, skipped);
+      if (kv.warning !== undefined) ctx.ui.notify(kv.warning, "warning");
+      if (kv.info !== undefined) ctx.ui.notify(kv.info, "info");
       progress.status(`Start MLX server process (${model})`);
       activate(1, "Launching mlx_lm.server");
 

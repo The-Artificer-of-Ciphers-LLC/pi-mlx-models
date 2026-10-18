@@ -227,7 +227,14 @@ const parseDigits =
     return /^\d+$/.test(trimmed) ? check(Number(trimmed)) : bad;
   };
 
+/** A JSON number that is a safe integer from `min` to `max` inclusive: no text, no fraction, no coercion (D-11). */
+const checkIntegerRange =
+  (min: number, max: number) =>
+  (value: unknown): CheckResult =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max ? ok(value) : bad;
+
 const checkDraftTokens = checkIntegerAtLeast(1);
+const checkKvBits = checkIntegerRange(2, 8);
 
 /** The most the extension will place in one argv element for the template (T-02-21). */
 const MAX_TEMPLATE_BYTES = 64 * 1024;
@@ -429,6 +436,19 @@ export const SETTINGS: readonly SettingDef[] = [
     expected: "an integer number of bytes, at least 1 (for example 8589934592 for 8 GiB)",
     problem: (shown) => `${shown} is not an integer number of bytes of at least 1, for example 8589934592 for 8 GiB`,
   }),
+  {
+    // KV cache quantization. The range is the one locked in D-11; MLX itself rejects 7, and mlx-lm's own error
+    // comes through if a value it cannot do is passed. Server-wide, not per model (D-13).
+    path: "server.kvBits",
+    kind: "integer",
+    expected: "an integer from 2 to 8 (MLX itself does not support 7)",
+    check: checkKvBits,
+    problem: PHRASES.integerRange(2, 8),
+    parseText: parseDigits(checkKvBits),
+    cli: "--kv-bits",
+    mlxFlag: "--kv-bits",
+    emit: valued("--kv-bits"),
+  },
   {
     path: "model.adapterPath",
     kind: "path",
@@ -1183,6 +1203,36 @@ export function describeFlags(launch: ResolvedLaunch, skipped?: ReadonlySet<stri
     (flag) => `${flag.flag}${flag.display ? ` ${flag.display}` : ""} (${flag.label}${!flag.core && skipped?.has(flag.flag) ? ", skipped" : ""})`,
   );
   return `flags: ${parts.join(", ")}`;
+}
+
+/** What a launch with KV cache quantization has to tell the user (D-09, D-10, D-12). */
+export interface KvNotices {
+  /** Shown at level warning on every launch that quantizes. */
+  warning?: string;
+  /** Shown at level info when a KV key is set without kvBits. */
+  info?: string;
+}
+
+/**
+ * The words after the batching sentence when a concurrency setting is also set. Nothing is dropped from the launch
+ * (D-10); the user is only told those settings do nothing while kvBits is set. Filled in by the interaction task.
+ */
+function concurrencyClause(_launch: ResolvedLaunch, _skipped: ReadonlySet<string> | undefined): string {
+  return "";
+}
+
+/**
+ * The notices for the KV cache settings of a resolved launch. A flag the install does not list (`skipped`) does not
+ * count as set: the skip notice already covers it (D-09). The text is schema-derived plus the cleaned `display` and
+ * `label` of validated flags (T-03-04), and no state is kept, so every launch gets its own notices.
+ */
+export function kvNotices(launch: ResolvedLaunch, skipped?: ReadonlySet<string>): KvNotices {
+  const bits = launch.flags.find((flag) => flag.path === "server.kvBits" && !skipped?.has(flag.flag));
+  if (bits === undefined) return {};
+  const clause = concurrencyClause(launch, skipped);
+  return {
+    warning: `KV quantization (${bits.flag} ${bits.display}, ${bits.label}): Disables batching, so requests are served one at a time.${clause ? ` ${clause}` : ""}`,
+  };
 }
 
 /** The most problem lines one refusal shows; the rest are counted. */

@@ -894,6 +894,7 @@ test("cliFlagSpecs lists the flags /mlx-start accepts, in schema order; only the
     { flag: "--prefill-step-size", path: "server.prefillStepSize", takesValue: true },
     { flag: "--prompt-cache-size", path: "server.promptCacheSize", takesValue: true },
     { flag: "--prompt-cache-bytes", path: "server.promptCacheBytes", takesValue: true },
+    { flag: "--kv-bits", path: "server.kvBits", takesValue: true },
     { flag: "--adapter-path", path: "model.adapterPath", takesValue: true },
     { flag: "--draft-model", path: "model.draftModel", takesValue: true },
     { flag: "--num-draft-tokens", path: "model.numDraftTokens", takesValue: true },
