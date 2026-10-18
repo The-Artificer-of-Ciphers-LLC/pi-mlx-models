@@ -253,7 +253,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
         if (typed === undefined) return "menu";
         const converted = convertInput(key.row, typed);
         if (!converted.ok) {
-          dialogs.notify(`Not saved: ${converted.message}.`, "error");
+          report(`Not saved: ${converted.message}.`, "error");
           return "menu";
         }
         value = converted.value;
@@ -264,7 +264,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     if (!remove) {
       const needed = confirmationFor(key.row, value);
       if (needed !== undefined && !(await dialogs.confirm(needed.title, needed.message))) {
-        dialogs.notify(`Nothing was saved: ${name} was not confirmed.`, "info");
+        report(`Nothing was saved: ${name} was not confirmed.`, "info");
         return "menu";
       }
     }
@@ -291,7 +291,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     if (typed === undefined) return undefined;
     const checked = validateModelKey(typed);
     if (!checked.ok) {
-      dialogs.notify(`Not added: ${checked.message}.`, "error");
+      report(`Not added: ${checked.message}.`, "error");
       return undefined;
     }
     // Only a key that would create a new entry is asked about: a key already in the file adds nothing.
@@ -301,7 +301,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
         `${shown(checked.value)} is not a preset key (${presets}), has no slash like org/name and is not a local path, so no start will use settings stored under it. A common cause is typing a profile name where the model key belongs: choose the model first, then add the profile. Yes adds it anyway. No or Esc cancels.`,
       );
       if (!confirmed) {
-        dialogs.notify(`Nothing was added: the model key ${shown(checked.value)} was not confirmed.`, "info");
+        report(`Nothing was added: the model key ${shown(checked.value)} was not confirmed.`, "info");
         return undefined;
       }
     }
@@ -328,7 +328,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
       `This removes the profile and everything set in it from the config file.${clears ? " It is the default profile of this model, so the default is cleared too." : ""} Yes deletes it. No or Esc cancels.`,
     );
     if (!confirmed) {
-      dialogs.notify(`Nothing was deleted: ${name} was not confirmed.`, "info");
+      report(`Nothing was deleted: ${name} was not confirmed.`, "info");
       return "menu";
     }
     return flowOf(
@@ -358,12 +358,12 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
       if (typed === undefined) return "menu";
       const checked = validateProfileName(typed);
       if (!checked.ok) {
-        dialogs.notify(`Not added: ${checked.message}.`, "error");
+        report(`Not added: ${checked.message}.`, "error");
         return "menu";
       }
       profile = checked.value;
       if (names.includes(profile)) {
-        dialogs.notify(`Profile ${shown(profile)}${ofModel(model)} already exists; its keys are edited and nothing is replaced.`, "info");
+        report(`Profile ${shown(profile)}${ofModel(model)} already exists; its keys are edited and nothing is replaced.`, "info");
       } else {
         const created = write(
           (draft) => setAt(draft, ["models", model, "profiles", profile], {}),
@@ -375,7 +375,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     }
 
     const actions: string[] = [PROFILE_ACTION.edit, PROFILE_ACTION.delete, PROFILE_ACTION.back];
-    const action = await pick(`Profile ${shown(profile)}${ofModel(model)}`, actions);
+    const action = await pick(titled(`Profile ${shown(profile)}${ofModel(model)}`), actions);
     if (action === undefined) return "menu";
     if (actions[action] === PROFILE_ACTION.edit) {
       return editKey("profile", { model, profile }, `Keys of profile ${shown(profile)}${ofModel(model)}`, ofProfile(model, profile));
@@ -388,7 +388,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     if (modelKeys(currentTree()).length === 0) {
       // A file that cannot be read has no models to list; say so the way a write would, and stop.
       if (readLayerFile(path).state === "unusable") return flowOf(write((draft) => draft, "", ""));
-      dialogs.notify("The config file lists no models yet: add options or a profile for a model first.", "info");
+      report("The config file lists no models yet: add options or a profile for a model first.", "info");
       return "menu";
     }
     const model = await chooseModel("Choose the model whose default profile to set", false);
@@ -396,7 +396,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     const tree = currentTree();
     const names = profileNames(tree, model);
     if (names.length === 0) {
-      dialogs.notify(`Model ${shown(model)} has no profiles: add a profile first.`, "info");
+      report(`Model ${shown(model)} has no profiles: add a profile first.`, "info");
       return "menu";
     }
     const current = getAt(tree, ["models", model, "defaultProfile"]);
@@ -442,7 +442,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     if (modelKeys(currentTree()).length === 0) {
       // A file that cannot be read has no entries to list; say so the way a write would, and stop.
       if (readLayerFile(path).state === "unusable") return flowOf(write((draft) => draft, "", ""));
-      dialogs.notify("The config file lists no model entries: there is nothing to delete.", "info");
+      report("The config file lists no model entries: there is nothing to delete.", "info");
       return "menu";
     }
     const model = await chooseModel("Choose the model entry to delete", false);
@@ -453,7 +453,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
       `${lostByEntry(model)} Other model entries and settings are not touched. Yes deletes it. No or Esc cancels.`,
     );
     if (!confirmed) {
-      dialogs.notify(`Nothing was deleted: ${name} was not confirmed.`, "info");
+      report(`Nothing was deleted: ${name} was not confirmed.`, "info");
       return "menu";
     }
     return flowOf(write((draft) => unsetAt(draft, ["models", model]), `Deleted ${name}.`, `${name} was not in the file.`));
