@@ -3075,6 +3075,17 @@ test("model.sampling.temperature with a value that parses to Infinity is refused
   assert.ok(lines[0].endsWith("is not a number of at least 0 (OpenAI field temperature, flag --temp)"), lines[0]);
 });
 
+test("a value that overflows to Infinity or -Infinity is echoed by name, not as null (IN-02)", () => {
+  const data = JSON.parse('{"model":{"sampling":{"temperature":1e999}}}') as Record<string, unknown>;
+  assert.deepEqual(refused({ global: ok(data) }), [
+    `model.sampling.temperature (${GLOBAL}): Infinity is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+  ]);
+  const negative = JSON.parse('{"model":{"sampling":{"temperature":-1e999}}}') as Record<string, unknown>;
+  assert.deepEqual(refused({ global: ok(negative) }), [
+    `model.sampling.temperature (${GLOBAL}): -Infinity is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+  ]);
+});
+
 test("a sampling value that is not an object is one line", () => {
   assert.deepEqual(refused({ global: ok({ model: { sampling: "x" } }) }), [`model.sampling (${GLOBAL}): "x" must be a JSON object`]);
 });
