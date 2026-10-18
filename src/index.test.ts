@@ -2326,3 +2326,132 @@ test("a bad mlxLm.version refuses mlx-init before any side effect", async () => 
   assert.deepEqual(h.hostCalls, [], "the scripted host was never called");
   assert.deepEqual(h.widgets, [], "no progress widget was drawn");
 });
+
+// ---- /mlx-init flags: strict parsing, one run only, the progress line, installs that never share a policy (plan 03-03) ----
+
+/** The mlx-lm spec of every pip install step the scripted host saw. */
+const mlxLmSpecs = (calls: string[][]) => calls.filter((call) => call[5]?.startsWith("mlx-lm")).map((call) => call[5]);
+
+test("mlx-init --mlx-lm-version 0.31.1 runs the mlx-lm pip step with mlx-lm==0.31.1", async () => {
+  const h = await setupRealInstall();
+
+  await h.commands.get("mlx-init")!("--mlx-lm-version 0.31.1", h.ctx);
+
+  assert.deepEqual(mlxLmSpecs(h.hostCalls), ["mlx-lm==0.31.1"]);
+  assert.deepEqual(errors(h.notes), []);
+});
+
+test("nothing typed on mlx-init is remembered: the next plain mlx-init floats again", async () => {
+  const h = await setupRealInstall();
+
+  await h.commands.get("mlx-init")!("--mlx-lm-version 0.31.1", h.ctx);
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.deepEqual(mlxLmSpecs(h.hostCalls), ["mlx-lm==0.31.1", "mlx-lm>=0.24.0"]);
+});
+
+test("mlx-init --mlx-lm-version=latest over a global pin floats", async () => {
+  const h = await setupRealInstall({ mlxLm: { version: "0.31.1" } });
+
+  await h.commands.get("mlx-init")!("--mlx-lm-version=latest", h.ctx);
+
+  assert.deepEqual(mlxLmSpecs(h.hostCalls), ["mlx-lm>=0.24.0"]);
+});
+
+test("a bad typed version ends with one invalid-configuration error naming the /mlx-init flag, and nothing happens", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-init")!('--mlx-lm-version "^0.32"', h.ctx);
+
+  assert.equal(errors(h.notes).length, 1);
+  assert.ok(errors(h.notes)[0].startsWith("mlx-init failed: invalid configuration"), errors(h.notes)[0]);
+  assert.ok(
+    errors(h.notes)[0].includes('mlxLm.version (/mlx-init --mlx-lm-version): "^0.32" must be "latest" or an exact version such as 0.32.2'),
+    errors(h.notes)[0],
+  );
+  assertNothingHappened(h);
+});
+
+test("mlx-init with an unknown flag is refused, with its own flag list, and nothing happens", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-init")!("--bogus 1", h.ctx);
+
+  assert.deepEqual(errors(h.notes), ["mlx-init failed: unknown flag --bogus (valid flags: --mlx-lm-version)"]);
+  assertNothingHappened(h);
+});
+
+test("mlx-init with a repeated flag is refused", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-init")!("--mlx-lm-version 1.0 --mlx-lm-version 2.0", h.ctx);
+
+  assert.deepEqual(errors(h.notes), ["mlx-init failed: --mlx-lm-version was given twice"]);
+  assertNothingHappened(h);
+});
+
+test("mlx-init takes no model", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-init")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(errors(h.notes), ["mlx-init failed: unexpected argument qwen3_4b (/mlx-init takes no model)"]);
+  assertNothingHappened(h);
+});
+
+test("mlx-start still rejects --mlx-lm-version as an unknown flag and does not list it", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-start")!("qwen3_4b --mlx-lm-version 0.31.1", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    "mlx-start failed: unknown flag --mlx-lm-version (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --kv-bits, --kv-group-size, --quantized-kv-start, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
+  ]);
+  assertNothingHappened(h);
+});
+
+test("two mlx-init runs with different policies never share one install", async () => {
+  const gate = deferred();
+  let running = 0;
+  let maxRunning = 0;
+  let call = 0;
+  const h = await setup({
+    ensureInstalled: async () => {
+      call += 1;
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      if (call === 1) await gate.promise;
+      running -= 1;
+    },
+  });
+
+  const first = h.commands.get("mlx-init")!("", h.ctx);
+  await flush();
+  const second = h.commands.get("mlx-init")!("--mlx-lm-version 0.31.1", h.ctx);
+  await flush();
+  assert.equal(h.installCalls.length, 1, "the second run waits: it does not join an install with another policy");
+  gate.resolve();
+  await Promise.all([first, second]);
+
+  assert.equal(h.installCalls.length, 2);
+  assert.equal(maxRunning, 1);
+  assert.equal(h.installCalls[1].policy.version, "0.31.1");
+  assert.ok(h.notes.some((n) => n.type === "info" && n.message === "MLX runtime installed."));
+  assert.deepEqual(errors(h.notes), []);
+});
+
+test("mlx-init says which mlx-lm version and index it uses and where each came from", async () => {
+  const plain = await setup();
+  await plain.commands.get("mlx-init")!("", plain.ctx);
+  assert.ok(infos(plain.notes).includes("Installing mlx-lm latest (default) from https://pypi.org/simple/ (default)"), infos(plain.notes).join("|"));
+
+  const typed = await setup();
+  await typed.commands.get("mlx-init")!("--mlx-lm-version 0.31.1", typed.ctx);
+  assert.ok(infos(typed.notes).includes("Installing mlx-lm 0.31.1 (/mlx-init) from https://pypi.org/simple/ (default)"), infos(typed.notes).join("|"));
+
+  const settings = freshSettings({});
+  writeGlobal(settings, { mlxLm: { version: "0.32.2" } });
+  const filed = await setup({ settings });
+  await filed.commands.get("mlx-init")!("", filed.ctx);
+  assert.ok(infos(filed.notes).includes("Installing mlx-lm 0.32.2 (global file) from https://pypi.org/simple/ (default)"), infos(filed.notes).join("|"));
+});

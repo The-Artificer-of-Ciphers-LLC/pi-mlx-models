@@ -196,3 +196,41 @@ test("a long run of quotes and backslashes is scanned in one pass", () => {
   assert.deepEqual(tokenizeStartArgs(hostile), { error: "unterminated quote in the /mlx-start arguments" });
   assert.ok(Date.now() - started < 1000);
 });
+
+// ---- the parser as /mlx-init uses it (plan 03-03) ----
+
+const INIT_SPECS: CliFlagSpec[] = [{ flag: "--mlx-lm-version", path: "mlxLm.version", takesValue: true }];
+const INIT = { command: "/mlx-init", takesModel: false } as const;
+
+test("with a command name the tokenizer errors name that command, and with none they stay as they were", () => {
+  assert.deepEqual(tokenizeStartArgs("--a 'oops", "/mlx-init"), { error: "unterminated quote in the /mlx-init arguments" });
+  assert.deepEqual(tokenizeStartArgs("--a 'oops"), { error: "unterminated quote in the /mlx-start arguments" });
+  const result = parseStartArgs("--mlx-lm-version 'oops", INIT_SPECS, { command: "/mlx-init" });
+  assert.deepEqual(result, { ok: false, error: "unterminated quote in the /mlx-init arguments" });
+});
+
+test("the length cap names the command", () => {
+  const result = parseStartArgs("a ".repeat(5000), INIT_SPECS, INIT);
+  assert.deepEqual(result, { ok: false, error: "the /mlx-init arguments are longer than 8192 characters" });
+});
+
+test("takesModel false turns a positional word into an error naming the command", () => {
+  const result = parseStartArgs("qwen3_4b", INIT_SPECS, INIT);
+  assert.deepEqual(result, { ok: false, error: "unexpected argument qwen3_4b (/mlx-init takes no model)" });
+  assert.deepEqual(parseStartArgs("--mlx-lm-version 1.0 extra", INIT_SPECS, INIT), {
+    ok: false,
+    error: "unexpected argument extra (/mlx-init takes no model)",
+  });
+});
+
+test("takesModel false still parses a valid flag list and rejects a repeated flag", () => {
+  assert.deepEqual(parseStartArgs("--mlx-lm-version=0.31.1", INIT_SPECS, INIT), {
+    ok: true,
+    flags: [{ flag: "--mlx-lm-version", path: "mlxLm.version", raw: "0.31.1" }],
+  });
+  assert.deepEqual(parseStartArgs("", INIT_SPECS, INIT), { ok: true, flags: [] });
+  assert.deepEqual(parseStartArgs("--mlx-lm-version 1.0 --mlx-lm-version 2.0", INIT_SPECS, INIT), {
+    ok: false,
+    error: "--mlx-lm-version was given twice",
+  });
+});
