@@ -4018,3 +4018,61 @@ test("with provider.listAllModels true an other listed model gets the flag and t
   assert.equal(byId[QWEN_ID].reasoning, false);
   assert.equal("compat" in byId[QWEN_ID], false);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// profile limits (MOD-02, MOD-03): plan 05-05
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** A harness whose global file holds the `fast` profile of qwen3_4b with the given limits. */
+async function limitsHarness(limits: Record<string, unknown>, options: Parameters<typeof setup>[0] = {}) {
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { qwen3_4b: { profiles: { fast: { limits } } } } });
+  return setup({ settings, ...options });
+}
+
+test("limits.contextWindow skips the read: the reader is not asked for the launched id, no fallback warning is shown and the window is the profile's", async () => {
+  const stand = makeFakeModelConfig({}, HTTP_401);
+  const h = await limitsHarness({ contextWindow: 100000 }, { readModelConfig: stand.read });
+
+  await h.commands.get("mlx-start")!("qwen3_4b --profile fast", h.ctx);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(stand.calls.filter((call) => call.modelId === QWEN_ID), []);
+  assert.deepEqual(fallbackWarnings(h.notes), []);
+  assert.deepEqual(warnings(h.notes), []);
+  assert.equal(h.providerCalls.at(-1)?.config.models[0].contextWindow, 100000);
+  const [line] = modelNotes(h.notes);
+  assert.ok(line.message.includes("context 100000 (profile fast)"), line.message);
+  assert.equal(h.notes.at(-1)?.message, READY_NOTE);
+});
+
+test("limits.input registers the image entry too; a launch without it registers text only, the gemma-4 preset included", async () => {
+  const withImages = await limitsHarness({ input: ["text", "image"] });
+  await withImages.commands.get("mlx-start")!("qwen3_4b --profile fast", withImages.ctx);
+  assert.deepEqual(withImages.providerCalls.at(-1)?.config.models[0].input, ["text", "image"]);
+  assert.ok(modelNotes(withImages.notes)[0].message.includes("input text and image (profile fast)"));
+
+  const plain = await setup();
+  await plain.commands.get("mlx-start")!("qwen3_4b", plain.ctx);
+  assert.deepEqual(plain.providerCalls.at(-1)?.config.models[0].input, ["text"]);
+
+  const gemma = await setup();
+  await gemma.commands.get("mlx-start")!("gemma4_e2b", gemma.ctx);
+  assert.deepEqual(gemma.providerCalls.at(-1)?.config.models[0].input, ["text"]);
+});
+
+test("limits.reasoning false on the R1 distill registers a plain model: no compat property and an output limit of 8192", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { models: { deepseek_r1_1_5b: { profiles: { plain: { limits: { reasoning: false } } } } } });
+  const h = await setup({ settings });
+
+  await h.commands.get("mlx-start")!("deepseek_r1_1_5b --profile plain", h.ctx);
+
+  assert.deepEqual(errors(h.notes), []);
+  const model = h.providerCalls.at(-1)?.config.models[0];
+  assert.equal(model.id, MODEL_PRESETS[0].modelId);
+  assert.equal(model.reasoning, false);
+  assert.equal("compat" in model, false);
+  assert.equal(model.maxTokens, 8192);
+  assert.ok(modelNotes(h.notes)[0].message.includes("reasoning no (profile plain)"));
+});

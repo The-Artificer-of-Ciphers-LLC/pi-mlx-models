@@ -1038,3 +1038,80 @@ test("an id that is not a repository id never reaches fetch, and neither does a 
 
   assert.equal(stub.calls.length, 0);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// What a profile's limits override (MOD-01, MOD-02, MOD-03; D-03, D-04, D-08, D-10, D-11)
+
+const LIMIT_R1 = MODEL_PRESETS[0];
+const LIMIT_KAT = "mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit";
+const readableConfig = (window: number): ModelConfigRead => ({ ok: true, config: { max_position_embeddings: window }, source: "cache" });
+const profileLabel = (name: string) => `profile ${name}`;
+
+test("limits.contextWindow replaces the window with the profile as its source, whether the config is unreadable or readable", () => {
+  const limits = { contextWindow: { value: 100000, label: profileLabel("think") } };
+  const unreadable = deriveModelInfo({ id: LIMIT_KAT, config: { ok: false, reason: "not in the Hugging Face cache" }, limits });
+  assert.equal(unreadable.contextWindow, 100000);
+  assert.equal(unreadable.contextSource, "profile think");
+  assert.equal(unreadable.fallbackReason, undefined);
+  const readable = deriveModelInfo({ id: LIMIT_KAT, config: readableConfig(262144), limits });
+  assert.equal(readable.contextWindow, 100000);
+  assert.equal(readable.contextSource, "profile think");
+  assert.equal(readable.fallbackReason, undefined);
+  assert.equal(deriveModelInfo({ id: LIMIT_KAT, limits }).fallbackReason, undefined, "no config at all is no reason either");
+});
+
+test("limits.reasoning wins in both directions and the default output limit follows the final flag", () => {
+  const off = deriveModelInfo({
+    id: LIMIT_R1.modelId,
+    config: readableConfig(131072),
+    limits: { reasoning: { value: false, label: profileLabel("plain") } },
+  });
+  assert.equal(off.reasoning, false);
+  assert.equal(off.reasoningSource, "profile plain");
+  assert.equal(off.maxTokens, 8192);
+  assert.equal(off.maxTokensSource, "default");
+  const on = deriveModelInfo({
+    id: LIMIT_KAT,
+    config: readableConfig(262144),
+    limits: { reasoning: { value: true, label: profileLabel("think") } },
+  });
+  assert.equal(on.reasoning, true);
+  assert.equal(on.reasoningSource, "profile think");
+  assert.equal(on.maxTokens, 32768);
+});
+
+test("limits.maxTokens replaces the default output limit and leaves the window alone; limits.input replaces the input list; empty limits change nothing", () => {
+  const config = readableConfig(262144);
+  const sized = deriveModelInfo({ id: LIMIT_KAT, config, limits: { maxTokens: { value: 16384, label: profileLabel("think") } } });
+  assert.equal(sized.maxTokens, 16384);
+  assert.equal(sized.maxTokensSource, "profile think");
+  assert.equal(sized.contextWindow, 262144);
+  assert.equal(sized.contextSource, "config.json");
+  const images = deriveModelInfo({ id: LIMIT_KAT, config, limits: { input: { value: ["text", "image"], label: profileLabel("vision") } } });
+  assert.deepEqual(images.input, ["text", "image"]);
+  assert.equal(images.inputSource, "profile vision");
+  assert.deepEqual(deriveModelInfo({ id: LIMIT_KAT, config, limits: {} }), deriveModelInfo({ id: LIMIT_KAT, config }));
+});
+
+test("the model line shows the profile as the source of every overridden value", () => {
+  const label = profileLabel("think");
+  const info = deriveModelInfo({
+    id: LIMIT_KAT,
+    config: readableConfig(262144),
+    limits: {
+      contextWindow: { value: 100000, label },
+      maxTokens: { value: 16384, label },
+      reasoning: { value: true, label },
+      input: { value: ["text", "image"], label },
+    },
+  });
+  const line = describeModel(info);
+  for (const part of [
+    "max output 16384 (profile think)",
+    "reasoning yes (profile think)",
+    "input text and image (profile think)",
+    "context 100000 (profile think)",
+  ]) {
+    assert.ok(line.includes(part), `${part} in ${line}`);
+  }
+});

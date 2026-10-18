@@ -3912,6 +3912,137 @@ test("a nested object inside limits names only its key and never echoes the valu
   assert.ok(!lines[0].includes("ZZZ-NESTED-VALUE"));
 });
 
+// ---- profile limits (MOD-02, MOD-03): plan 05-05, Task 2 ----
+
+const limitsLine = (key: string, problem: string, label = GLOBAL) => `${PROFILE_PATH}.limits.${key} (${label}): ${problem}`;
+
+test("each limits key is accepted inside a profile and lands on launch.limits with the profile as its label", () => {
+  const cases: Array<[string, unknown]> = [
+    ["contextWindow", 100000],
+    ["maxTokens", 4096],
+    ["reasoning", true],
+    ["input", ["text", "image"]],
+  ];
+  for (const [key, value] of cases) {
+    const launch = launchWith({ global: withProfile({ limits: { [key]: value } }) }, FAST);
+    assert.deepEqual(launch.limits, { [key]: { value, label: "profile fast" } }, key);
+  }
+});
+
+test("a bad limits value gives one line naming the key, the file and the allowed values", () => {
+  const badIntegers: Array<[unknown, string]> = [
+    [0, "0"],
+    [-1, "-1"],
+    [1.5, "1.5"],
+    ["8192", '"8192"'],
+    [null, "null"],
+  ];
+  for (const key of ["contextWindow", "maxTokens"]) {
+    for (const [value, shown] of badIntegers) {
+      assert.deepEqual(refusedLines({ global: withProfile({ limits: { [key]: value } }) }), [
+        limitsLine(key, `${shown} is not an integer of at least 1`),
+      ]);
+    }
+  }
+  for (const [value, shown] of [["yes", '"yes"'], [1, "1"], [null, "null"]] as const) {
+    assert.deepEqual(refusedLines({ global: withProfile({ limits: { reasoning: value } }) }), [limitsLine("reasoning", `${shown} must be true or false`)]);
+  }
+  const badInputs: Array<[unknown, string]> = [
+    [["image"], '["image"]'],
+    [[], "[]"],
+    ["text", '"text"'],
+    [["text", "video"], '["text","video"]'],
+    [[1], "[1]"],
+  ];
+  for (const [value, shown] of badInputs) {
+    assert.deepEqual(refusedLines({ project: withProfile({ limits: { input: value } }) }), [
+      limitsLine("input", `${shown} must be a list of "text" and "image" that includes "text"`, PROJECT),
+    ]);
+  }
+});
+
+test("limits.input collapses a repeated entry in first-seen order and hands out a copy", () => {
+  const input = { global: withProfile({ limits: { input: ["text", "text", "image"] } }) };
+  const first = launchWith(input, FAST);
+  assert.deepEqual(first.limits.input?.value, ["text", "image"]);
+  first.limits.input?.value.push("image");
+  assert.deepEqual(launchWith(input, FAST).limits.input?.value, ["text", "image"]);
+});
+
+test("an unknown key inside limits is a line of its own: no hint, a did-you-mean, and a hostile key changes nothing", () => {
+  assert.deepEqual(refusedLines({ global: withProfile({ limits: { thinkingTokens: 1 } }) }), [limitsLine("thinkingTokens", "unknown key")]);
+  assert.deepEqual(refusedLines({ global: withProfile({ limits: { contextwindow: 1 } }) }), [
+    limitsLine("contextwindow", "unknown key (did you mean contextWindow?)"),
+  ]);
+  assert.deepEqual(refusedLines({ global: withProfile({ limits: { maxToken: 1 } }) }), [
+    limitsLine("maxToken", "unknown key (did you mean maxTokens?)"),
+  ]);
+  const before = Object.getOwnPropertyNames(Object.prototype).sort();
+  const hostile = JSON.parse('{"__proto__": {"polluted": true}}');
+  assert.deepEqual(refusedLines({ global: withProfile({ limits: hostile }) }), [limitsLine("__proto__", "unknown key")]);
+  assert.deepEqual(Object.getOwnPropertyNames(Object.prototype).sort(), before);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
+});
+
+test("limits in the model block, a models entry or at the top level is an unknown key; the first two say where it belongs", () => {
+  assert.deepEqual(refused({ global: ok({ model: { limits: { maxTokens: 4096 } } }) }), [
+    `model.limits (${GLOBAL}): unknown key (limits belongs inside a profile)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { limits: { maxTokens: 4096 } } } }) }), [
+    `models["qwen3_4b"].limits (${GLOBAL}): unknown key (limits belongs inside a profile)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ limits: { maxTokens: 4096 } }) }), [`limits (${GLOBAL}): unknown key`]);
+  assert.deepEqual(refused({ global: ok({ model: { limitz: {} } }) }), [`model.limitz (${GLOBAL}): unknown key`]);
+});
+
+test("limits never reach argv or a request: the flags, extra arguments, request and request notes are the same with and without them", () => {
+  const without = launchWith({ global: FAST_FILE() }, FAST);
+  const profile = { ...FAST_PROFILE, limits: { contextWindow: 100000, maxTokens: 4096, reasoning: true, input: ["text", "image"] } };
+  const withLimits = launchWith({ global: ok({ models: { qwen3_4b: { profiles: { fast: profile } } } }) }, FAST);
+  assert.deepEqual(withLimits.flags, without.flags);
+  assert.deepEqual(toLaunchSpec(withLimits).extraArgs, toLaunchSpec(without).extraArgs);
+  assert.deepEqual(withLimits.request, without.request);
+  assert.deepEqual(withLimits.requestNotes, without.requestNotes);
+  const only = launchWith({ global: withProfile({ limits: { maxTokens: 4096 } }) }, FAST);
+  assert.deepEqual(toLaunchSpec(only).extraArgs, []);
+  assert.deepEqual(only.flags, []);
+  assert.deepEqual(only.request.sampling, {});
+  assert.deepEqual(only.requestNotes, []);
+});
+
+test("the same profile name in both files merges its limits key by key, the project value winning, and a project profile's limits are no violation", () => {
+  const global = withProfile({ limits: { contextWindow: 100000, maxTokens: 8192 } });
+  const project = withProfile({ limits: { maxTokens: 4096 } });
+  assert.deepEqual(launchWith({ global, project }, FAST).limits, {
+    contextWindow: { value: 100000, label: "profile fast" },
+    maxTokens: { value: 4096, label: "profile fast" },
+  });
+  assert.deepEqual(resolved({ global, project }).prepared.projectViolations, []);
+});
+
+test("a launch without a profile, or with a profile that sets no limits, has empty limits", () => {
+  assert.deepEqual(launchWith({ global: FAST_FILE() }, {}).limits, {});
+  assert.deepEqual(launchWith({ global: FAST_FILE() }, FAST).limits, {});
+  assert.deepEqual(launchOf({}).limits, {});
+});
+
+test("every model.limits row is profile-only: per model, with no flag, environment variable, request field or default", () => {
+  const rows = SETTINGS.filter((row) => row.path.startsWith("model.limits."));
+  assert.deepEqual(
+    rows.map((row) => row.path),
+    ["model.limits.contextWindow", "model.limits.maxTokens", "model.limits.reasoning", "model.limits.input"],
+  );
+  for (const row of rows) {
+    assert.equal(row.perModel, true, row.path);
+    for (const field of ["cli", "env", "piFlag", "mlxFlag", "requestField", "initCli", "default"] as const) {
+      assert.equal(Object.hasOwn(row, field), false, `${row.path} has ${field}`);
+    }
+    assert.deepEqual(row.emit(1), [], row.path);
+  }
+  assert.ok(!cliFlagSpecs().some((spec) => spec.path.startsWith("model.limits.")));
+  assert.ok(!initFlagSpecs().some((spec) => spec.path.startsWith("model.limits.")));
+});
+
 const NAME_LINE = (shown: string, label = GLOBAL) => `models["qwen3_4b"].profiles[${shown}] (${label}): the profile name must be 1 to 64 characters`;
 for (const [name, shown] of [
   ["", '""'],
