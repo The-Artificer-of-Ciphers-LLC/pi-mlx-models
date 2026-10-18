@@ -173,7 +173,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     return;
   }
 
-  /** The last result of an action, waiting for the title of the next menu; shown once. */
+  /** The last result of an action, waiting for the title of the next menu; used up by a menu that is answered. */
   let pendingResult: string | undefined;
 
   /** Tell the user what happened: notify with the message as it is, and remember a bounded copy for the next menu title. */
@@ -196,6 +196,18 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     if (answer === undefined) return undefined;
     const index = choices.indexOf(answer);
     return index < 0 ? undefined : index;
+  }
+
+  /**
+   * `pick` with the pending result above the title. An answered menu uses the result up, so it is shown once per answered
+   * menu. A menu that answers nothing (dismissed, or a dialog that threw: `dialogs.select` cannot tell the two apart) may
+   * never have been seen, so the result is put back for the next menu, unless `report` stored a newer one meanwhile (WR-03).
+   */
+  async function pickWithResult(title: string, choices: string[]): Promise<number | undefined> {
+    const carried = pendingResult;
+    const chosen = await pick(titled(title), choices);
+    if (chosen === undefined && pendingResult === undefined) pendingResult = carried;
+    return chosen;
   }
 
   /** The file as data for showing current values; a file that cannot be used shows nothing, and the write reports it. */
@@ -375,7 +387,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     }
 
     const actions: string[] = [PROFILE_ACTION.edit, PROFILE_ACTION.delete, PROFILE_ACTION.back];
-    const action = await pick(titled(`Profile ${shown(profile)}${ofModel(model)}`), actions);
+    const action = await pickWithResult(`Profile ${shown(profile)}${ofModel(model)}`, actions);
     if (action === undefined) return "menu";
     if (actions[action] === PROFILE_ACTION.edit) {
       return editKey("profile", { model, profile }, `Keys of profile ${shown(profile)}${ofModel(model)}`, ofProfile(model, profile));
@@ -461,7 +473,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
 
   for (let round = 0; round < MAX_MENU_ROUNDS; round += 1) {
     const entries = [MENU.view, MENU.general, MENU.modelBlock, MENU.modelEntry, MENU.profiles, MENU.defaultProfile, MENU.deleteEntry, MENU.done];
-    const chosen = await pick(titled(MENU_TITLE), entries);
+    const chosen = await pickWithResult(MENU_TITLE, entries);
     if (chosen === undefined || entries[chosen] === MENU.done) return;
     let flow: Flow = "menu";
     switch (entries[chosen]) {
