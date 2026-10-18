@@ -453,6 +453,44 @@ test("run with a timeout kills a child that does not end and rejects with a fixe
   assert.equal(isAlive(pid), false, "the child was killed");
 });
 
+test("run with a timeout also ends a grandchild that holds the output pipes", { timeout: 20_000, skip: process.platform === "win32" }, async () => {
+  // The child starts a grandchild that inherits stdout and would live 6 s; the caller must not wait for it.
+  const script = [
+    "const { spawn } = require('node:child_process');",
+    "const g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 6000)'], { stdio: 'inherit' });",
+    "process.stdout.write('gpid=' + g.pid + '\\n');",
+    "setInterval(() => {}, 1000);",
+  ].join(" ");
+  let gpid = 0;
+  const started = Date.now();
+  try {
+    await assert.rejects(run(process.execPath, ["-e", script], (line) => {
+      const m = line.match(/^gpid=(\d+)$/);
+      if (m) gpid = Number(m[1]);
+    }, { timeoutMs: 400 }), /timed out/);
+    assert.ok(Date.now() - started < 3000, "rejected at the bound, not when the grandchild ended");
+    assert.ok(gpid > 0, "premise: the child reported the grandchild's pid");
+    for (let i = 0; i < 40 && isAlive(gpid); i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(isAlive(gpid), false, "the grandchild was killed with the child");
+  } finally {
+    if (gpid > 0 && isAlive(gpid)) process.kill(gpid, "SIGKILL");
+  }
+});
+
+test("run with a sub-second timeout says so in milliseconds, never 0 s", { timeout: 20_000 }, async () => {
+  await assert.rejects(
+    run(process.execPath, ["-e", "setInterval(() => {}, 1000)"], undefined, { timeoutMs: 300 }),
+    (error: Error) => /timed out after 300 ms/.test(error.message) && !/after 0 s/.test(error.message),
+  );
+});
+
+test("run with a timeout of whole seconds says so in seconds", { timeout: 20_000 }, async () => {
+  await assert.rejects(
+    run(process.execPath, ["-e", "setInterval(() => {}, 1000)"], undefined, { timeoutMs: 1000 }),
+    /timed out after 1 s/,
+  );
+});
+
 test("run with a timeout that is not reached resolves as before", async () => {
   await run(process.execPath, ["-e", "process.exit(0)"], undefined, { timeoutMs: 20_000 });
 });
