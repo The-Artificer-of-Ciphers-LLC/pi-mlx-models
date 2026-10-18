@@ -74,6 +74,16 @@ const BAD_SHAPE_NOTICE =
 const modelMismatchNotice = (launchedId: string): string =>
   `pi-mlx-models: a request to the MLX server named a different model than the one launched (${clipDiagnostic(redactCredentials(cleanLabel(launchedId)), 80, "start")}), so the profile and sampling settings were not applied to it. Shown once per session.`;
 
+/** The ready message when the started model could not be selected for the user: the user picks it themselves. */
+const READY_HINT = "MLX server is ready for prompts. Use /model and pick pi-mlx-models/...";
+const shownModelId = (model: string): string => clipDiagnostic(redactCredentials(cleanLabel(model)), 80, "start");
+/** The ready message after pi switched to the started model. The id came from user input or a project file, so it is cleaned. */
+const readySelectedNotice = (model: string): string =>
+  `MLX server is ready for prompts. ${PROVIDER_ID}/${shownModelId(model)} is now the selected model.`;
+/** Shown when pi answers that it did not make the switch. */
+const selectRefusedNotice = (model: string): string =>
+  `pi-mlx-models: pi did not select ${PROVIDER_ID}/${shownModelId(model)}; it reports that authentication is not configured for the provider.`;
+
 /** What a pi hook receives next to its event; only the model of the request is used. */
 export interface HookContext {
   model?: { provider?: string; id?: string };
@@ -211,6 +221,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   /** Whether the bad-payload notice has been shown in this extension instance (D-11). */
   let badShapeShown = false;
   let modelMismatchShown = false;
+  /**
+   * Counts model_select events that our own switch did not cause. A start compares it with the value it saw when it began:
+   * a model the user picked meanwhile (set, cycle or restore) wins over the switch.
+   */
+  let userPicks = 0;
+  /** True only while our own `pi.setModel` call is pending, so the model_select event it raises is not counted as a pick. */
+  let switching = false;
 
   /**
    * The settings in effect outside any /mlx-start: the global file plus the environment, or the environment
@@ -437,6 +454,28 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     }
   }
 
+  /**
+   * Selects the started model in pi. Never throws: a switch that cannot be made leaves the start a success and the user
+   * to pick the model with /model. Only the object the registry returns is passed to pi, so no other provider's model can be chosen.
+   */
+  async function selectStartedModel(pi: PiHost, ctx: any, model: string, picksAtStart: number): Promise<"selected" | "refused" | "skipped"> {
+    try {
+      if (userPicks !== picksAtStart) return "skipped"; // the user's choice during the start wins
+      const found = ctx?.modelRegistry?.find?.(PROVIDER_ID, model);
+      if (found === undefined || found === null) return "skipped";
+      switching = true;
+      let result: unknown;
+      try {
+        result = await pi.setModel(found);
+      } finally {
+        switching = false;
+      }
+      return result === true ? "selected" : result === false ? "refused" : "skipped";
+    } catch {
+      return "skipped";
+    }
+  }
+
   async function runStart(
     pi: PiHost,
     ctx: any,
@@ -446,6 +485,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     listAll: boolean,
   ) {
     const isStale = () => startEpoch !== mine;
+    // Read before the first await: a model picked in pi from here on stops the switch at the end.
+    const picksAtStart = userPicks;
     // The server of this start exited. That does not move the start epoch, so the awaits after the launch check it too: a
     // dead server must not be announced as ready, described or registered.
     let serverExited = false;
@@ -617,7 +658,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
       progress.clear();
       ctx.ui.setStatus(PROVIDER_ID, `mlx: running (${model})`);
-      ctx.ui.notify("MLX server is ready for prompts. Use /model and pick pi-mlx-models/...", "info");
+      const outcome = await selectStartedModel(pi, ctx, model, picksAtStart);
+      // A stop, a newer start or a server exit during the switch: no ready message.
+      if (isAbandoned()) return;
+      if (outcome === "refused") ctx.ui.notify(selectRefusedNotice(model), "warning");
+      ctx.ui.notify(outcome === "selected" ? readySelectedNotice(model) : READY_HINT, "info");
     } catch (e) {
       // /mlx-stop or a newer /mlx-start took over; their UI state wins.
       if (isStale()) return;
@@ -804,6 +849,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.
       await Promise.race([server.stop().catch(() => {}), deps.sleep(deps.shutdownWaitMs)]);
       await registerProvider(pi, { includeFallback: false });
+    });
+
+    // Every change of the active model arrives here. The ones our own switch raises are not the user's choice and are not counted.
+    pi.on("model_select", () => {
+      if (!switching) userPicks += 1;
     });
 
     // The payload of every request pi sends goes through here, other providers' included. Only a request for this provider's
