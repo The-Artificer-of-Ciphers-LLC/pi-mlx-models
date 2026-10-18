@@ -1,7 +1,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
-import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
+import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
 import type { CliFlagSpec } from "./startargs.js";
 
@@ -781,10 +781,10 @@ function unknownKeyHint(key: string, block: string | undefined, container: strin
 
 const FILE_LABEL = { global:"global config.json", project: "project .pi/pi-mlx-models.json" } as const;
 
-/** The user and password of a URL, replaced by `***` wherever the text is shown: a refused index is often one with a pasted secret (WR-01). */
-const redactCredentials = (text: string): string => text.replace(/([/\\]{2})[^\s/\\?#"]*@/g, "$1***@");
-
-/** Text that came from a file, the environment or a flag, made safe and bounded before it is shown (D-24). */
+/**
+ * Text that came from a file, the environment or a flag, made safe and bounded before it is shown (D-24). The order
+ * matters: the redaction sees the whole text, so the 60 character clip is last and cannot bring a secret back (WR-01).
+ */
 const show = (text: string): string => clipDiagnostic(redactCredentials(cleanLabel(text)), 60, "start");
 const showValue = (value: unknown): string => {
   try {
