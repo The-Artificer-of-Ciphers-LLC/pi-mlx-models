@@ -1194,9 +1194,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         }
 
         let probe = await deps.probeHealth(address, baseUrl);
-        // A launch that replaced this one during the probe (/mlx-restart, /mlx-last) listens somewhere else, possibly: look again,
-        // once, at the current one. A record that was only cleared (/mlx-stop, an exit) is reported as before.
-        if (snapshot !== null && recordOf(snapshot.epoch) === null && launchRecord !== null) {
+        // A launch that replaced this one during the probe (/mlx-restart, /mlx-last) listens somewhere else, possibly: look again
+        // at the current one, up to three more times so a second replacement during a look is followed too. A record that was
+        // only cleared (/mlx-stop, an exit) is reported as before.
+        for (let looks = 0; looks < 3 && snapshot !== null && recordOf(snapshot.epoch) === null && launchRecord !== null; looks += 1) {
           snapshot = launchRecord;
           ({ address, baseUrl } = snapshot);
           probe = await deps.probeHealth(address, baseUrl);
