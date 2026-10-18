@@ -193,13 +193,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
    * provider, so a bad value must not replace the valid base URL and default model. `/mlx-init` and `/mlx-start`
    * resolve without this option and are the ones that report such a value. Nothing is ever installed from this result.
    */
-  function ambientSettings(): Pick<Prepared, "baseUrl" | "defaultModel"> {
+  function ambientSettings(): Pick<Prepared, "baseUrl" | "defaultModel" | "listAllModels"> {
     const env = deps.settings.env;
     const withFile = prepareSettings({ global: readLayerFile(deps.settings.globalConfigPath), env, ignoreInstall: true });
     if (withFile.ok) return withFile.prepared;
     const envOnly = prepareSettings({ global: { state: "absent" }, env, ignoreInstall: true });
     if (envOnly.ok) return envOnly.prepared;
-    return { baseUrl: deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT), defaultModel: DEFAULT_MODEL_ID };
+    return { baseUrl: deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT), defaultModel: DEFAULT_MODEL_ID, listAllModels: false };
   }
 
   /**
@@ -548,6 +548,9 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
     const ambient = ambientSettings();
     activeBaseUrl = ambient.baseUrl;
+    // No project directory exists yet, so the load-time list follows the global file and the environment only; every start
+    // then uses the value of its own configuration, project file included.
+    listAllModels = ambient.listAllModels;
     await registerProvider(pi, { includeFallback: false });
 
     pi.registerCommand("mlx-init", {
