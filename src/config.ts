@@ -6,6 +6,8 @@ import * as pi from "@earendil-works/pi-coding-agent";
 export const DEFAULT_PORT = 8080;
 export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_MODEL_ID = "mlx-community/Qwen3-4B-Instruct-2507-4bit";
+/** The package index /mlx-init installs from when no setting names another. */
+export const DEFAULT_PIP_INDEX = "https://pypi.org/simple/";
 
 /** The OpenAI-style base URL for a host and port. A bare IPv6 host is bracketed. Callers append "/models" etc. */
 export function deriveBaseUrl(host: string, port: number): string {

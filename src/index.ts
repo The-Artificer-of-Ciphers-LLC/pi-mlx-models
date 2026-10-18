@@ -4,6 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_HOST,
   DEFAULT_MODEL_ID,
+  DEFAULT_PIP_INDEX,
   DEFAULT_PORT,
   GLOBAL_CONFIG_PATH,
   PROJECT_CONFIG_RELPATH,
@@ -16,7 +17,7 @@ import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
 import { createProgress, type Progress } from "./progress.js";
-import { ensureInstalled, type RuntimeEvent } from "./runtime.js";
+import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
 import { createMlxServer, type MlxServer } from "./server.js";
 import {
   PI_FLAGS,
@@ -172,15 +173,29 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   };
 
   /** The one runtime install that may touch the venv at a time. */
-  let installing: { promise: Promise<void>; upgrade: boolean; listeners: Set<(event: RuntimeEvent) => void> } | null = null;
+  let installing: {
+    promise: Promise<void>;
+    upgrade: boolean;
+    /** The policy it runs under; an omitted policy and the default one have the same key. */
+    policyKey: string;
+    listeners: Set<(event: RuntimeEvent) => void>;
+  } | null = null;
+
+  const policyKeyOf = (policy: InstallPolicy | undefined): string =>
+    JSON.stringify([policy?.version ?? "latest", policy?.pipIndex ?? DEFAULT_PIP_INDEX]);
 
   /**
    * Run (or join) the runtime install. Concurrent callers never run two installs in one venv: a caller
    * that a running install already satisfies shares it (and its progress events); an upgrade request
-   * waits for a plain install to finish and then runs its own.
+   * waits for a plain install to finish and then runs its own. An install also satisfies only a caller with
+   * the same policy: a different version or index waits and runs its own, so the line shown to the user is
+   * always the policy that ran (T-03-11).
    */
-  async function install(options: { upgrade: boolean; onEvent: (event: RuntimeEvent) => void }): Promise<void> {
-    while (installing && options.upgrade && !installing.upgrade) await installing.promise.catch(() => {});
+  async function install(options: { upgrade: boolean; onEvent: (event: RuntimeEvent) => void; policy?: InstallPolicy }): Promise<void> {
+    const wanted = policyKeyOf(options.policy);
+    while (installing && ((options.upgrade && !installing.upgrade) || installing.policyKey !== wanted)) {
+      await installing.promise.catch(() => {});
+    }
     if (installing) {
       installing.listeners.add(options.onEvent);
       return installing.promise;
@@ -189,13 +204,23 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     const promise: Promise<void> = deps
       .ensureInstalled({
         ...(options.upgrade ? { upgrade: true } : {}),
+        ...(options.policy ? { policy: options.policy } : {}),
         onEvent: (event) => listeners.forEach((listener) => listener(event)),
       })
       .finally(() => {
         if (installing?.promise === promise) installing = null;
       });
-    installing = { promise, upgrade: options.upgrade, listeners };
+    installing = { promise, upgrade: options.upgrade, policyKey: wanted, listeners };
     return promise;
+  }
+
+  /** Show each configuration warning once per extension instance, however many commands read the same files. */
+  function showConfigWarnings(ctx: any, warnings: readonly string[]) {
+    for (const warning of warnings) {
+      if (shownWarnings.has(warning)) continue;
+      shownWarnings.add(warning);
+      ctx.ui.notify(warning, "warning");
+    }
   }
 
   async function registerProvider(pi: PiHost, options?: { includeFallback?: boolean }) {
@@ -434,6 +459,25 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           ctx.ui.notify("mlx-init failed: MLX server is starting; run /mlx-stop first", "error");
           return;
         }
+        // The same layered configuration as /mlx-start, read the same way, and refused the same way: an invalid file or
+        // a project file that asks for something it may never ask for stops the init before any side effect.
+        const result = prepareSettings({
+          global: readLayerFile(deps.settings.globalConfigPath),
+          project: readLayerFile(join(workingDirectory(ctx), PROJECT_CONFIG_RELPATH)),
+          env: deps.settings.env,
+        });
+        showConfigWarnings(ctx, result.warnings);
+        if (!result.ok) {
+          ctx.ui.notify(`mlx-init failed: ${formatConfigErrors(result.errors)}`, "error");
+          return;
+        }
+        const { prepared } = result;
+        if (prepared.projectViolations.length > 0) {
+          ctx.ui.notify(`mlx-init failed: ${formatProjectRefusal(prepared.projectViolations, deps.settings.globalConfigPath)}`, "error");
+          return;
+        }
+        const policy: InstallPolicy = { version: prepared.install.version, pipIndex: prepared.install.pipIndex };
+
         const mine = (initEpoch += 1);
         const isStale = () => initEpoch !== mine;
         const progress = newProgress(ctx, "MLX init progress", [
@@ -447,6 +491,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           ctx.ui.notify("Installing local MLX runtime...", "info");
           await install({
             upgrade: true,
+            policy,
             onEvent: (e) => {
               if (isStale()) return;
               step = INIT_STEPS[e.phase];
@@ -495,11 +540,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           piFlags,
           args: typed,
         });
-        for (const warning of result.warnings) {
-          if (shownWarnings.has(warning)) continue;
-          shownWarnings.add(warning);
-          ctx.ui.notify(warning, "warning");
-        }
+        showConfigWarnings(ctx, result.warnings);
         // Invalid configuration stops the start before any install, provider refresh or spawn (D-06).
         if (!result.ok) {
           ctx.ui.notify(`mlx-start failed: ${formatConfigErrors(result.errors)}`, "error");

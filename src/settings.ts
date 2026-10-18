@@ -1,6 +1,6 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
+import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
 import type { CliFlagSpec } from "./startargs.js";
@@ -233,6 +233,24 @@ const checkIntegerRange =
   (value: unknown): CheckResult =>
     typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max ? ok(value) : bad;
 
+/**
+ * An exact version as pip knows it, release part first: two to four numbers, then optional pre, post and dev parts.
+ * No epoch, no local part, no operator, no wildcard. Only text that matches this is ever placed after `mlx-lm==`.
+ */
+const PIN_TEXT = /^[0-9]+(\.[0-9]+){1,3}((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$/;
+
+/** The longest pin that is looked at; real versions are far shorter. */
+const MAX_PIN_LENGTH = 32;
+
+/**
+ * The mlx-lm version policy: the word "latest" or an exact version, nothing else (D-06). Not trimmed, not
+ * case-folded and never a pip specifier, so the value can only ever form the argv element `mlx-lm==VALUE` (T-03-08).
+ */
+function checkPin(value: unknown): CheckResult {
+  if (typeof value !== "string" || value.length > MAX_PIN_LENGTH) return bad;
+  return value === "latest" || PIN_TEXT.test(value) ? ok(value) : bad;
+}
+
 const checkDraftTokens = checkIntegerAtLeast(1);
 const checkKvBits = checkIntegerRange(2, 8);
 
@@ -319,6 +337,7 @@ const PHRASES = {
   jsonText: (shown: string) => `${shown} is not valid JSON; give a JSON object`,
   forbiddenKey: (key: string) => (shown: string) => `${shown} contains the key ${showKey(key)}, which is not allowed`,
   argsTooLarge: (shown: string) => `${shown} is larger than 16 KiB`,
+  pin: (shown: string) => `${shown} must be "latest" or an exact version such as 0.32.2`,
   tooDeep: (shown: string) => `${shown} is nested too deeply`,
   notJson: (shown: string) => `${shown} contains a value that is not JSON`,
 };
@@ -552,6 +571,17 @@ export const SETTINGS: readonly SettingDef[] = [
     env: "PI_MLX_MODELS_DEFAULT_MODEL",
     emit: () => [],
   },
+  {
+    // Which mlx-lm /mlx-init installs. A project file may set it: a pin only chooses among the versions of the index
+    // the user configured (D-03). It is not a server flag, so it never reaches argv or the flags line.
+    path: "mlxLm.version",
+    kind: "string",
+    expected: 'the word "latest" or an exact version such as 0.32.2',
+    check: checkPin,
+    problem: PHRASES.pin,
+    parseText: (raw) => checkPin(raw.trim()),
+    emit: () => [],
+  },
 ];
 
 /** A pi flag: its name without dashes, what it does, and the setting it sets (none for `mlx-model`). */
@@ -760,6 +790,17 @@ export interface Prepared {
   projectViolations: ProjectViolation[];
   /** The validated model options of every layer, held until a model is chosen: `buildLaunch` is their second stage. */
   modelSettings: ModelSettings;
+  /** What /mlx-init installs: the version policy and the package index, with the layer each came from (D-04, D-07). */
+  install: InstallSettings;
+}
+
+/** The install policy of one resolved configuration. A source is a layer label, and absent when the value is the default. */
+export interface InstallSettings {
+  /** "latest" or an exact version. */
+  version: string;
+  pipIndex: string;
+  versionSource?: string;
+  pipIndexSource?: string;
 }
 
 /** One file's model options: the `model` block, and each `models` entry by its key or model id. */
@@ -1024,6 +1065,11 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
       flags,
       sources,
       projectViolations: projectViolationsOf(fileValues.project),
+      install: {
+        version: String(value("mlxLm.version") ?? "latest"),
+        pipIndex: DEFAULT_PIP_INDEX,
+        ...(sources.has("mlxLm.version") ? { versionSource: sources.get("mlxLm.version")!.label } : {}),
+      },
       modelSettings: {
         layers: (["global", "project"] as const).map((layer) => ({
           layer,
