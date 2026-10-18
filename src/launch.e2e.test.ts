@@ -939,3 +939,25 @@ test("an unknown profile name is refused before any install, probe or spawn, nam
   assert.equal(h.installCalls, 0);
   assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
 });
+
+// ---- profiles and the trust boundary (plan 04-05: CFG-04, D-03, D-04, T-04-13) ----
+
+test("a project profile that asks for trustRemoteCode is refused with one error: nothing is spawned, installed or asked", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeProject({ models: { qwen3_4b: { profiles: { fast: { trustRemoteCode: true } } } } });
+
+  await h.start("qwen3_4b --profile fast");
+
+  const failures = h.notes.filter((n) => n.type === "error");
+  assert.deepEqual(
+    failures.map((n) => n.message),
+    [
+      'mlx-start failed: invalid configuration\n  models["qwen3_4b"].profiles["fast"].trustRemoteCode (project .pi/pi-mlx-models.json): unknown key (trustRemoteCode is a "server" key, not part of a profile)',
+    ],
+  );
+  assert.equal(h.confirms.length, 0, "no dialog was asked");
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+  assert.equal(h.providerCalls.length, 1, "only the initial provider registration");
+});

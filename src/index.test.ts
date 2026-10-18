@@ -3250,3 +3250,38 @@ test("a launch with only server-capable sampling values has no request: line and
 
   assert.equal(startingNotes(h.notes)[0], `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --temp 0.2 (global file)`);
 });
+
+// ---- profiles and the trust boundary (plan 04-05: CFG-04, D-03, D-04, T-04-13) ----
+
+test("a project profile that asks for trustRemoteCode ends the start with a configuration error, no dialog and no side effect", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { models: { qwen3_4b: { profiles: { fast: { trustRemoteCode: true } } } } });
+  const h = await setup({ ctx: { cwd } });
+
+  await startMlx(h, "qwen3_4b --profile fast");
+
+  assert.deepEqual(errors(h.notes), [
+    'mlx-start failed: invalid configuration\n  models["qwen3_4b"].profiles["fast"].trustRemoteCode (project .pi/pi-mlx-models.json): unknown key (trustRemoteCode is a "server" key, not part of a profile)',
+  ]);
+  assert.equal(h.confirms.length, 0, "no dialog was asked");
+  assertNothingHappened(h);
+});
+
+test("a profile adds no trust dialog and removes none: the dialogs of a start are the same with and without --profile", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, {
+    server: { trustRemoteCode: true },
+    models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } },
+  });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+  const without = h.confirms.splice(0);
+  await startMlx(h, "qwen3_4b --profile fast");
+  const withProfile = h.confirms.splice(0);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.ok(without.length > 0, "premise: a global trustRemoteCode asks");
+  assert.deepEqual(withProfile, without);
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId, QWEN.modelId], "both starts went through");
+});
