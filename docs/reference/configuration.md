@@ -506,6 +506,8 @@ Auto-start starts the last model by itself when pi opens a session. It is off by
 
 **Turning it on.** Set `autoStart` to `true` in the global file, or set `PI_MLX_MODELS_AUTO_START=true`. The environment variable beats the file. `/mlx-config` can set the key and asks for confirmation before it saves `true`. Project files may not set it; see [Settings that ask for permission](#settings-that-ask-for-permission). Turning the option off, in the file or with `PI_MLX_MODELS_AUTO_START=false`, is the way to stop it.
 
+**Where its settings come from.** The global file and the environment only. Auto-start never reads the project file, so a cloned repository cannot choose the draft model, adapter, ports, cache sizes or any other value of a launch that nobody started by hand. `/mlx-start`, `/mlx-last` and `/mlx-restart` still read the project file.
+
 **What it does.** At the start of a pi session, whatever the reason, it starts the model and the profile of the [remembered launch](#the-remembered-launch) in the background. It returns at once, so pi is not held up. It shows the same progress widget and notices as `/mlx-start`, and it goes through the same checks. When the server is ready, the message is the usual hint to pick the model with `/model`:
 
 ```
@@ -523,7 +525,7 @@ It does not change the model that is selected in pi. A started launch is remembe
 | 3 | A start is already under way, or this session already made a launch | Nothing. |
 | 4 | Nothing is remembered | Nothing. `defaultModel` is not used as a fallback. |
 | 5 | The remembered launch file cannot be read | One warning: `auto-start skipped: the remembered launch file REASON; run /mlx-start to choose a model`. |
-| 6 | The configuration is invalid, or a project file asks for something it may not | One notice with the same problem lines as `/mlx-start`, starting `auto-start skipped:`. |
+| 6 | The configuration is invalid | One notice with the same problem lines as `/mlx-start`, starting `auto-start skipped:`. |
 | 7 | Something already answers on the configured port | One info notice: `auto-start skipped: something already answers on port N`. The server is never registered, adopted or stopped. |
 | 8 | The runtime is not installed | One notice: `auto-start skipped: the MLX runtime is not installed; run /mlx-init, then /mlx-start`. Nothing is installed. |
 | 9 | The remembered profile is no longer defined for the model | One notice with the unknown-profile message, which lists the model's profiles, and the line `Run /mlx-start to start by hand.` |

@@ -30,6 +30,7 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 ### Changed
 
+- **Auto-start ignores the project settings file.** It builds its launch from the global file and the environment only, so a cloned repository's `.pi/pi-mlx-models.json` can no longer steer a launch made when pi opens. `/mlx-start`, `/mlx-last` and `/mlx-restart` still read it.
 - **pi now lists only the loaded model by default.** Before, it listed every model the server reported. The list is empty before the first `/mlx-start` and after `/mlx-stop`. Set `provider.listAllModels` to `true` to list every model. If you use a server you started yourself through `PI_MLX_MODELS_BASE_URL` or `baseUrl`, set it to `true` or pi shows no model until a first start.
 - **The context window and output limit are no longer 128000 and 8192 for every model.** pi is told the model's own window, a quarter of it as the default output limit (at most 8192, or 32768 for a reasoning model), and 32768 when the window cannot be read. A model with a short window now gets a smaller limit than before; set `limits.contextWindow` or `limits.maxTokens` in a profile to change either.
 - The DeepSeek-R1 distill preset is now flagged as a reasoning model, with the compat flags above and a 32768 output limit.
