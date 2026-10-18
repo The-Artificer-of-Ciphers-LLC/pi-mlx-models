@@ -10,7 +10,7 @@ import type { ServerAddress } from "./server.js";
 
 /**
  * Default bound, in milliseconds, of one status probe's models request. Shorter than DISCOVERY_TIMEOUT_MS (5000),
- * because a status command should answer quickly. Open decision for the user, recorded in the plan 06-03 summary.
+ * because a status command should answer quickly. Approved by the owner on 2026-10-18 (plan 06-03 summary).
  */
 export const STATUS_PROBE_TIMEOUT_MS = 1500;
 
