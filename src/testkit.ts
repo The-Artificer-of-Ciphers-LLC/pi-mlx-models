@@ -60,6 +60,8 @@ export function stubArgs(model: string, address: StubAddress, extraArgs: readonl
 }
 
 type Handler = (args: string, ctx: any) => Promise<void>;
+/** A handler registered with `pi.on`: session_shutdown takes nothing, before_provider_request takes an event and a context. */
+export type HookHandler = (event?: any, ctx?: any) => unknown;
 export type ProviderCall = { name: string; config: any };
 export type Note = { message: string; type: string };
 export type FlagRegistration = { name: string; options: { description?: string; type: "boolean" | "string"; default?: boolean | string } };
@@ -72,7 +74,7 @@ export type FlagRegistration = { name: string; options: { description?: string; 
  */
 export function makeFakePi() {
   const commands = new Map<string, Handler>();
-  const handlers = new Map<string, () => Promise<void> | void>();
+  const handlers = new Map<string, HookHandler>();
   const providerCalls: ProviderCall[] = [];
   const flags: FlagRegistration[] = [];
   const flagValues = new Map<string, boolean | string>();
@@ -92,7 +94,8 @@ export function makeFakePi() {
       getFlagCalls += 1;
       return flagValues.get(name);
     },
-    on(event, handler) {
+    // Explicit parameter types: PiHost.on is overloaded, so an object-literal method gets no contextual types.
+    on(event: string, handler: HookHandler) {
       handlers.set(event, handler);
     },
   };

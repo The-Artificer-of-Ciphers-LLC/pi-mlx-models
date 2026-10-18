@@ -4,6 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { PROVIDER_ID } from "./config.js";
 import type { ProbeResult } from "./flagprobe.js";
 import { createExtension } from "./index.js";
 import { MODEL_PRESETS } from "./presets.js";
@@ -628,4 +629,84 @@ test("a project file's max tokens beats a global models entry, and the flags lin
   assert.match(startNotes(h.notes)[0].message, /\nflags: --port \d+ \(env PI_MLX_MODELS_PORT\), --max-tokens 512 \(project file\)$/);
   assert.equal(h.confirms.length, 0, "sampling in a project file needs no confirmation (D-04)");
   assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+});
+
+// ---- sampling and template arguments to the request (GEN-01, GEN-02): the registered before_provider_request hook ----
+
+/** A request payload shaped like the one pi builds for this provider's launched model. */
+const piPayload = (model: string) => ({
+  model,
+  messages: [{ role: "user", content: "hi" }],
+  stream: true,
+  temperature: 0.9,
+  max_completion_tokens: 8192,
+  reasoning_effort: "high",
+  chat_template_kwargs: { enable_thinking: true, preserve_thinking: true },
+});
+
+const hookOf = (h: { handlers: Map<string, (event?: any, ctx?: any) => unknown> }) => {
+  const hook = h.handlers.get("before_provider_request");
+  assert.ok(hook, "the extension registers a before_provider_request handler");
+  return hook;
+};
+
+const REQUEST_CONFIG = (port: number) => ({
+  server: { port },
+  model: { sampling: { temperature: 0.2 }, chatTemplateArgs: { enable_thinking: false } },
+});
+
+test("after /mlx-start the hook rewrites a pi payload: configured temperature, one template source, the rest as pi sent it", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(REQUEST_CONFIG(port));
+  await h.start();
+  const payload = piPayload(QWEN.modelId);
+  const before = structuredClone(payload);
+
+  const result = (await hookOf(h)({ payload }, { model: { provider: PROVIDER_ID, id: QWEN.modelId } })) as Record<string, unknown>;
+
+  assert.ok(result !== undefined && result !== payload, "a new object, not pi's");
+  assert.equal(result.temperature, 0.2);
+  assert.deepEqual(result.chat_template_kwargs, { enable_thinking: false });
+  assert.equal("reasoning_effort" in result, false);
+  assert.equal(result.model, payload.model);
+  assert.deepEqual(result.messages, payload.messages);
+  assert.equal(result.stream, true);
+  assert.equal(result.max_completion_tokens, 8192);
+  assert.deepEqual(payload, before, "pi's payload object was not mutated");
+});
+
+test("the hook leaves a request for another provider untouched", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(REQUEST_CONFIG(port));
+  await h.start();
+
+  const result = await hookOf(h)({ payload: piPayload(QWEN.modelId) }, { model: { provider: "openai", id: QWEN.modelId } });
+
+  assert.equal(result, undefined);
+});
+
+test("the hook leaves a request for another model id untouched", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(REQUEST_CONFIG(port));
+  await h.start();
+
+  const result = await hookOf(h)(
+    { payload: piPayload("some/other-model") },
+    { model: { provider: PROVIDER_ID, id: "some/other-model" } },
+  );
+
+  assert.equal(result, undefined);
+});
+
+test("before any /mlx-start in the session the hook leaves every request untouched", { timeout: 30_000 }, async (t) => {
+  const { env, port } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeConfig(REQUEST_CONFIG(port));
+
+  const result = await hookOf(h)({ payload: piPayload(QWEN.modelId) }, { model: { provider: PROVIDER_ID, id: QWEN.modelId } });
+
+  assert.equal(result, undefined);
 });
