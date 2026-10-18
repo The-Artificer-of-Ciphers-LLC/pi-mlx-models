@@ -142,13 +142,19 @@ async function harness(
 const startNotes = (notes: Array<{ message: string; type: string }>) =>
   notes.filter((n) => n.message.startsWith("Starting MLX server with"));
 const lastBaseUrl = (calls: Array<{ config: any }>) => calls.at(-1)?.config.baseUrl;
+/** A fetch that rejects: a real reader given this can reach no host, whatever it tries. */
+const noNetwork = (async () => {
+  throw new Error("network down");
+}) as unknown as typeof fetch;
 
 test("a model whose config.json is in the cache is registered with that file's context window", { timeout: 30_000 }, async (t) => {
   const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
   t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
   // The real layout: refs/main, a blob, and snapshots/<revision>/config.json as a symlink to the blob.
   writeHfCache(cacheRoot, QWEN.modelId, hfFixture("qwen3-4b-instruct-2507-4bit"));
-  const h = await harness(t, {}, {}, ALL_SUPPORTED, { readModelConfig: createModelConfigReader({ cacheRoot }) });
+  const h = await harness(t, {}, {}, ALL_SUPPORTED, {
+    readModelConfig: createModelConfigReader({ cacheRoot, fetch: noNetwork, env: {} }),
+  });
 
   await h.start();
 
@@ -165,7 +171,9 @@ test("a model whose config.json is in the cache is registered with that file's c
 test("a model with no config.json in the cache still starts, registered with the fallback window", { timeout: 30_000 }, async (t) => {
   const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
   t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
-  const h = await harness(t, {}, {}, ALL_SUPPORTED, { readModelConfig: createModelConfigReader({ cacheRoot }) });
+  const h = await harness(t, {}, {}, ALL_SUPPORTED, {
+    readModelConfig: createModelConfigReader({ cacheRoot, fetch: noNetwork, env: {} }),
+  });
 
   await h.start();
 
@@ -181,11 +189,8 @@ test("an unreadable config.json through the real reader gives the fallback windo
   const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
   t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
   // An empty cache and a fetch that rejects: nothing can answer, whatever the reader tries.
-  const refusing = (async () => {
-    throw new Error("network down");
-  }) as unknown as typeof fetch;
   const h = await harness(t, {}, {}, ALL_SUPPORTED, {
-    readModelConfig: createModelConfigReader({ cacheRoot, fetch: refusing, env: {} }),
+    readModelConfig: createModelConfigReader({ cacheRoot, fetch: noNetwork, env: {} }),
   });
 
   await h.start();

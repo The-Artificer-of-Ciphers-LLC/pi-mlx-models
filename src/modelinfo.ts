@@ -16,9 +16,25 @@ export const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
 /** The longest the Hugging Face Hub is given to answer, request and body together (A1, T-05-09). */
 export const HUB_TIMEOUT_MS = 3000;
 
-/** The base URL the Hub is asked at: `HF_ENDPOINT` when it is a plain https URL, else the Hub itself (A3, T-05-11). */
-export function hubBaseUrlOf(_env: Record<string, string | undefined>): string {
-  return "";
+const DEFAULT_HUB_URL = "https://huggingface.co";
+
+/**
+ * The base URL the Hub is asked at: `HF_ENDPOINT` when it is a plain https URL (no credentials, query or fragment) with its
+ * trailing slashes removed, else the Hub itself (A3, T-05-11).
+ */
+export function hubBaseUrlOf(env: Record<string, string | undefined>): string {
+  const raw = env.HF_ENDPOINT?.trim();
+  if (!raw || raw.includes("?") || raw.includes("#")) return DEFAULT_HUB_URL;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return DEFAULT_HUB_URL;
+  }
+  if (url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
+    return DEFAULT_HUB_URL;
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
 }
 
 export type InputKind = "text" | "image";
@@ -132,17 +148,22 @@ function readConfigFile(file: string): FileOutcome {
   return { kind: "text", text: bytes.toString("utf8") };
 }
 
-/** The outcome of one file as a `ModelConfigRead`; `missingReason` says what a missing file means for this lookup. */
-function toRead(outcome: FileOutcome, source: "cache" | "path", missingReason: string): ModelConfigRead {
-  if (outcome.kind === "missing") return { ok: false, reason: missingReason };
-  if (outcome.kind === "refused") return { ok: false, reason: outcome.reason };
+/** The text of a `config.json` from `source` as a `ModelConfigRead`: a JSON object, or the reason it is not one. */
+function parseConfig(text: string, source: "cache" | "hub" | "path"): ModelConfigRead {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(outcome.text);
+    parsed = JSON.parse(text);
   } catch {
     return { ok: false, reason: NOT_JSON };
   }
   return isRecord(parsed) ? { ok: true, config: parsed, source } : { ok: false, reason: NOT_AN_OBJECT };
+}
+
+/** The outcome of one file as a `ModelConfigRead`; `missingReason` says what a missing file means for this lookup. */
+function toRead(outcome: FileOutcome, source: "cache" | "path", missingReason: string): ModelConfigRead {
+  if (outcome.kind === "missing") return { ok: false, reason: missingReason };
+  if (outcome.kind === "refused") return { ok: false, reason: outcome.reason };
+  return parseConfig(outcome.text, source);
 }
 
 /** The revision `refs/main` names: 40 hexadecimal characters in a small regular file, else nothing. */
@@ -199,22 +220,135 @@ function readFromCache(cacheRoot: string, modelId: string): ModelConfigRead {
 /** An id that is an absolute path, or starts with `./` or `../`, names a local model directory. */
 const isLocalPath = (id: string): boolean => isAbsolute(id) || id.startsWith("./") || id.startsWith("../");
 
+/** Every Hub failure is this prefix and a constant phrase, so a reason never holds a token, a URL or a thrown message. */
+const HUB_MISS_PREFIX = "not in the local cache; ";
+const MAX_REDIRECTS = 3;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const OFFLINE_VALUES = new Set(["1", "on", "yes", "true"]);
+
+const hubMiss = (phrase: string): ModelConfigRead => ({ ok: false, reason: `${HUB_MISS_PREFIX}${phrase}` });
+
+/** The failure phrase of a response status that is neither a success nor a redirect. */
+function statusPhrase(status: number): string {
+  if (status === 401 || status === 403) {
+    return `the Hugging Face Hub answered HTTP ${status}: the repository is gated, private or missing (set HF_TOKEN for a gated model)`;
+  }
+  if (status === 404) return `the model was not found on the Hugging Face Hub (HTTP 404)`;
+  return `the Hugging Face Hub answered HTTP ${status}`;
+}
+
+/** The URL a redirect leads to, or nothing when it is refused: it must be http or https, and https may not drop to http. */
+function redirectTarget(from: URL, location: string | null): URL | undefined {
+  if (location === null || location === "") return undefined;
+  let next: URL;
+  try {
+    next = new URL(location, from);
+  } catch {
+    return undefined;
+  }
+  if (next.protocol !== "https:" && next.protocol !== "http:") return undefined;
+  if (from.protocol === "https:" && next.protocol === "http:") return undefined;
+  return next;
+}
+
+/** The response body as text, read in chunks and refused as soon as it passes `MAX_CONFIG_BYTES` (T-05-09). */
+async function readBodyText(res: Response): Promise<{ text: string } | { tooLarge: true }> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_CONFIG_BYTES) {
+    await res.body?.cancel().catch(() => undefined);
+    return { tooLarge: true };
+  }
+  const reader = res.body?.getReader();
+  if (reader === undefined) return { text: "" };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > MAX_CONFIG_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      return { tooLarge: true };
+    }
+    chunks.push(value);
+  }
+  return { text: Buffer.concat(chunks).toString("utf8") };
+}
+
+interface HubRequest {
+  fetch: typeof fetch;
+  base: string;
+  modelId: string;
+  token: string | undefined;
+  timeoutMs: number;
+}
+
+/**
+ * Ask the Hub for the `config.json` of a repository id that already passed `isHfRepoId` (D-02). One time limit covers every
+ * hop and the body. Redirects are followed by hand, at most `MAX_REDIRECTS`, and the token goes only to URLs with the
+ * origin of the base (T-05-08). It never throws and no reason holds anything but a constant phrase, a status or a time.
+ */
+async function readFromHub(request: HubRequest): Promise<ModelConfigRead> {
+  const signal = AbortSignal.timeout(request.timeoutMs);
+  const baseOrigin = new URL(request.base).origin;
+  let url = new URL(`${request.base}/${request.modelId}/resolve/main/config.json`);
+  try {
+    for (let hop = 0; ; hop++) {
+      const headers: Record<string, string> = {};
+      if (request.token !== undefined && url.origin === baseOrigin) headers.Authorization = `Bearer ${request.token}`;
+      const res = await request.fetch(url.href, { method: "GET", headers, redirect: "manual", signal });
+      if (REDIRECT_STATUSES.has(res.status)) {
+        await res.body?.cancel().catch(() => undefined);
+        if (hop >= MAX_REDIRECTS) return hubMiss("the Hugging Face Hub redirected too many times");
+        const next = redirectTarget(url, res.headers.get("location"));
+        if (next === undefined) return hubMiss("the Hugging Face Hub sent a redirect that was refused");
+        url = next;
+        continue;
+      }
+      if (res.status < 200 || res.status > 299) {
+        await res.body?.cancel().catch(() => undefined);
+        return hubMiss(statusPhrase(res.status));
+      }
+      const body = await readBodyText(res);
+      return "text" in body ? parseConfig(body.text, "hub") : { ok: false, reason: TOO_LARGE };
+    }
+  } catch (error) {
+    const timedOut = signal.aborted || (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError"));
+    return hubMiss(
+      timedOut ? `the Hugging Face Hub did not answer within ${request.timeoutMs} ms` : "the Hugging Face Hub could not be reached",
+    );
+  }
+}
+
 /**
  * Create the reader of a model's `config.json`: a local model directory (an absolute path, or `./` and `../` against the
- * reader's working directory), or the Hugging Face cache snapshot of a repository id. Any other id is refused before a
- * path is built (T-05-04). It never throws: every outcome is a `ModelConfigRead`, and a reason never holds a path, a token
- * or file text (T-05-05).
+ * reader's working directory), or the Hugging Face cache snapshot of a repository id and, when the cache has none and the
+ * caller allows it, the Hub. Any other id is refused before a path or a URL is built (T-05-04). It never throws: every
+ * outcome is a `ModelConfigRead`, and a reason never holds a path, a token or file text (T-05-05, T-05-08).
  */
 export function createModelConfigReader(options: ModelConfigReaderOptions = {}): ReadModelConfig {
-  const cacheRoot = options.cacheRoot ?? resolveCacheRoot(options.env ?? process.env);
-  return async (modelId) => {
+  const env = options.env ?? process.env;
+  const cacheRoot = options.cacheRoot ?? resolveCacheRoot(env);
+  return async (modelId, readOptions) => {
     try {
       if (isLocalPath(modelId)) {
         const directory = resolve(options.cwd ?? process.cwd(), modelId);
         return toRead(readConfigFile(join(directory, "config.json")), "path", NO_CONFIG_IN_DIRECTORY);
       }
       if (!isHfRepoId(modelId)) return { ok: false, reason: NOT_AN_ID };
-      return readFromCache(cacheRoot, modelId);
+      const cached = readFromCache(cacheRoot, modelId);
+      if (cached.ok || cached.reason !== NOT_IN_CACHE || !readOptions.hub) return cached;
+      if (OFFLINE_VALUES.has((env.HF_HUB_OFFLINE ?? "").trim().toLowerCase())) {
+        return hubMiss("the Hugging Face Hub was not asked because HF_HUB_OFFLINE is set");
+      }
+      const token = env.HF_TOKEN?.trim();
+      return await readFromHub({
+        fetch: options.fetch ?? globalThis.fetch,
+        base: options.hubBaseUrl !== undefined ? options.hubBaseUrl.replace(/\/+$/, "") : hubBaseUrlOf(env),
+        modelId,
+        token: token === undefined || token === "" ? undefined : token,
+        timeoutMs: options.hubTimeoutMs ?? HUB_TIMEOUT_MS,
+      });
     } catch {
       return { ok: false, reason: UNREADABLE };
     }
