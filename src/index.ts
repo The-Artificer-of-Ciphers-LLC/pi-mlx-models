@@ -22,10 +22,12 @@ import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtim
 import { createMlxServer, type MlxServer } from "./server.js";
 import {
   PI_FLAGS,
+  PROFILE_FLAG_SPEC,
   buildLaunch,
   cliFlagSpecs,
   describeFlags,
   describeInstall,
+  describeProfile,
   describeRequest,
   formatConfigErrors,
   formatProjectRefusal,
@@ -321,7 +323,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     return true;
   }
 
-  async function startModelFromInput(pi: PiHost, ctx: any, args: string | undefined, prepared: Prepared) {
+  async function startModelFromInput(pi: PiHost, ctx: any, args: string | undefined, prepared: Prepared, profile?: string) {
     const selected = resolveModel(args, prepared.defaultModel);
     // Bad input is reported before anything runs: no provider refresh, no install, no spawn.
     if (selected.error !== undefined) {
@@ -334,6 +336,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       prepared,
       { modelId: selected.modelId, ...(selected.preset ? { presetKey: selected.preset.key } : {}) },
       { home: deps.settings.home, cwd: workingDirectory(ctx) },
+      profile === undefined ? {} : { profile },
     );
     if (!built.ok) {
       ctx.ui.notify(`mlx-start failed: ${formatConfigErrors(built.errors)}`, "error");
@@ -424,10 +427,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       }
       progress.done(0, "Runtime ready");
 
+      const profileLine = describeProfile(launch);
       const flagsLine = describeFlags(launch, skipped);
       const requestLine = describeRequest(launch);
       ctx.ui.notify(
-        `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...${flagsLine ? `\n${flagsLine}` : ""}${requestLine ? `\n${requestLine}` : ""}`,
+        `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...${profileLine ? `\n${profileLine}` : ""}${flagsLine ? `\n${flagsLine}` : ""}${requestLine ? `\n${requestLine}` : ""}`,
         "info",
       );
       // KV quantization turns batching off. Told on every launch, through no once-per-text set and with no state kept (D-09).
@@ -585,7 +589,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       description: "Start local MLX server. Usage: /mlx-start [preset-number|preset-key|hf-model-id] [--flag value ...]",
       handler: async (args, ctx) => {
         // Syntax errors in the arguments are reported before anything else: no unknown flag is ever passed on (D-08).
-        const parsed = parseStartArgs(args ?? "", cliFlagSpecs());
+        const parsed = parseStartArgs(args ?? "", [...cliFlagSpecs(), PROFILE_FLAG_SPEC]);
         if (!parsed.ok) {
           ctx.ui.notify(`mlx-start failed: ${parsed.error}`, "error");
           return;
@@ -599,7 +603,12 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         }
         const modelFlag = pi.getFlag("mlx-model");
         const typed: Record<string, string | true> = {};
-        for (const flag of parsed.flags) typed[flag.path] = flag.raw;
+        // The profile is not a setting: it picks a set of values for this launch only (D-02), so it stays out of the layers.
+        let profile: string | undefined;
+        for (const flag of parsed.flags) {
+          if (flag.path === PROFILE_FLAG_SPEC.path) profile = typeof flag.raw === "string" ? flag.raw : undefined;
+          else typed[flag.path] = flag.raw;
+        }
 
         // The global file and the project file (the working directory's own, never a parent's) are read on every
         // start, so an edit needs no reload (D-04, D-05).
@@ -639,7 +648,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           return;
         }
 
-        await startModelFromInput(pi, ctx, modelInput, prepared);
+        await startModelFromInput(pi, ctx, modelInput, prepared, profile);
       },
     });
 

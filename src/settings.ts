@@ -860,6 +860,16 @@ const SAMPLING_ROWS: ReadonlyMap<string, SettingDef> = new Map(
 );
 /** The keys valid inside the sampling object, for the "did you mean" of a mistyped one. */
 const SAMPLING_CANDIDATES: readonly Candidate[] = [...SAMPLING_ROWS.keys()].map((name) => ({ path: name, name }));
+/** The key of a `models` entry that holds its named profiles (D-01). */
+const PROFILES_KEY = "profiles";
+/** The key of the reserved object inside a profile (D-17) and the path prefix of the rows Phase 5 adds for it. */
+const LIMITS_KEY = "limits";
+const LIMITS_PREFIX = `${MODEL_BLOCK}.${LIMITS_KEY}.`;
+/** A profile name: 1 to 64 characters, a letter or digit first, then letters, digits, `.`, `_` and `-` (T-04-15). */
+const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const PROFILE_NAME_RULE = 'the profile name must be 1 to 64 characters: letters, digits, ".", "_" and "-", starting with a letter or digit';
+/** The most profile names an unknown-profile line lists. */
+const MAX_PROFILES_LISTED = 10;
 /** The block names of nested keys, e.g. "server". */
 const BLOCKS = new Set(SETTINGS.filter((row) => row.path.includes(".")).map((row) => row.path.split(".")[0]));
 
@@ -1013,10 +1023,11 @@ function displayLabel(layer: LayerName, row: SettingDef): string {
 }
 
 /**
- * The label shown next to a folded value: its layer today. One helper for the flags line and the request: line, so a
- * profile can later name itself in both from one place.
+ * The label shown next to a folded value: `profile NAME` when a profile supplied it (D-06), else its layer. One helper
+ * for the flags line and the request: line.
  */
-const sourceLabel = (hit: { layer: LayerName }, row: SettingDef): string => displayLabel(hit.layer, row);
+const sourceLabel = (hit: { layer: LayerName; profile?: string }, row: SettingDef): string =>
+  hit.profile === undefined ? displayLabel(hit.layer, row) : `profile ${show(hit.profile)}`;
 
 /** The layer as a problem line labels it. A command-line or pi flag label already names the flag. */
 function problemLabel(layer: "args" | "piFlags", row: SettingDef): string {
@@ -1164,6 +1175,63 @@ function readSampling(target: Map<string, SettingValue>, prefix: string, label: 
 }
 
 /**
+ * Read the reserved `limits` object of one profile (D-17). Phase 5 defines its keys by adding rows whose paths start with
+ * `model.limits.`; they are looked up in the table when this runs, so a row added later is found with no change here.
+ * Until then every key is an error. Values land in `target` under their row's path, so they overlay and merge like every
+ * other profile value; they have no server flag and no request field. Keys are only compared as text, never assigned.
+ */
+function readLimits(target: Map<string, SettingValue>, prefix: string, label: string, value: unknown, problems: string[]): void {
+  const where = `${prefix}.${LIMITS_KEY}`;
+  if (!isPlainObject(value)) {
+    problems.push(`${where} (${label}): ${PHRASES.object(showValue(value))}`);
+    return;
+  }
+  const rows = SETTINGS.filter((row) => row.path.startsWith(LIMITS_PREFIX));
+  const candidates: Candidate[] = rows.map((row) => ({ path: row.path.slice(LIMITS_PREFIX.length), name: row.path.slice(LIMITS_PREFIX.length) }));
+  for (const [key, child] of Object.entries(value)) {
+    const row = rows.find((candidate) => candidate.path === `${LIMITS_PREFIX}${key}`);
+    if (row === undefined) {
+      const meant = nearest(key, candidates);
+      const hint = rows.length === 0 ? " (limits is reserved and accepts no keys yet)" : meant === undefined ? "" : ` (did you mean ${meant}?)`;
+      problems.push(`${where}.${showKey(key)} (${label}): unknown key${hint}`);
+      continue;
+    }
+    const result = row.check(child);
+    if (result.ok) target.set(row.path, result.value);
+    else problems.push(`${where}.${showKey(key)} (${label}): ${(result.problem ?? row.problem)(showValue(child))}${flagSuffix(row)}`);
+  }
+}
+
+/**
+ * Read one profile body (D-03, D-05): the per-model keys of the `model` block, the `sampling` object and the reserved
+ * `limits` object, nothing else. A server-wide key, a nested `profiles` or any other key is a line naming the key, the
+ * profile and the file layer (T-04-13). The values go into a fresh Map keyed by row path.
+ */
+function readProfile(profilePath: string, label: string, body: Record<string, unknown>, problems: string[]): Map<string, SettingValue> {
+  const values = new Map<string, SettingValue>();
+  for (const [key, value] of Object.entries(body)) {
+    if (key === SAMPLING_KEY) {
+      readSampling(values, profilePath, label, value, problems);
+      continue;
+    }
+    if (key === LIMITS_KEY) {
+      readLimits(values, profilePath, label, value, problems);
+      continue;
+    }
+    const where = `${profilePath}.${showKey(key)}`;
+    const row = key.includes(".") ? undefined : ROWS_BY_PATH.get(`${MODEL_BLOCK}.${key}`);
+    if (row === undefined) {
+      problems.push(`${where} (${label}): unknown key${samplingKeyHint(key) ?? unknownKeyHint(key, MODEL_BLOCK, "a profile")}`);
+      continue;
+    }
+    const result = row.check(value);
+    if (result.ok) values.set(row.path, result.value);
+    else problems.push(`${where} (${label}): ${(result.problem ?? row.problem)(showValue(value))}${flagSuffix(row)}`);
+  }
+  return values;
+}
+
+/**
  * The valid values of one config file, plus a line in `problems` for everything wrong with it (D-06, D-07).
  * Keys are compared against the schema with Map and Set lookups only, and parsed keys are never assigned onto
  * another object, so a key such as `__proto__` is just an unknown key (T-02-08).
@@ -1196,6 +1264,20 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
   const considerEntry = (id: string, entry: ModelEntry, key: string, value: unknown) => {
     if (key === SAMPLING_KEY) {
       readSampling(entry.values, entryPath(id), label, value, problems);
+      return;
+    }
+    if (key === PROFILES_KEY) {
+      const where = `${entryPath(id)}.${PROFILES_KEY}`;
+      if (!isPlainObject(value)) {
+        problems.push(`${where} (${label}): ${PHRASES.object(showValue(value))}`);
+        return;
+      }
+      for (const [name, body] of Object.entries(value)) {
+        const profileWhere = `${where}[${JSON.stringify(showKey(name))}]`;
+        if (!PROFILE_NAME.test(name)) problems.push(`${profileWhere} (${label}): ${PROFILE_NAME_RULE}`);
+        else if (!isPlainObject(body)) problems.push(`${profileWhere} (${label}): ${PHRASES.object(showValue(body))}`);
+        else entry.profiles.set(name, readProfile(profileWhere, label, body, problems));
+      }
       return;
     }
     const where = `${entryPath(id)}.${showKey(key)}`;
@@ -1541,6 +1623,20 @@ const layerLabel = (layer: LayerName, row: SettingDef): string =>
   layer === "global" || layer === "project" ? FILE_LABEL[layer] : problemLabel("args", row);
 
 /**
+ * The line that refuses a profile name no matching entry defines: `lead`, which already names the profile and where it
+ * came from, then the model and the profiles that do exist for it, sorted and at most ten (D-02). Every name goes
+ * through `show`, so a hostile name in a file or typed on the command line is cleaned and clipped.
+ */
+function unknownProfileLine(lead: string, modelId: string, entries: ReadonlyArray<{ entry: ModelEntry }>): string {
+  const names = [...new Set(entries.flatMap(({ entry }) => [...entry.profiles.keys()]))].sort();
+  const listed = names.slice(0, MAX_PROFILES_LISTED).map(show).join(", ");
+  const more = names.length - MAX_PROFILES_LISTED;
+  const tail =
+    names.length === 0 ? "no profiles are defined for this model" : `available profiles: ${listed}${more > 0 ? `, ...and ${more} more` : ""}`;
+  return `${lead}: not defined for ${show(modelId)}; ${tail}`;
+}
+
+/**
  * The second stage: pair the prepared settings with the model being started. The model options of each file layer
  * are overlaid by `models[preset key]` and then `models[model id]`, the layers are applied from the lowest
  * precedence up (so a project `model` block beats a global `models` entry), and what was typed on `/mlx-start`
@@ -1552,18 +1648,47 @@ export function buildLaunch(
   where: LaunchContext,
   options: BuildOptions = {},
 ): BuildResult {
-  const folded = new Map<string, { value: SettingValue; layer: LayerName }>();
-  const apply = (values: ReadonlyMap<string, SettingValue> | undefined, layer: LayerName) => {
+  // The entries that match this model, lowest precedence first: the global file before the project file, and inside a
+  // file the entry keyed by the preset key before the more specific one keyed by the model id.
+  const entries: Array<{ layer: "global" | "project"; entry: ModelEntry }> = [];
+  for (const data of prepared.modelSettings.layers) {
+    const byPreset = model.presetKey === undefined ? undefined : data.models.get(model.presetKey);
+    const byId = data.models.get(model.modelId);
+    if (byPreset !== undefined) entries.push({ layer: data.layer, entry: byPreset });
+    if (byId !== undefined) entries.push({ layer: data.layer, entry: byId });
+  }
+  // A profile that is not defined for this model refuses the start before anything else is looked at (D-02).
+  const selected = options.profile;
+  if (selected !== undefined && !entries.some(({ entry }) => entry.profiles.has(selected))) {
+    return { ok: false, errors: [unknownProfileLine(`profile "${show(selected)}" (/mlx-start --profile)`, model.modelId, entries)] };
+  }
+
+  const folded = new Map<string, { value: SettingValue; layer: LayerName; profile?: string }>();
+  const apply = (values: ReadonlyMap<string, SettingValue> | undefined, layer: LayerName, profile?: string) => {
     if (values === undefined) return;
     for (const [path, value] of values) {
       const previous = folded.get(path)?.value;
-      folded.set(path, { value: isSettingObject(previous) && isSettingObject(value) ? mergeObjects(previous, value) : value, layer });
+      const merged = isSettingObject(previous) && isSettingObject(value) ? mergeObjects(previous, value) : value;
+      folded.set(path, profile === undefined ? { value: merged, layer } : { value: merged, layer, profile });
     }
   };
   for (const data of prepared.modelSettings.layers) {
     apply(data.model, data.layer);
     if (model.presetKey !== undefined) apply(data.models.get(model.presetKey)?.values, data.layer);
     apply(data.models.get(model.modelId)?.values, data.layer);
+  }
+  // The selected profile goes over every file layer's model values and under what was typed (assumption A1). The same
+  // name in both files merges key by key, the project file over the global one; each value keeps the file layer it came
+  // from, so the project-directory check on a template path still sees a project profile as the project (T-04-14).
+  if (selected !== undefined) {
+    const profileValues = new Map<string, { value: SettingValue; layer: "global" | "project" }>();
+    for (const { layer, entry } of entries) {
+      for (const [path, value] of entry.profiles.get(selected) ?? []) {
+        const previous = profileValues.get(path)?.value;
+        profileValues.set(path, { value: isSettingObject(previous) && isSettingObject(value) ? mergeObjects(previous, value) : value, layer });
+      }
+    }
+    for (const [path, hit] of profileValues) apply(new Map([[path, hit.value]]), hit.layer, selected);
   }
   apply(prepared.modelSettings.args, "args");
 
@@ -1629,7 +1754,15 @@ export function buildLaunch(
   }
   return {
     ok: true,
-    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: [...prepared.flags, ...modelFlags], request, requestNotes },
+    launch: {
+      model,
+      address: prepared.address,
+      baseUrl: prepared.baseUrl,
+      flags: [...prepared.flags, ...modelFlags],
+      request,
+      requestNotes,
+      ...(selected === undefined ? {} : { profile: { name: selected, source: "/mlx-start" } }),
+    },
   };
 }
 
@@ -1659,7 +1792,7 @@ export function describeFlags(launch: ResolvedLaunch, skipped?: ReadonlySet<stri
 
 /** The `profile: NAME (SOURCE)` line of the start message, or "" when the launch applies no profile (D-06). */
 export function describeProfile(launch: ResolvedLaunch): string {
-  return "";
+  return launch.profile === undefined ? "" : `profile: ${show(launch.profile.name)} (${launch.profile.source})`;
 }
 
 /** The `request: ...` line of the start message, or "" when no value is request-only. */
