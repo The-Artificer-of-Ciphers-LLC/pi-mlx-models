@@ -1009,6 +1009,12 @@ function displayLabel(layer: LayerName, row: SettingDef): string {
   }
 }
 
+/**
+ * The label shown next to a folded value: its layer today. One helper for the flags line and the request: line, so a
+ * profile can later name itself in both from one place.
+ */
+const sourceLabel = (hit: { layer: LayerName }, row: SettingDef): string => displayLabel(hit.layer, row);
+
 /** The layer as a problem line labels it. A command-line or pi flag label already names the flag. */
 function problemLabel(layer: "args" | "piFlags", row: SettingDef): string {
   return layer === "args" ? `${commandOf(row)} ${row.initCli ?? row.cli}` : displayLabel(layer, row);
@@ -1571,7 +1577,7 @@ export function buildLaunch(prepared: Prepared, model: { modelId: string; preset
     } else {
       display = typeof value === "boolean" ? "" : show(String(value));
     }
-    modelFlags.push({ path: row.path, flag: row.mlxFlag, args: row.emit(value), display, label: displayLabel(hit.layer, row), core: false });
+    modelFlags.push({ path: row.path, flag: row.mlxFlag, args: row.emit(value), display, label: sourceLabel(hit, row), core: false });
   }
   if (errors.length > 0) return { ok: false, errors };
 
@@ -1584,13 +1590,21 @@ export function buildLaunch(prepared: Prepared, model: { modelId: string; preset
     if (hit !== undefined) sampling[row.path.slice(samplingPrefix.length)] = Array.isArray(hit.value) ? [...hit.value] : hit.value;
   }
   const templateArgs = folded.get("model.chatTemplateArgs")?.value;
+  // Sampling values with no server flag are listed in the start message with their layer, so everything sent is visible.
+  const requestNotes: RequestNote[] = [];
+  for (const row of SETTINGS) {
+    const hit = row.path.startsWith(samplingPrefix) ? folded.get(row.path) : undefined;
+    if (hit === undefined || row.mlxFlag !== undefined || row.requestField === undefined) continue;
+    const display = Array.isArray(hit.value) || typeof hit.value === "string" ? showValue(hit.value) : show(String(hit.value));
+    requestNotes.push({ field: row.requestField, display, label: sourceLabel(hit, row) });
+  }
   const request: RequestOverrides = { sampling: sampling as SamplingValues };
   if (isSettingObject(templateArgs) && Object.keys(templateArgs).length > 0) {
     request.chatTemplateArgs = JSON.parse(JSON.stringify(templateArgs)) as SettingObject;
   }
   return {
     ok: true,
-    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: [...prepared.flags, ...modelFlags], request, requestNotes: [] },
+    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: [...prepared.flags, ...modelFlags], request, requestNotes },
   };
 }
 
@@ -1619,8 +1633,9 @@ export function describeFlags(launch: ResolvedLaunch, skipped?: ReadonlySet<stri
 }
 
 /** The `request: ...` line of the start message, or "" when no value is request-only. */
-export function describeRequest(_launch: ResolvedLaunch): string {
-  return "";
+export function describeRequest(launch: ResolvedLaunch): string {
+  if (launch.requestNotes.length === 0) return "";
+  return `request: ${launch.requestNotes.map((note) => `${note.field} ${note.display} (${note.label})`).join(", ")}`;
 }
 
 /** What a launch with KV cache quantization has to tell the user (D-09, D-10, D-12). */

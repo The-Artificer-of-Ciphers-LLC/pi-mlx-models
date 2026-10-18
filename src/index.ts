@@ -26,6 +26,7 @@ import {
   cliFlagSpecs,
   describeFlags,
   describeInstall,
+  describeRequest,
   formatConfigErrors,
   formatProjectRefusal,
   initFlagSpecs,
@@ -424,8 +425,9 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       progress.done(0, "Runtime ready");
 
       const flagsLine = describeFlags(launch, skipped);
+      const requestLine = describeRequest(launch);
       ctx.ui.notify(
-        `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...${flagsLine ? `\n${flagsLine}` : ""}`,
+        `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...${flagsLine ? `\n${flagsLine}` : ""}${requestLine ? `\n${requestLine}` : ""}`,
         "info",
       );
       // KV quantization turns batching off. Told on every launch, through no once-per-text set and with no state kept (D-09).
@@ -470,6 +472,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             progress.done(3, "Model loaded");
             break;
           case "exited":
+            active = null; // a dead server's values must never apply to a later server on the same port (A7)
             progress.stop();
             ctx.ui.setStatus(PROVIDER_ID, "mlx: stopped");
             break;
