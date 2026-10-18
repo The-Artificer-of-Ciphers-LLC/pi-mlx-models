@@ -295,6 +295,22 @@ test("configmenu WR-01: a bare model id such as gpt2 is asked about as unlikely,
   s.assertScriptsUsed();
 });
 
+test("configmenu 06 review IN-06: an all-digit model key is asked about with a sentence that a number is read as a preset number, and other keys do not get it", async (t) => {
+  const digits = session(t, { confirm: true, select: [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: ["2", "fast"] });
+  await digits.run();
+  assert.equal(digits.confirms.length, 1, JSON.stringify(digits.prompts));
+  assert.match(digits.confirms[0].message, /preset number/);
+  assert.match(digits.confirms[0].message, /unlikely/);
+  assert.deepEqual(digits.json(), { models: { "2": { profiles: { fast: {} } } } });
+  digits.assertScriptsUsed();
+
+  const word = session(t, { confirm: true, select: [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: ["gpt2", "fast"] });
+  await word.run();
+  assert.equal(word.confirms.length, 1);
+  assert.doesNotMatch(word.confirms[0].message, /preset number/);
+  word.assertScriptsUsed();
+});
+
 test("configmenu typed model key that can match asks nothing: a preset key, org/name and local paths are added directly", async (t) => {
   for (const key of ["qwen3_4b", "org/name", "/abs/path/model", "./rel/model", "../up/model"]) {
     const s = session(t, { confirm: true, select: [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: [key, "fast"] });
