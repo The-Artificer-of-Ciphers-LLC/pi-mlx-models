@@ -618,3 +618,39 @@ test("docs check: README links into this repository are on main and resolve, and
   const inRepository = linkTargetsOf(readme).filter((target) => repoPathOf(target, "README.md", repo) !== null);
   assert.ok(inRepository.length >= 15, `only ${inRepository.length} README targets point into the repository`);
 });
+
+test("docs check: the README links the how-to behind each requirement it states and the precedence and example of the configuration reference (package page, D-04, D-05)", () => {
+  const repo = repoFromPackage();
+  const reached = new Set<string>();
+  for (const target of linkTargetsOf(readRepo("README.md"))) {
+    const found = repoPathOf(target, "README.md", repo);
+    if (found !== null) reached.add(found.fragment === "" ? found.path : `${found.path}#${found.fragment}`);
+  }
+  const expected = [
+    "docs/how-to/configure-the-server.md#use-a-different-python",
+    "docs/how-to/configure-the-server.md#set-a-connection-value-from-the-environment",
+    "docs/how-to/allow-remote-code-or-network-access.md",
+    "docs/reference/configuration.md#sources-from-highest-precedence-to-lowest",
+    "docs/reference/configuration.md#file-layout",
+    "docs/reference/commands.md",
+  ];
+  assert.deepEqual(
+    expected.filter((target) => !reached.has(target)),
+    [],
+  );
+});
+
+test("docs check: the release how-to has a Check the listing section that says there is nothing to submit (package page, D-08)", () => {
+  const howTo = readRepo("docs/how-to/release-a-new-version.md");
+  assert.ok(howTo.split("\n").some((line) => line.trimEnd() === "## Check the listing"), 'no "## Check the listing" heading');
+  assert.ok(howTo.includes(ticked("pi-package")), "the keyword `pi-package` is not named");
+  assert.ok(howTo.includes("https://pi.dev/packages/@taoc/pi-mlx-models"), "the package page URL is not given");
+  assert.ok(/nothing to submit/i.test(howTo), 'the page does not say there is "nothing to submit"');
+});
+
+test("docs check: CHANGELOG.md has exactly one Unreleased heading, spelled as the Release workflow expects (package page)", () => {
+  const headings = readRepo("CHANGELOG.md")
+    .split("\n")
+    .filter((line) => line.trimEnd() === "## Unreleased");
+  assert.equal(headings.length, 1);
+});
