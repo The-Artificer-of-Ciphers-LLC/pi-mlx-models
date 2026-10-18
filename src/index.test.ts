@@ -1035,7 +1035,7 @@ test("mlx-start with an unknown flag is refused, with the valid flags listed, an
   await h.commands.get("mlx-start")!("--bogus 1", h.ctx);
 
   assert.deepEqual(errors(h.notes), [
-    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
+    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --kv-bits, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
   ]);
   assert.equal(h.notes.length, 1);
   assertNothingHappened(h);
@@ -2152,4 +2152,51 @@ test("a /mlx-stop while the probe is pending abandons the start: no server, no l
     before,
     "nothing is written after the stop, not even the skip warning",
   );
+});
+
+// ---- KV quantization: the batching warning on every launch (plan 03-02: SRV-05, D-09, D-10, D-12) ----
+
+const KV_BATCHING_4 = "KV quantization (--kv-bits 4, global file): Disables batching, so requests are served one at a time.";
+
+test("kvBits in the global file reaches argv and each launch shows the batching warning once, at level warning", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { kvBits: 4 } });
+  const h = await setup({ settings });
+
+  await startMlx(h, "qwen3_4b");
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(
+    h.notes.filter((n) => n.message.startsWith("KV quantization")),
+    [
+      { message: KV_BATCHING_4, type: "warning" },
+      { message: KV_BATCHING_4, type: "warning" },
+    ],
+    "shown on every launch, not once per session",
+  );
+  assert.deepEqual(h.server.launches.map((l) => l?.extraArgs), [["--kv-bits=4"], ["--kv-bits=4"]]);
+  assert.deepEqual(errors(h.notes), []);
+});
+
+test("an install without --kv-bits gets only the skip notice and the start goes on", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { kvBits: 4 } });
+  const h = await setup({ settings, probe: async () => OLD_INSTALL });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), ["Skipped --kv-bits: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)"]);
+  assert.equal(h.server.startCalls.length, 1);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, []);
+});
+
+test("a failed probe shows the could-not-check warning and the batching warning, because the flag is passed", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { kvBits: 4 } });
+  const h = await setup({ settings, probe: async () => ({ ok: false, reason: "boom" }) });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), ["Could not check which flags mlx-lm supports (boom); passing every configured flag.", KV_BATCHING_4]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--kv-bits=4"]);
 });

@@ -12,6 +12,7 @@ import {
   describeFlags,
   formatConfigErrors,
   formatProjectRefusal,
+  kvNotices,
   prepareSettings,
   readLayerFile,
   toLaunchSpec,
@@ -2387,4 +2388,49 @@ test("none of the five rows has an environment variable or a pi flag, and the pi
     PI_FLAGS.map((flag) => flag.name),
     ["mlx-model", "mlx-port", "mlx-host", "mlx-log-level"],
   );
+});
+
+// ---- KV quantization (SRV-05) ----
+
+const BATCHING = "Disables batching, so requests are served one at a time.";
+
+for (const bits of [2, 8]) {
+  test(`server.kvBits: ${bits} in the global file is accepted and emitted as --kv-bits=${bits}`, () => {
+    const { prepared } = resolved({ global: ok({ server: { kvBits: bits } }) });
+    assert.deepEqual(prepared.flags.map((flag) => flag.args), [[`--kv-bits=${bits}`]]);
+    assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, [`--kv-bits=${bits}`]);
+  });
+}
+
+const BAD_KV_BITS: ReadonlyArray<[unknown, string]> = [
+  [1, "1"],
+  [9, "9"],
+  [0, "0"],
+  [4.5, "4.5"],
+  ["4", '"4"'],
+  [true, "true"],
+  [null, "null"],
+];
+
+for (const [value, shown] of BAD_KV_BITS) {
+  test(`server.kvBits: ${shown} in the global file is refused naming the range`, () => {
+    assert.deepEqual(refused({ global: ok({ server: { kvBits: value } }) }), [
+      `server.kvBits (${GLOBAL}): ${shown} is not an integer from 2 to 8 (flag --kv-bits)`,
+    ]);
+  });
+}
+
+test("server.kvBits: a value typed on /mlx-start is labelled with the command", () => {
+  const { prepared } = resolved({ args: { "server.kvBits": "4" } });
+  assert.deepEqual(prepared.flags.map((flag) => [flag.args, flag.label]), [[["--kv-bits=4"], "/mlx-start"]]);
+});
+
+test("kvNotices: kvBits from the global file gives mlx-lm's own batching sentence and no info note", () => {
+  const notices = kvNotices(launchOf({ global: ok({ server: { kvBits: 4 } }) }));
+  assert.deepEqual(notices, { warning: `KV quantization (--kv-bits 4, global file): ${BATCHING}` });
+});
+
+test("kvNotices: without kvBits there is neither a warning nor an info note", () => {
+  assert.deepEqual(kvNotices(launchOf({})), {});
+  assert.deepEqual(kvNotices(launchOf({ global: ok({ server: { logLevel: "DEBUG" } }) })), {});
 });

@@ -541,3 +541,24 @@ test("a decode concurrency of 0 in the global file stops the start before any si
   assert.equal(h.installCalls, 0);
   assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
 });
+
+// ---- KV quantization (SRV-05): kvBits reaches the argv and every launch says batching is off ----
+
+test("kvBits in the global file reaches the process and the flags line, with one batching warning", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port, kvBits: 4 } });
+
+  await h.start();
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--kv-bits=4"]);
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  assert.match(starting[0].message, /--kv-bits 4 \(global file\)$/);
+  const warnings = h.notes.filter((n) => n.type === "warning");
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].message.includes("Disables batching, so requests are served one at a time."), warnings[0].message);
+
+  await h.stop();
+  assert.equal(await connectRefused(port), true, "stop must wait on the launch's own port");
+});
