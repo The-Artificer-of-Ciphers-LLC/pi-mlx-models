@@ -28,9 +28,10 @@ import {
   type ModelInfo,
   type ReadModelConfig,
 } from "./modelinfo.js";
+import { probePort } from "./port.js";
 import { createProgress, type Progress } from "./progress.js";
 import { applyRequestOverrides, type ActiveLaunch } from "./request.js";
-import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
+import { ensureInstalled, runtimeInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
 import { createMlxServer, type MlxServer, type ServerAddress } from "./server.js";
 import {
   PI_FLAGS,
@@ -44,6 +45,7 @@ import {
   formatConfigErrors,
   formatProjectRefusal,
   initFlagSpecs,
+  isAutoStartRequested,
   kvNotices,
   pinNotice,
   pinUnreadableNotice,
@@ -62,14 +64,23 @@ import { classifyHealth, createHealthProbe, formatStatus, type ProbeHealth, type
 
 const PROGRESS_WIDGET = "mlx-progress";
 
-/** The commands that start a model, as their names without the slash. A closed set of constants: no user text becomes one (T-06-05). */
-type LaunchCommand = "mlx-start" | "mlx-last" | "mlx-restart";
+/**
+ * The launches, as their names without the slash: the three commands that start a model and auto-start, which starts one
+ * when pi opens. A closed set of constants: no user text becomes one (T-06-05).
+ */
+type LaunchCommand = "mlx-start" | "mlx-last" | "mlx-restart" | "auto-start";
 
-/** Every command whose failures and refusals are worded by `failed`: the launch commands and the read-only ones. Constants only. */
+/** Every name whose failures and refusals are worded by `failed` and `refusal`: the launches and the read-only commands. Constants only. */
 type CommandName = LaunchCommand | "mlx-status" | "mlx-config";
 
-/** The text of a refused or failed launch of `command`. The only place a command name is joined to a failure message. */
+/** The text of a failed launch of `command`. The only place a command name is joined to a failure message. */
 const failed = (command: CommandName, text: string): string => `${command} failed: ${text}`;
+
+/**
+ * The text of a launch of `command` that was refused before any server was launched. Auto-start has nobody to tell "failed"
+ * to, so its refusals read "skipped" and point at /mlx-start; every other command words them exactly as `failed` does.
+ */
+const refusal = (command: CommandName, text: string): string => (command === "auto-start" ? `auto-start skipped: ${text}` : failed(command, text));
 
 /** The text of a launch of `command` the user declined. The only place a command name is joined to a cancel message. */
 const cancelled = (command: CommandName, text: string): string => `${command} cancelled: ${text}`;
@@ -81,6 +92,10 @@ interface LaunchRun {
   profile?: string;
   /** Whether `profile` was typed in this command or kept from an earlier launch; it words the profile source in the start message. */
   profileOrigin?: "typed" | "kept";
+  /** Whether the ready start selects the model in pi (default true). Auto-start passes false: it never changes the model the user chose (A5). */
+  select?: boolean;
+  /** Whether a person is at the keyboard to confirm (default true). Auto-start passes false: it refuses a launch that needs a confirmation (D-27). */
+  interactive?: boolean;
 }
 
 /** The slash form of each launch command, as `buildLaunch` words its profile lines. A fixed map: no user text is ever looked up in it. */
@@ -88,6 +103,8 @@ const SLASH_FORM: Record<LaunchCommand, "/mlx-start" | "/mlx-last" | "/mlx-resta
   "mlx-start": "/mlx-start",
   "mlx-last": "/mlx-last",
   "mlx-restart": "/mlx-restart",
+  // Auto-start has no slash form of its own; the command that starts by hand is the one its notices point to.
+  "auto-start": "/mlx-start",
 };
 
 /**
@@ -156,6 +173,8 @@ export interface PiHost {
   /** The value of a registered flag; read it inside handlers, not while the factory runs. */
   getFlag(name: string): boolean | string | undefined;
   on(event: "session_shutdown", handler: () => Promise<void> | void): void;
+  /** Fires every time a session starts, whatever the reason (startup, reload, new, resume or fork); pi waits for the handler it returns from. */
+  on(event: "session_start", handler: (event: { reason?: string }, ctx: any) => Promise<void> | void): void;
   /** Called with the payload pi is about to send; a returned value replaces it, undefined leaves it. */
   on(event: "before_provider_request", handler: (event: { payload: unknown }, ctx: HookContext) => unknown): void;
   /** Fires on every change of the active model, the ones this extension makes included. */
@@ -180,6 +199,15 @@ export interface ExtensionDeps {
   installedVersion: () => Promise<VersionResult>;
   /** The probe /mlx-status uses: whether a connect to the address is accepted and, if so, whether /v1/models answers. */
   probeHealth: ProbeHealth;
+  /** True when something already answers (accepts a connection or holds the bind) at the address; auto-start asks it before it starts anything. */
+  probePort: (host: string, port: number) => Promise<boolean>;
+  /** True when the MLX runtime (the venv and its mlx-lm) is usable; auto-start asks it and never installs anything. */
+  runtimeInstalled: () => Promise<boolean>;
+  /**
+   * Receives the promise of the background work the session_start hook started, so a test can wait for it. Not a timeout and
+   * not set in production: the hook returns at once either way.
+   */
+  trackBackground?: (work: Promise<void>) => void;
   /** How long session_shutdown waits for the server to stop before letting pi exit. */
   shutdownWaitMs: number;
   sleep: (ms: number) => Promise<void>;
@@ -252,6 +280,9 @@ function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
     probeFlags: overrides.probeFlags ?? probe.probe,
     installedVersion: overrides.installedVersion ?? probe.installedVersion,
     probeHealth: overrides.probeHealth ?? createHealthProbe(),
+    probePort: overrides.probePort ?? probePort,
+    runtimeInstalled: overrides.runtimeInstalled ?? (() => runtimeInstalled()),
+    ...(overrides.trackBackground === undefined ? {} : { trackBackground: overrides.trackBackground }),
     shutdownWaitMs: overrides.shutdownWaitMs ?? 5000,
     sleep: overrides.sleep ?? unrefSleep,
   };
@@ -401,7 +432,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     // and never falls back to the model's defaultProfile (D-02).
     const profileFlag = flags.find((flag) => flag.path === PROFILE_FLAG_SPEC.path);
     if (profileFlag !== undefined && (typeof profileFlag.raw !== "string" || profileFlag.raw.trim() === "")) {
-      ctx.ui.notify(failed(command, "--profile needs a profile name"), "error");
+      ctx.ui.notify(refusal(command, "--profile needs a profile name"), "error");
       return undefined;
     }
     // Everything below is read from this call alone and kept nowhere: overrides apply to this launch only (D-10).
@@ -432,14 +463,14 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     showConfigWarnings(ctx, result.warnings);
     // Invalid configuration stops the start before any install, provider refresh or spawn (D-06).
     if (!result.ok) {
-      ctx.ui.notify(failed(command, formatConfigErrors(result.errors)), "error");
+      ctx.ui.notify(refusal(command, formatConfigErrors(result.errors)), "error");
       return undefined;
     }
     const { prepared } = result;
     // A cloned repository's file may tune the server but never run code or open the network; no dialog can
     // override that, and nothing has been touched yet (D-16).
     if (prepared.projectViolations.length > 0) {
-      ctx.ui.notify(failed(command, formatProjectRefusal(prepared.projectViolations, deps.settings.globalConfigPath)), "error");
+      ctx.ui.notify(refusal(command, formatProjectRefusal(prepared.projectViolations, deps.settings.globalConfigPath)), "error");
       return undefined;
     }
     return { prepared, profile, modelFlag };
@@ -529,13 +560,23 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
    * start without a word. The start epoch is not touched here, so a refused or declined start cannot cancel one that
    * is already running (T-02-18).
    */
-  async function confirmTrustRisks(ctx: any, prepared: Prepared, command: LaunchCommand): Promise<boolean> {
+  async function confirmTrustRisks(ctx: any, prepared: Prepared, run: LaunchRun): Promise<boolean> {
+    const { command } = run;
     const risks = trustRisks(prepared);
     if (risks.length === 0) return true;
     const phrases = joinPhrases(risks.map((risk) => risk.phrase));
+    // Nobody is at the keyboard for an unattended launch, so it never opens a dialog and never confirms for the user: it says
+    // what needs confirming and points to the command that asks (D-27, T-06-33).
+    if (run.interactive === false) {
+      ctx.ui.notify(
+        refusal(command, `${phrases} ${risks.length > 1 ? "need" : "needs"} your confirmation; run /mlx-start to confirm`),
+        "warning",
+      );
+      return false;
+    }
     if (!ctx.hasUI) {
       ctx.ui.notify(
-        failed(command, `${phrases} ${risks.length > 1 ? "need" : "needs"} interactive confirmation; run /${command} in an interactive pi session`),
+        refusal(command, `${phrases} ${risks.length > 1 ? "need" : "needs"} interactive confirmation; run /${command} in an interactive pi session`),
         "error",
       );
       return false;
@@ -561,7 +602,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     const selected = resolveModel(input, prepared.defaultModel);
     // Bad input is reported before anything runs: no provider refresh, no install, no spawn.
     if (selected.error !== undefined) {
-      ctx.ui.notify(failed(run.command, selected.error), "error");
+      ctx.ui.notify(refusal(run.command, selected.error), "error");
       return;
     }
     // The model's own options (the `model` block and its `models` entries) are settled here; `~` and relative paths
@@ -573,10 +614,12 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       run.profile === undefined ? {} : { profile: run.profile, command: SLASH_FORM[run.command], origin: run.profileOrigin ?? "typed" },
     );
     if (!built.ok) {
-      ctx.ui.notify(failed(run.command, formatConfigErrors(built.errors)), "error");
+      // An unattended launch that cannot be built (a profile the model no longer defines) tells the user what to do by hand.
+      const errors = formatConfigErrors(built.errors);
+      ctx.ui.notify(refusal(run.command, run.command === "auto-start" ? `${errors}\nRun /mlx-start to start by hand.` : errors), "error");
       return;
     }
-    if (!(await confirmTrustRisks(ctx, prepared, run.command))) return;
+    if (!(await confirmTrustRisks(ctx, prepared, run))) return;
     const mine = (startEpoch += 1);
     initEpoch += 1;
     startInFlight = mine;
@@ -821,7 +864,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
       progress.clear();
       ctx.ui.setStatus(PROVIDER_ID, `mlx: running (${model})`);
-      const outcome = await selectStartedModel(pi, ctx, model, picksAtStart);
+      // Auto-start never moves the model the user has selected: its ready message is the hint to pick it (A5).
+      const outcome = run.select === false ? "skipped" : await selectStartedModel(pi, ctx, model, picksAtStart);
       // A stop, a newer start or a server exit during the switch: no ready message.
       if (isAbandoned()) return;
       if (outcome === "refused") ctx.ui.notify(selectRefusedNotice(model), "warning");
@@ -836,6 +880,61 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       progress.fail(step, errorMessage(e));
       ctx.ui.notify(failed(run.command, errorMessage(e)), "error");
     }
+  }
+
+  /**
+   * Start the last-used model when pi opens, if the user asked for that (CMD-05, D-24 to D-29). Nobody is at the keyboard, so
+   * every gate that is not met ends it quietly or with one notice that points to /mlx-start; it never opens a dialog, never
+   * installs anything, never touches a server it did not start and never changes the model pi has selected.
+   *
+   * The gates run cheapest and quietest first: the option (off means no read, no probe and no notice), a UI, a start already
+   * under way or made in this session, the remembered launch (absent is silent, unreadable gets one warning), the
+   * configuration (the same refusals as /mlx-start), the port, the runtime, then the launch checks every start makes. A start
+   * or stop that happens while it awaits ends it silently: whoever acted last owns the server.
+   */
+  async function autoStartLastLaunch(pi: PiHost, ctx: any): Promise<void> {
+    // The option comes from the environment and the global file only; a project file can never turn it on (D-24, D-26).
+    if (!isAutoStartRequested(readLayerFile(deps.settings.globalConfigPath), deps.settings.env)) return;
+    // A one-shot print or JSON run has no user and may exit before the model loads (A4).
+    if (ctx.hasUI !== true) return;
+    if (startInFlight !== null || launchRecord !== null) return;
+    const seen = startEpoch;
+    const superseded = () => startEpoch !== seen || startInFlight !== null || launchRecord !== null;
+
+    const record = readLastLaunch(statePath());
+    // Nothing remembered: nothing to start, and defaultModel is never a fallback, so there is no unprompted first download (D-28).
+    if (record.state === "absent") return;
+    if (record.state === "unreadable") {
+      ctx.ui.notify(`auto-start skipped: the remembered launch file ${record.reason}; run /mlx-start to choose a model`, "warning");
+      return;
+    }
+
+    const settings = readLaunchSettings(pi, ctx, "auto-start", [], {});
+    if (settings === undefined) return;
+    const { prepared } = settings;
+
+    // Something that answers is not ours: auto-start registers, adopts and stops nothing (D-26, T-06-35).
+    const occupied = await deps.probePort(prepared.address.host, prepared.address.port);
+    if (superseded()) return;
+    if (occupied) {
+      ctx.ui.notify(`auto-start skipped: something already answers on port ${prepared.address.port}`, "info");
+      return;
+    }
+
+    // The runtime is only looked at, never installed: a missing one is /mlx-init's job (D-27, T-06-36).
+    const installed = await deps.runtimeInstalled();
+    if (superseded()) return;
+    if (!installed) {
+      ctx.ui.notify("auto-start skipped: the MLX runtime is not installed; run /mlx-init, then /mlx-start", "warning");
+      return;
+    }
+
+    await startModelFromInput(pi, ctx, record.value.model, prepared, {
+      command: "auto-start",
+      ...(record.value.profile === null ? {} : { profile: record.value.profile, profileOrigin: "kept" as const }),
+      select: false,
+      interactive: false,
+    });
   }
 
   return async function extension(pi: PiHost) {
@@ -1159,6 +1258,20 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.
       await Promise.race([server.stop().catch(() => {}), deps.sleep(deps.shutdownWaitMs)]);
       await registerProvider(pi, { includeFallback: false });
+    });
+
+    // Fires for every session start, whatever the reason: the shutdown before a new, resumed, forked or reloaded session stopped
+    // the server, so the option means "when pi opens a session". The work runs in the background and this returns at once, so
+    // pi's startup is never held up (D-25, T-06-38); a failure in it becomes one notice instead of an unhandled rejection.
+    pi.on("session_start", (_event, ctx) => {
+      const work = autoStartLastLaunch(pi, ctx).catch((e) => {
+        try {
+          ctx.ui.notify(`auto-start failed: ${clipDiagnostic(redactCredentials(cleanLabel(errorMessage(e))), 300, "start")}`, "error");
+        } catch {
+          // No way left to tell the user; the work is over either way.
+        }
+      });
+      deps.trackBackground?.(work);
     });
 
     // Every change of the active model arrives here. The ones our own switch raises are not the user's choice and are not counted.

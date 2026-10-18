@@ -2924,10 +2924,10 @@ const hookPayload = (extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
-test("the extension registers exactly the handlers session_shutdown, before_provider_request and model_select", async () => {
+test("the extension registers exactly the handlers session_shutdown, session_start, before_provider_request and model_select", async () => {
   const { handlers } = await setup();
 
-  assert.deepEqual([...handlers.keys()].sort(), ["before_provider_request", "model_select", "session_shutdown"]);
+  assert.deepEqual([...handlers.keys()].sort(), ["before_provider_request", "model_select", "session_shutdown", "session_start"]);
 });
 
 test("the hook rewrites a matching request and shows no notice when it does (D-14)", async () => {
