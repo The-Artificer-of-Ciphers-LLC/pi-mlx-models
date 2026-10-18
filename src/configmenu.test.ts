@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { confirmationFor, renderConfig, setAt } from "./configedit.js";
 import { ACTION, CARRY_MAX_CHARS, CARRY_MAX_LINES, type ConfigMenuUi, MENU, MENU_TITLE, NEW_ENTRY, NEW_PROFILE, NO_DEFAULT, PROFILE_ACTION, carriedCopy, runConfigMenu } from "./configmenu.js";
 import { MODEL_PRESETS } from "./presets.js";
@@ -791,23 +790,26 @@ test("configmenu carries the last result: a saved notice is still notified and i
   s.assertScriptsUsed();
 });
 
-test("configmenu carries the last result for every kind of notice: each scenario emits one notice and a later select title holds it", async (t) => {
+test("configmenu IN-03: carries the last result for every kind of notice: each scenario emits one notice and a later select title holds it, and every notice site has a row", async (t) => {
   const qwenProfiles = { models: { qwen3_4b: { defaultProfile: "fast", profiles: { fast: {}, slow: {} } } } };
-  const scenarios: Array<{ name: string; expect: RegExp; options: SessionOptions }> = [
-    { name: "unchanged", expect: /^Nothing changed/, options: { file: { server: { port: 8081 } }, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["8081"] } },
-    { name: "rejected typed value", expect: /^Not saved/, options: { file: {}, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["70000"] } },
-    { name: "sensitive key not confirmed", expect: /^Nothing was saved/, options: { file: {}, confirm: false, select: [MENU.general, "autoStart", "true", MENU.done] } },
-    { name: "rejected model key", expect: /^Not added/, options: { select: [MENU.modelEntry, NEW_ENTRY, MENU.done], input: ["-x"] } },
-    { name: "declined Add anyway", expect: /^Nothing was added/, options: { confirm: false, select: [MENU.profiles, NEW_ENTRY, MENU.done], input: ["careful"] } },
-    { name: "rejected profile name", expect: /^Not added/, options: { file: { models: { qwen3_4b: {} } }, select: [MENU.profiles, "qwen3_4b", NEW_PROFILE, MENU.done], input: ["-x"] } },
-    { name: "declined profile delete", expect: /^Nothing was deleted: profile/, options: { file: qwenProfiles, confirm: false, select: [MENU.profiles, "qwen3_4b", "fast", PROFILE_ACTION.delete, MENU.done] } },
-    { name: "confirmed profile delete", expect: /^Deleted profile/, options: { file: qwenProfiles, confirm: true, select: [MENU.profiles, "qwen3_4b", "fast", PROFILE_ACTION.delete, MENU.done] } },
-    { name: "default profile of a model without profiles", expect: /has no profiles/, options: { file: { models: { plain: {} } }, select: [MENU.defaultProfile, "plain", MENU.done] } },
-    { name: "default profile with no models", expect: /lists no models/, options: { file: {}, select: [MENU.defaultProfile, MENU.done] } },
-    { name: "declined entry delete", expect: /^Nothing was deleted: model entry/, options: { file: { models: { careful: {} } }, confirm: false, select: [MENU.deleteEntry, "careful", MENU.done] } },
-    { name: "entry delete with no models", expect: /no model entries/, options: { file: {}, select: [MENU.deleteEntry, MENU.done] } },
-    { name: "confirmed entry delete", expect: /^Deleted model entry/, options: { file: { models: { careful: {} } }, confirm: true, select: [MENU.deleteEntry, "careful", MENU.done] } },
-    { name: "default profile set", expect: /the default profile/, options: { file: qwenProfiles, select: [MENU.defaultProfile, "qwen3_4b", "slow", MENU.done] } },
+  const scenarios: Array<{ name: string; site: string; expect: RegExp; options: SessionOptions }> = [
+    { name: "unchanged", site: "write", expect: /^Nothing changed/, options: { file: { server: { port: 8081 } }, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["8081"] } },
+    { name: "rejected typed value", site: "editKey", expect: /^Not saved/, options: { file: {}, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["70000"] } },
+    { name: "sensitive key not confirmed", site: "editKey", expect: /^Nothing was saved/, options: { file: {}, confirm: false, select: [MENU.general, "autoStart", "true", MENU.done] } },
+    { name: "rejected model key", site: "chooseModel", expect: /^Not added/, options: { select: [MENU.modelEntry, NEW_ENTRY, MENU.done], input: ["-x"] } },
+    { name: "declined Add anyway", site: "chooseModel", expect: /^Nothing was added/, options: { confirm: false, select: [MENU.profiles, NEW_ENTRY, MENU.done], input: ["careful"] } },
+    { name: "rejected profile name", site: "profilesFlow", expect: /^Not added/, options: { file: { models: { qwen3_4b: {} } }, select: [MENU.profiles, "qwen3_4b", NEW_PROFILE, MENU.done], input: ["-x"] } },
+    { name: "declined profile delete", site: "deleteProfile", expect: /^Nothing was deleted: profile/, options: { file: qwenProfiles, confirm: false, select: [MENU.profiles, "qwen3_4b", "fast", PROFILE_ACTION.delete, MENU.done] } },
+    { name: "confirmed profile delete", site: "deleteProfile", expect: /^Deleted profile/, options: { file: qwenProfiles, confirm: true, select: [MENU.profiles, "qwen3_4b", "fast", PROFILE_ACTION.delete, MENU.done] } },
+    { name: "default profile of a model without profiles", site: "defaultProfileFlow", expect: /has no profiles/, options: { file: { models: { plain: {} } }, select: [MENU.defaultProfile, "plain", MENU.done] } },
+    { name: "default profile with no models", site: "defaultProfileFlow", expect: /lists no models/, options: { file: {}, select: [MENU.defaultProfile, MENU.done] } },
+    { name: "declined entry delete", site: "deleteEntryFlow", expect: /^Nothing was deleted: model entry/, options: { file: { models: { careful: {} } }, confirm: false, select: [MENU.deleteEntry, "careful", MENU.done] } },
+    { name: "entry delete with no models", site: "deleteEntryFlow", expect: /no model entries/, options: { file: {}, select: [MENU.deleteEntry, MENU.done] } },
+    { name: "confirmed entry delete", site: "deleteEntryFlow", expect: /^Deleted model entry/, options: { file: { models: { careful: {} } }, confirm: true, select: [MENU.deleteEntry, "careful", MENU.done] } },
+    { name: "default profile set", site: "defaultProfileFlow", expect: /the default profile/, options: { file: qwenProfiles, select: [MENU.defaultProfile, "qwen3_4b", "slow", MENU.done] } },
+    { name: "saved edit", site: "write", expect: /^Saved server\.port\./, options: { file: {}, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["8081"] } },
+    { name: "refused edit", site: "write", expect: /^Not saved/, options: { file: { server: { port: 8080, bogusKey: 1 } }, select: [MENU.general, "server.logLevel", ACTION.set, MENU.done], input: ["DEBUG"] } },
+    { name: "default profile removed", site: "defaultProfileFlow", expect: /was removed/, options: { file: qwenProfiles, select: [MENU.defaultProfile, "qwen3_4b", NO_DEFAULT, MENU.done] } },
   ];
   const failing: string[] = [];
   for (const scenario of scenarios) {
@@ -826,6 +828,10 @@ test("configmenu carries the last result for every kind of notice: each scenario
     }
   }
   assert.deepEqual(failing, [], "scenarios whose notice is not carried into a later select title");
+  const sites = new Set(scenarios.map((scenario) => scenario.site));
+  for (const site of ["write", "editKey", "chooseModel", "profilesFlow", "deleteProfile", "defaultProfileFlow", "deleteEntryFlow"]) {
+    assert.ok(sites.has(site), `no scenario for the notice site ${site}`);
+  }
 });
 
 test("configmenu carries a result into the profile action menu: a created profile and an existing one show their notice above the heading, and the top menu after it is plain", async (t) => {
@@ -1120,16 +1126,4 @@ test("configmenu IN-01: ctx.ui.notify receives the notice exactly as built, and 
   assert.ok(tops[1].title.includes(declined.notes[0].message), tops[1].title);
   assert.equal(tops[1].title.includes("secret"), false, tops[1].title);
   declined.assertScriptsUsed();
-});
-
-test("configmenu every notice goes through report: a new direct dialogs.notify call must be added to the known sites on purpose", () => {
-  const source = readFileSync(fileURLToPath(new URL("../src/configmenu.ts", import.meta.url)), "utf8");
-  const code = source
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/^\s*\/\/.*$/gm, "")
-    .replace(/\s\/\/\s.*$/gm, "");
-  // Known direct calls: the two of the no-UI branch, the View case (its text is the whole config and is not carried) and the
-  // single call inside report. Every other notice must go through report so that it is carried into the next menu title.
-  assert.equal(code.match(/\bdialogs\.notify\(/g)?.length, 4, "a new notice must go through report, or be added to the known sites on purpose with the reason it is not carried");
-  assert.equal(code.match(/\boptions\.ui\.notify\(/g)?.length, 1, "only the body of dialogs.notify calls the UI");
 });
