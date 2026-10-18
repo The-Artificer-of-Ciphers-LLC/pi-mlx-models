@@ -4535,3 +4535,167 @@ test("mlx-last with a trust risk and no UI is refused with the /mlx-last name in
   ]);
   assertNothingHappened(h);
 });
+
+// ---- the write rules of the record: at ready only, by every route, and a failed write never fails the start (plan 06-06: D-02 to D-04) ----
+
+const recordText = (file: string) => readFileSync(file, "utf8");
+const recordKeys = (file: string) => Object.keys(JSON.parse(recordText(file)) as Record<string, unknown>);
+const rememberWarnings = (notes: Note[]) => warnings(notes).filter((message) => message.includes("could not remember this launch"));
+
+test("remember at ready: the record holds the model id and null for a launch with no profile, and nothing typed", async () => {
+  const { h, recordFile } = await lastSetup();
+
+  await startMlx(h, "qwen3_4b --port 9411 --log-level DEBUG");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(recordText(recordFile), `{"version":1,"model":"${QWEN_ID}","profile":null}\n`);
+  assert.deepEqual(recordKeys(recordFile), ["version", "model", "profile"], "typed flags and ports are never saved");
+});
+
+test("remember at ready: a profile chosen by --profile is recorded by name", async () => {
+  const { h, recordFile } = await lastSetup({ global: FAST_AND_OTHER });
+
+  await startMlx(h, "qwen3_4b --profile fast --trust-remote-code --port 9412");
+
+  assert.equal(recordText(recordFile), `{"version":1,"model":"${QWEN_ID}","profile":"fast"}\n`);
+});
+
+test("remember at ready: the profile a defaultProfile chose is the one that applied, so it is recorded by name", async () => {
+  const { h, recordFile } = await lastSetup({
+    global: { models: { qwen3_4b: { defaultProfile: "other", profiles: FAST_AND_OTHER.models.qwen3_4b.profiles } } },
+  });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--temp=0.9"], "premise: the default profile applied");
+  assert.equal(recordText(recordFile), `{"version":1,"model":"${QWEN_ID}","profile":"other"}\n`);
+});
+
+test("remember only at ready: a start whose server start rejects writes nothing and leaves a good record byte for byte", async () => {
+  const record: Remembered = { model: OTHER_PRESET.modelId, profile: null };
+  const { h, recordFile } = await lastSetup({
+    record,
+    setup: {
+      server: {
+        start: async () => {
+          throw new Error("boom");
+        },
+      },
+    },
+  });
+  const before = recordText(recordFile);
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), ["mlx-start failed: boom"]);
+  assert.equal(recordText(recordFile), before);
+});
+
+test("remember only at ready: a failed first start creates no record at all", async () => {
+  const { h, recordFile } = await lastSetup({
+    setup: {
+      server: {
+        start: async () => {
+          throw new Error("boom");
+        },
+      },
+    },
+  });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(existsSync(recordFile), false);
+});
+
+test("remember only at ready: a start stopped with /mlx-stop before the server is ready writes nothing", async () => {
+  const gate = deferred();
+  const { h, recordFile } = await lastSetup({
+    record: { model: OTHER_PRESET.modelId, profile: null },
+    setup: {
+      server: {
+        start: async () => {
+          await gate.promise;
+        },
+      },
+    },
+  });
+  const before = recordText(recordFile);
+
+  const starting = startMlx(h, "qwen3_4b");
+  await flush();
+  assert.equal(h.server.startCalls.length, 1, "premise: server.start is in flight");
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  gate.resolve();
+  await starting;
+
+  assert.equal(recordText(recordFile), before);
+});
+
+test("remember only at ready: a start superseded by a newer /mlx-start does not write the stale model", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const { h, recordFile } = await lastSetup({
+    setup: {
+      server: {
+        start: async () => {
+          calls += 1;
+          if (calls === 1) await gate.promise;
+        },
+      },
+    },
+  });
+
+  const first = startMlx(h, "qwen3_4b");
+  await flush();
+  assert.equal(calls, 1, "premise: the first server.start is in flight");
+  await startMlx(h, OTHER_PRESET.key);
+  assert.equal(recordText(recordFile), `{"version":1,"model":"${OTHER_PRESET.modelId}","profile":null}\n`, "premise: the newer start wrote its own");
+  gate.resolve();
+  await first;
+
+  assert.equal(recordText(recordFile), `{"version":1,"model":"${OTHER_PRESET.modelId}","profile":null}\n`);
+});
+
+test("remember only at ready: a server that exited during the start is not remembered", async () => {
+  const { h, recordFile } = await lastSetup({
+    setup: {
+      server: {
+        start: async (_model, onEvent) => {
+          onEvent?.({ type: "exited" });
+        },
+      },
+    },
+  });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(existsSync(recordFile), false);
+});
+
+test("remember on every route: the record /mlx-start wrote is replaced by the one /mlx-last writes for another profile", async () => {
+  const { h, recordFile } = await lastSetup({ global: FAST_AND_OTHER });
+
+  await startMlx(h, "qwen3_4b --profile fast");
+  assert.equal(recordText(recordFile), `{"version":1,"model":"${QWEN_ID}","profile":"fast"}\n`);
+  await startLast(h, "--profile other");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(recordText(recordFile), `{"version":1,"model":"${QWEN_ID}","profile":"other"}\n`);
+  await startLast(h);
+  assert.equal(h.server.launches[2]?.extraArgs.join(" "), "--temp=0.9", "the next /mlx-last replays the profile it recorded");
+});
+
+test("remember survives a write failure: the start still reports ready, with one warning that is not repeated", async () => {
+  const { h, recordFile } = await lastSetup();
+  mkdirSync(recordFile);
+
+  await startMlx(h, "qwen3_4b");
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(h.server.startCalls.length, 2);
+  assert.equal(h.notes.filter((n) => n.message === READY_NOTE).length, 2, "both starts reached ready");
+  assert.equal(rememberWarnings(h.notes).length, 1, rememberWarnings(h.notes).join("|"));
+  assert.ok(rememberWarnings(h.notes)[0].endsWith("/mlx-last keeps using the previous one."), rememberWarnings(h.notes)[0]);
+});
