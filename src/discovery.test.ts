@@ -143,6 +143,14 @@ test("probeModels: a 500 and a 404 do not answer", { timeout: 20_000 }, async (t
   }
 });
 
+test("probeModels: a 2xx other than 200 does not answer, even with a well-formed body (204, 206)", { timeout: 20_000 }, async (t) => {
+  for (const status of [201, 204, 206]) {
+    const { baseUrl } = await listen(t, json(status, JSON.stringify({ data: [{ id: "a" }] })));
+    assert.deepEqual(await probeModels({ baseUrl }), { answers: false }, String(status));
+    assert.deepEqual(await discoverModelIds({ baseUrl }), [], String(status));
+  }
+});
+
 test("probeModels: a body that is not JSON and a data field that is not an array do not answer", { timeout: 20_000 }, async (t) => {
   const bad = await listen(t, json(200, "not json at all"));
   assert.deepEqual(await probeModels({ baseUrl: bad.baseUrl }), { answers: false });
