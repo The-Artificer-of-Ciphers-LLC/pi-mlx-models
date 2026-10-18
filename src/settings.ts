@@ -884,6 +884,8 @@ export interface ProjectViolation {
   /** The offending value, cleaned and clipped; empty for a boolean. */
   shown: string;
   reason: string;
+  /** Chooses where mlx-lm is installed from rather than what runs or listens; the refusal then words its header for it. */
+  installOnly?: true;
 }
 
 export type PrepareResult =
@@ -997,6 +999,11 @@ function projectViolationsOf(project: ReadonlyMap<string, SettingValue>): Projec
   // Held as the comma list the server flag takes; an empty list never gets this far.
   if (typeof origins === "string") {
     violations.push({ path: "server.allowedOrigins", shown: showValue(origins), reason: "lets web pages call the local server" });
+  }
+  // Whoever chooses the package index chooses which code /mlx-init installs (D-01). mlxLm.version is not listed (D-03).
+  const pipIndex = project.get("mlxLm.pipIndex");
+  if (typeof pipIndex === "string") {
+    violations.push({ path: "mlxLm.pipIndex", shown: show(pipIndex), reason: "chooses where mlx-lm is installed from", installOnly: true });
   }
   return violations;
 }
@@ -1452,11 +1459,18 @@ export function trustRisks(prepared: Prepared): TrustRisk[] {
 
 /** The text that refuses a project file asking for a risky setting, without the "mlx-start failed: " prefix. */
 export function formatProjectRefusal(violations: readonly ProjectViolation[], globalConfigPath: string): string {
+  const withInstall = violations.some((violation) => violation.installOnly === true);
+  const header = withInstall
+    ? ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:"
+    : ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:";
+  const footer = withInstall
+    ? `Move them to ${cleanLabel(globalConfigPath)}. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking.`
+    : `Move them to ${cleanLabel(globalConfigPath)}; starting then asks for confirmation.`;
   return [
-    ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+    header,
     ...violations.map(
       (violation) => `  ${show(violation.path)}${violation.shown === "" ? "" : ` (${show(violation.shown)})`}: ${show(violation.reason)}`,
     ),
-    `Move them to ${cleanLabel(globalConfigPath)}; starting then asks for confirmation.`,
+    footer,
   ].join("\n");
 }
