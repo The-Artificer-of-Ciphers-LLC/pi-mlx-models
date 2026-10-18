@@ -41,6 +41,9 @@ export const MENU = {
   done: "Done",
 } as const;
 
+/** The title of the top-level menu. */
+export const MENU_TITLE = "MLX config";
+
 /** What can be done with one key. */
 export const ACTION = {
   set: "Set a value",
@@ -423,7 +426,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
 
   for (let round = 0; round < MAX_MENU_ROUNDS; round += 1) {
     const entries = [MENU.view, MENU.general, MENU.modelBlock, MENU.modelEntry, MENU.profiles, MENU.defaultProfile, MENU.deleteEntry, MENU.done];
-    const chosen = await pick("MLX config", entries);
+    const chosen = await pick(MENU_TITLE, entries);
     if (chosen === undefined || entries[chosen] === MENU.done) return;
     let flow: Flow = "menu";
     switch (entries[chosen]) {

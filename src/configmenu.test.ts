@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { confirmationFor, renderConfig, setAt } from "./configedit.js";
-import { ACTION, type ConfigMenuUi, MENU, NEW_ENTRY, NEW_PROFILE, NO_DEFAULT, PROFILE_ACTION, runConfigMenu } from "./configmenu.js";
+import { ACTION, type ConfigMenuUi, MENU, MENU_TITLE, NEW_ENTRY, NEW_PROFILE, NO_DEFAULT, PROFILE_ACTION, runConfigMenu } from "./configmenu.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { PROFILE_NAME_SHORT_RULE, SETTINGS, prepareSettings, readLayerFile } from "./settings.js";
 import { makeCtx, scriptInput, scriptSelect } from "./testkit.js";
@@ -745,5 +745,28 @@ test("configmenu an invalid combined result: a file that already holds an unknow
   assert.ok(error, JSON.stringify(s.notes));
   assert.match(error.message, /bogusKey/);
   assert.match(error.message, /may already have been in the file/);
+  s.assertScriptsUsed();
+});
+
+/** The select prompts that are the top menu: found by their options (they include Done), never by their title. */
+const topMenus = (prompts: Array<{ kind: string; title: string; options?: string[] }>) =>
+  prompts.filter((prompt) => prompt.kind === "select" && prompt.options?.includes(MENU.done) === true);
+
+test("configmenu carries the last result: a saved notice is still notified and is also the top of the next top menu title, with no extra dialog", async (t) => {
+  const s = session(t, { file: {}, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["8081"] });
+  await s.run();
+  const saved = s.notes.filter((note) => /^Saved server\.port\./.test(note.message));
+  assert.equal(saved.length, 1, JSON.stringify(s.notes));
+  const menus = topMenus(s.prompts);
+  assert.equal(menus.length, 2);
+  assert.equal(menus[0].title, MENU_TITLE);
+  assert.ok(menus[1].title.includes(saved[0].message), menus[1].title);
+  assert.ok(menus[1].title.endsWith(MENU_TITLE), menus[1].title);
+  assert.ok(menus[1].title.indexOf(saved[0].message) < menus[1].title.lastIndexOf(MENU_TITLE));
+  assert.ok(menus[1].title.includes(`${saved[0].message}\n\n${MENU_TITLE}`), "a blank line separates the notice from the menu title");
+  assert.deepEqual(
+    s.prompts.map((prompt) => prompt.kind),
+    ["select", "select", "select", "input", "select"],
+  );
   s.assertScriptsUsed();
 });
