@@ -50,6 +50,13 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 - **`config.json` can now be created by the extension,** only by `/mlx-config` on a first edit. Before, the extension never created it.
 - **`last-launch.json` appears in the data directory** next to `config.json` after a successful start, and with it the directory itself. It holds the model id and the profile name; deleting it forgets the launch. See [The remembered launch](docs/reference/configuration.md#the-remembered-launch).
 
+### Fixed
+
+- **`/mlx-config` and a config file that cannot be edited.** A config file nested too deeply to copy is refused as unreadable and left as it was, instead of ending the command with an error. A config file that is a symbolic link to a file that does not exist yet is written where the link points, and the link stays a link. A loop of links is refused. The notice of a new profile says it is already saved and stays in the file if you choose Back, and the "Add anyway?" dialog explains that an all-digit key is read as a preset number.
+- **Model ids with an `@`.** A model id or path such as `org/model@rev` or `/Users/a@b/models/x` is shown as it is in the ready message, the model mismatch notice and `/mlx-status`. Credentials in an id written as a URL are still hidden.
+- **`/mlx-status` during a restart.** When `/mlx-restart` or `/mlx-last` replaces the launch while the status is probing, the status describes the new launch instead of calling the old address a server this session did not start.
+- **Auto-start precheck.** The check that mlx-lm can be imported is stopped after 60 seconds, so a wedged import no longer leaves auto-start pending for good.
+
 ## 0.2.3 - 2026-10-17
 
 ### Changed
