@@ -88,7 +88,8 @@ export type JsonValue = string | number | boolean | null | JsonValue[] | { [key:
 /** An object-valued setting; its objects have no prototype, so no key can reach `Object.prototype`. */
 export type SettingObject = { [key: string]: JsonValue };
 
-export type SettingValue = string | number | boolean | SettingObject;
+/** A checked value of a row; only the sampling `stop` row holds a list, and a list replaces a lower layer's whole (D-12). */
+export type SettingValue = string | number | boolean | string[] | SettingObject;
 
 /** A value that failed its check; `problem` words the line when this row's usual phrase does not fit the failure. */
 type CheckResult = { ok: true; value: SettingValue } | { ok: false; problem?: (shown: string) => string };
@@ -244,6 +245,36 @@ const checkNumberAtLeast =
   (min: number) =>
   (value: unknown): CheckResult =>
     typeof value === "number" && Number.isFinite(value) && value >= min ? ok(value) : bad;
+
+/** A JSON number that is finite and above 0 and, when `max` is given, at most `max` (a sampling bound, D-09). */
+const checkNumberAboveZero =
+  (max = Number.POSITIVE_INFINITY) =>
+  (value: unknown): CheckResult =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 && value <= max ? ok(value) : bad;
+
+/** A JSON number from `min` to `max` inclusive; it must be finite (D-09). */
+const checkNumberRange =
+  (min: number, max: number) =>
+  (value: unknown): CheckResult =>
+    typeof value === "number" && Number.isFinite(value) && value >= min && value <= max ? ok(value) : bad;
+
+/** A sampling seed: a safe integer of either sign, since D-09 says only "an integer". */
+const checkSeed = checkIntegerAtLeast(Number.MIN_SAFE_INTEGER);
+
+/** The most stop sequences, and the most characters in one, that a request may carry (T-04-03). */
+const MAX_STOP_STRINGS = 4;
+const MAX_STOP_LENGTH = 256;
+const isStopString = (entry: unknown): entry is string => typeof entry === "string" && entry.length >= 1 && entry.length <= MAX_STOP_LENGTH;
+
+/**
+ * A stop sequence or a list of them: kept exactly as written, so a newline or other control character inside one is
+ * allowed (a newline is a normal stop sequence). A list is copied; it never reaches argv (T-04-01).
+ */
+function checkStop(value: unknown): CheckResult {
+  if (isStopString(value)) return ok(value);
+  if (Array.isArray(value) && value.length >= 1 && value.length <= MAX_STOP_STRINGS && value.every(isStopString)) return ok([...value]);
+  return bad;
+}
 
 /** Plain decimal or exponent syntax: no hex, no `Infinity`, no empty text, which `Number()` would read as 0. */
 const NUMBER_TEXT = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
@@ -401,6 +432,12 @@ const PHRASES = {
   integerRange: (min: number, max: number) => (shown: string) => `${shown} is not an integer from ${min} to ${max}`,
   integerAtLeast: (min: number) => (shown: string) => `${shown} is not an integer of at least ${min}`,
   numberAtLeast: (min: number) => (shown: string) => `${shown} is not a number of at least ${min}`,
+  numberAboveZero: (shown: string) => `${shown} is not a number above 0`,
+  numberAboveZeroAtMostOne: (shown: string) => `${shown} is not a number above 0 and at most 1`,
+  numberZeroToOne: (shown: string) => `${shown} is not a number from 0 to 1`,
+  integer: (shown: string) => `${shown} is not an integer`,
+  stop: (shown: string) =>
+    `${shown} must be a non-empty string or a list of 1 to ${MAX_STOP_STRINGS} non-empty strings of at most ${MAX_STOP_LENGTH} characters`,
   oneOf: (members: readonly string[]) => (shown: string) => `${shown} must be one of ${members.join(", ")}`,
   boolean: (shown: string) => `${shown} must be true or false`,
   string: (shown: string) => `${shown} must be a non-empty string`,
@@ -642,6 +679,89 @@ export const SETTINGS: readonly SettingDef[] = [
     emit: valued("--temp"),
   },
   {
+    path: "model.sampling.topP",
+    kind: "number",
+    perModel: true,
+    expected: "a number above 0 and at most 1",
+    check: checkNumberAboveZero(1),
+    problem: PHRASES.numberAboveZeroAtMostOne,
+    parseText: parseNumberText(checkNumberAboveZero(1)),
+    requestField: "top_p",
+    mlxFlag: "--top-p",
+    emit: valued("--top-p"),
+  },
+  {
+    path: "model.sampling.topK",
+    kind: "integer",
+    perModel: true,
+    expected: "an integer of at least 0",
+    check: checkIntegerAtLeast(0),
+    problem: PHRASES.integerAtLeast(0),
+    parseText: parseDigits(checkIntegerAtLeast(0)),
+    requestField: "top_k",
+    mlxFlag: "--top-k",
+    emit: valued("--top-k"),
+  },
+  {
+    path: "model.sampling.minP",
+    kind: "number",
+    perModel: true,
+    expected: "a number from 0 to 1",
+    check: checkNumberRange(0, 1),
+    problem: PHRASES.numberZeroToOne,
+    parseText: parseNumberText(checkNumberRange(0, 1)),
+    requestField: "min_p",
+    mlxFlag: "--min-p",
+    emit: valued("--min-p"),
+  },
+  {
+    // The three rows below are sent with each request only: mlx_lm.server has no flag for them (D-07), so they have no
+    // mlxFlag and never become an argv element or a flags-line entry. Plan 04-02 reads them for the request path.
+    path: "model.sampling.repetitionPenalty",
+    kind: "number",
+    perModel: true,
+    expected: "a number above 0",
+    check: checkNumberAboveZero(),
+    problem: PHRASES.numberAboveZero,
+    parseText: parseNumberText(checkNumberAboveZero()),
+    requestField: "repetition_penalty",
+    emit: () => [],
+  },
+  {
+    path: "model.sampling.maxTokens",
+    kind: "integer",
+    perModel: true,
+    expected: "an integer of at least 1",
+    check: checkIntegerAtLeast(1),
+    problem: PHRASES.integerAtLeast(1),
+    parseText: parseDigits(checkIntegerAtLeast(1)),
+    requestField: "max_completion_tokens",
+    mlxFlag: "--max-tokens",
+    emit: valued("--max-tokens"),
+  },
+  {
+    path: "model.sampling.stop",
+    kind: "list",
+    perModel: true,
+    expected: `a non-empty string or a list of 1 to ${MAX_STOP_STRINGS} non-empty strings of at most ${MAX_STOP_LENGTH} characters`,
+    check: checkStop,
+    problem: PHRASES.stop,
+    parseText: checkStop,
+    requestField: "stop",
+    emit: () => [],
+  },
+  {
+    path: "model.sampling.seed",
+    kind: "integer",
+    perModel: true,
+    expected: "an integer",
+    check: checkSeed,
+    problem: PHRASES.integer,
+    parseText: (raw) => (/^[+-]?\d+$/.test(raw.trim()) ? checkSeed(Number(raw.trim())) : bad),
+    requestField: "seed",
+    emit: () => [],
+  },
+  {
     path: "baseUrl",
     kind: "string",
     expected: "an http or https URL",
@@ -753,12 +873,16 @@ const TOP_LEVEL: readonly Candidate[] = [...new Set([...SETTINGS.map((row) => ro
 
 /** The keys of nested rows, in schema order; `inBlock` keeps only that block's, `exceptBlock` drops it. */
 function nestedKeys(filter: { inBlock?: string; exceptBlock?: string }): Candidate[] {
+  const seen = new Set<string>();
   return SETTINGS.filter((row) => row.path.includes(".")).flatMap((row) => {
-    const dot = row.path.indexOf(".");
-    const block = row.path.slice(0, dot);
+    const [block, name] = row.path.split(".");
     if (filter.inBlock !== undefined && block !== filter.inBlock) return [];
     if (filter.exceptBlock !== undefined && block === filter.exceptBlock) return [];
-    return [{ path: row.path, name: row.path.slice(dot + 1) }];
+    // A row three segments deep (`model.sampling.topP`) stands for its container: one candidate, `model.sampling`.
+    const path = `${block}.${name}`;
+    if (seen.has(path)) return [];
+    seen.add(path);
+    return [{ path, name }];
   });
 }
 
@@ -834,6 +958,19 @@ function unknownKeyHint(key: string, block: string | undefined, container: strin
   const home = dot === -1 ? "a top-level key" : `a "${meant.slice(0, dot)}" key`;
   const where = `${home}, not part of ${container}`;
   return normalizeKey(key) === normalizeKey(name) ? ` (${name} is ${where})` : ` (did you mean ${meant}? It is ${where})`;
+}
+
+/**
+ * The hint for an unknown key of the model block or of a `models` entry that is really a sampling key written one
+ * level too high: its normalised spelling (case, `-` and `_` ignored) equals that of a sampling key. Only schema names
+ * and fixed words are added to the line (T-02-27).
+ */
+function samplingKeyHint(key: string): string | undefined {
+  const wanted = normalizeKey(key);
+  for (const name of SAMPLING_ROWS.keys()) {
+    if (normalizeKey(name) === wanted) return ` (${name} is a "${SAMPLING_KEY}" key; write it inside "${SAMPLING_KEY}")`;
+  }
+  return undefined;
 }
 
 const FILE_LABEL = { global:"global config.json", project: "project .pi/pi-mlx-models.json" } as const;
@@ -1025,7 +1162,8 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
     // the model block, the `sampling` object is.
     const row = key.includes(".") ? undefined : ROWS_BY_PATH.get(path);
     if (row === undefined) {
-      problems.push(`${showKey(path)} (${label}): unknown key${unknownKeyHint(key, block, `"${block}"`)}`);
+      const misplaced = block === MODEL_BLOCK ? samplingKeyHint(key) : undefined;
+      problems.push(`${showKey(path)} (${label}): unknown key${misplaced ?? unknownKeyHint(key, block, `"${block}"`)}`);
       return;
     }
     // An install row is not read at all when the caller leaves the install settings out; an unknown key was reported above.
@@ -1036,10 +1174,14 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
   };
   /** One `models` entry: the same keys and checks as the `model` block, with the entry's own path in every line. */
   const considerEntry = (id: string, entry: Map<string, SettingValue>, key: string, value: unknown) => {
+    if (key === SAMPLING_KEY) {
+      readSampling(entry, entryPath(id), label, value, problems);
+      return;
+    }
     const where = `${entryPath(id)}.${showKey(key)}`;
     const row = key.includes(".") ? undefined : ROWS_BY_PATH.get(`${MODEL_BLOCK}.${key}`);
     if (row === undefined) {
-      problems.push(`${where} (${label}): unknown key${unknownKeyHint(key, MODEL_BLOCK, `a "${MODELS_KEY}" entry`)}`);
+      problems.push(`${where} (${label}): unknown key${samplingKeyHint(key) ?? unknownKeyHint(key, MODEL_BLOCK, `a "${MODELS_KEY}" entry`)}`);
       return;
     }
     const result = row.check(value);
