@@ -109,7 +109,20 @@ export function editConfig(path: string, change: (draft: ConfigTree) => ConfigTr
     };
   }
   const original: ConfigTree = file.state === "ok" ? file.data : {};
-  const result = change(copyValue(original) as ConfigTree);
+  let result: ConfigTree;
+  try {
+    result = change(copyValue(original) as ConfigTree);
+    // The comparison below serialises both trees; a tree too deep for the stack fails here, before anything is written.
+    JSON.stringify(original);
+    JSON.stringify(result);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    return {
+      ok: false,
+      kind: "unreadable",
+      message: `the config file ${shownPath(path)} is nested too deeply to edit; it was not changed. Fix or remove it, then run /mlx-config again.`,
+    };
+  }
 
   const checked = prepareSettings({ global: { state: "ok", data: result }, env: {} });
   if (!checked.ok) {
