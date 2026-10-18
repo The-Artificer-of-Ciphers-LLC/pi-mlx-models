@@ -183,21 +183,30 @@ export const systemHost: RuntimeHost = {
   run,
 };
 
-/** An import that takes longer than this is wedged: the check ends and answers "not installed". A cold first import is far shorter. */
+/** An import that takes longer than this is wedged: the check ends and answers "timed out". A cold first import is far shorter. */
 const IMPORT_CHECK_TIMEOUT_MS = 60_000;
 
+/** The answer of the import check: usable, not usable, or too slow to tell. */
+export type RuntimeCheck = "installed" | "missing" | "timed out";
+
 /**
- * True when the venv Python exists and can import mlx_lm: the one answer to "has /mlx-init been run". Runs only the fixed
- * command the installer already runs (`-c "import mlx_lm"`), with no user text, and never throws: any failure is false.
+ * Whether the venv Python exists and can import mlx_lm, with a timeout told apart from a missing runtime (a slow cold import
+ * is not a reason to say "run /mlx-init"). Runs only the fixed command the installer already runs (`-c "import mlx_lm"`),
+ * with no user text, and never throws.
  */
-export async function runtimeInstalled(host: RuntimeHost = systemHost): Promise<boolean> {
+export async function runtimeCheck(host: RuntimeHost = systemHost): Promise<RuntimeCheck> {
   try {
-    if (!host.exists(VENV_PYTHON)) return false;
+    if (!host.exists(VENV_PYTHON)) return "missing";
     await host.run(VENV_PYTHON, ["-c", "import mlx_lm"], undefined, { timeoutMs: IMPORT_CHECK_TIMEOUT_MS });
-    return true;
-  } catch {
-    return false;
+    return "installed";
+  } catch (error) {
+    return error instanceof RunTimeoutError ? "timed out" : "missing";
   }
+}
+
+/** True when the venv Python exists and can import mlx_lm: the one answer to "has /mlx-init been run". A timeout is false. */
+export async function runtimeInstalled(host: RuntimeHost = systemHost): Promise<boolean> {
+  return (await runtimeCheck(host)) === "installed";
 }
 
 /** Minor version of the venv's own interpreter, or null when it cannot be run or its output is not a Python 3 version. */

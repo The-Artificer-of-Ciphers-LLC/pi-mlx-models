@@ -32,7 +32,7 @@ import {
 import { probePort } from "./port.js";
 import { createProgress, type Progress } from "./progress.js";
 import { applyRequestOverrides, type ActiveLaunch } from "./request.js";
-import { ensureInstalled, runtimeInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
+import { ensureInstalled, runtimeCheck, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
 import { createMlxServer, type MlxServer, type ServerAddress } from "./server.js";
 import {
   PI_FLAGS,
@@ -202,8 +202,11 @@ export interface ExtensionDeps {
   probeHealth: ProbeHealth;
   /** True when something already answers (accepts a connection or holds the bind) at the address; auto-start asks it before it starts anything. */
   probePort: (host: string, port: number) => Promise<boolean>;
-  /** True when the MLX runtime (the venv and its mlx-lm) is usable; auto-start asks it and never installs anything. */
-  runtimeInstalled: () => Promise<boolean>;
+  /**
+   * True when the MLX runtime (the venv and its mlx-lm) is usable; auto-start asks it and never installs anything. "timed out"
+   * means the import check did not finish, which is not the same as a missing runtime.
+   */
+  runtimeInstalled: () => Promise<boolean | "timed out">;
   /**
    * Receives the promise of the background work the session_start hook started, so a test can wait for it. Not a timeout and
    * not set in production: the hook returns at once either way.
@@ -271,7 +274,10 @@ function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
     installedVersion: overrides.installedVersion ?? probe.installedVersion,
     probeHealth: overrides.probeHealth ?? createHealthProbe(),
     probePort: overrides.probePort ?? probePort,
-    runtimeInstalled: overrides.runtimeInstalled ?? (() => runtimeInstalled()),
+    runtimeInstalled: overrides.runtimeInstalled ?? (async () => {
+      const check = await runtimeCheck();
+      return check === "timed out" ? check : check === "installed";
+    }),
     ...(overrides.trackBackground === undefined ? {} : { trackBackground: overrides.trackBackground }),
     shutdownWaitMs: overrides.shutdownWaitMs ?? 5000,
     sleep: overrides.sleep ?? unrefSleep,
@@ -915,6 +921,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     // The runtime is only looked at, never installed: a missing one is /mlx-init's job (D-27, T-06-36).
     const installed = await deps.runtimeInstalled();
     if (superseded()) return;
+    if (installed === "timed out") {
+      ctx.ui.notify("auto-start skipped: the check that mlx-lm can be imported timed out; run /mlx-start to start by hand", "warning");
+      return;
+    }
     if (!installed) {
       ctx.ui.notify("auto-start skipped: the MLX runtime is not installed; run /mlx-init, then /mlx-start", "warning");
       return;
