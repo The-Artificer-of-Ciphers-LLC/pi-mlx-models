@@ -5943,3 +5943,218 @@ test("auto-start without a UI (print or JSON mode) does nothing, silently", asyn
   assert.deepEqual(h.portProbes, []);
   assertAutoStartIdle(h);
 });
+
+// ---- auto-start: races, policy and the failure paths (plan 06-11: D-25, D-29, Pitfall 10) ----
+
+/** A server whose start waits on `gate` after it has launched, so a start can be held in flight. */
+const gatedServer = (gate: { promise: Promise<void> }): FakeServerOptions => ({
+  start: async (_model, onEvent) => {
+    onEvent?.({ type: "launched" });
+    await gate.promise;
+    for (const type of ["loading", "warming", "ready"] as const) onEvent?.({ type });
+  },
+});
+
+test("auto-start does not remember /mlx-stop: the next pi over the same files starts the last-used model again", async () => {
+  const first = await autoSetup({ record: null });
+  await startMlx(first.h, "qwen3_4b");
+  await first.h.commands.get("mlx-stop")!("", first.h.ctx);
+  assert.equal(first.h.server.startCalls.length, 1, "premise: the model was started once and stopped by hand");
+  assert.ok(existsSync(first.recordFile), "premise: the start left a record");
+
+  const second = await setup({ settings: first.settings });
+  await sessionStart(second);
+
+  assert.deepEqual(errors(second.notes), []);
+  assert.deepEqual(second.server.startCalls, [QWEN_ID], "the explicit stop was not remembered");
+});
+
+test("auto-start skips, silently, while a start is in flight and again once that start has made a launch of this session", async () => {
+  const gate = deferred();
+  const { h } = await autoSetup({ setup: { server: gatedServer(gate) } });
+  const starting = startMlx(h, "qwen3_4b");
+  await until(() => h.server.startCalls.length === 1);
+  const notesBefore = h.notes.length;
+
+  await sessionStart(h);
+
+  assert.equal(h.server.startCalls.length, 1, "no second start while one is in flight");
+  assert.equal(h.notes.length, notesBefore, "and nothing is said");
+  assert.deepEqual(h.portProbes, [], "the port is not even probed");
+  gate.resolve();
+  await starting;
+  const notesAfter = h.notes.length;
+
+  await sessionStart(h);
+
+  assert.equal(h.server.startCalls.length, 1, "a launch of this session exists, so auto-start leaves it alone");
+  assert.equal(h.notes.length, notesAfter);
+  assert.deepEqual(h.portProbes, []);
+});
+
+test("auto-start twice in a row starts the model once", async () => {
+  const { h } = await autoSetup();
+
+  fireSessionStart(h);
+  fireSessionStart(h);
+  while (h.background.length > 0) await h.background.shift();
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN_ID]);
+  assert.equal(startingNotes(h.notes).length, 1);
+});
+
+test("auto-start yields to a start made while it was probing the port: the user's model is the one started", async () => {
+  const probe = deferred<boolean>();
+  const { h } = await autoSetup({ setup: { probePort: () => probe.promise } });
+
+  const hook = sessionStart(h);
+  await until(() => h.portProbes.length === 1);
+  await startMlx(h, OTHER_PRESET.key);
+  probe.resolve(false);
+  await hook;
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [OTHER_PRESET.modelId], "only the model the user started");
+  assert.equal(startingNotes(h.notes).length, 1);
+  assert.equal(h.runtimeChecks, 0, "auto-start went no further");
+});
+
+test("auto-start yields to a stop made while it was probing the port, and says nothing about it", async () => {
+  const probe = deferred<boolean>();
+  const { h } = await autoSetup({ setup: { probePort: () => probe.promise } });
+
+  const hook = sessionStart(h);
+  await until(() => h.portProbes.length === 1);
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  probe.resolve(false);
+  await hook;
+
+  assert.deepEqual(h.server.startCalls, []);
+  assert.deepEqual(h.notes, [{ message: "MLX server stopped.", type: "info" }], "only the stop's own notice");
+  assert.equal(h.runtimeChecks, 0);
+});
+
+test("auto-start yields to a stop made while it was checking the runtime, even when the runtime is missing", async () => {
+  const check = deferred<boolean>();
+  const { h } = await autoSetup({ setup: { runtimeInstalled: () => check.promise } });
+
+  const hook = sessionStart(h);
+  await until(() => h.runtimeChecks === 1);
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  check.resolve(false);
+  await hook;
+
+  assert.deepEqual(h.server.startCalls, []);
+  assert.deepEqual(h.notes, [{ message: "MLX server stopped.", type: "info" }], "no 'runtime not installed' notice for a session the user already stopped");
+});
+
+test("auto-start treats every session reason the same: startup, reload, new, resume and fork each start the model once", async () => {
+  for (const reason of ["startup", "reload", "new", "resume", "fork"]) {
+    const { h } = await autoSetup();
+
+    await sessionStart(h, reason);
+
+    assert.deepEqual(errors(h.notes), [], reason);
+    assert.deepEqual(h.server.startCalls, [QWEN_ID], reason);
+  }
+});
+
+test("auto-start failure after the launch reads 'auto-start failed', not 'skipped', and the record is not overwritten", async () => {
+  const raw = `{"version":1,"model":"${QWEN_ID}","profile":null}`;
+  const { h, recordFile } = await autoSetup({
+    record: raw,
+    setup: {
+      server: {
+        start: async () => {
+          throw new Error("boom");
+        },
+      },
+    },
+  });
+
+  await sessionStart(h);
+
+  assert.deepEqual(errors(h.notes), ["auto-start failed: boom"]);
+  assert.equal(recordText(recordFile), raw, "a failed start leaves the record as it was");
+});
+
+test("auto-start unexpected error: a probe that rejects ends in one error notice and no unhandled rejection", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const { h } = await autoSetup({
+      setup: {
+        probePort: async () => {
+          throw new Error("probe exploded");
+        },
+      },
+    });
+
+    await sessionStart(h);
+    await flush();
+
+    assert.deepEqual(h.notes, [{ message: "auto-start failed: probe exploded", type: "error" }]);
+    assert.deepEqual(unhandled, []);
+    assertAutoStartIdle(h);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("auto-start unexpected error: a notice that cannot be shown does not become an unhandled rejection either", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const { h } = await autoSetup({
+      setup: {
+        probePort: async () => {
+          throw new Error("probe exploded");
+        },
+      },
+    });
+    h.ctx.ui.notify = () => {
+      throw new Error("the UI is gone");
+    };
+
+    await sessionStart(h);
+    await flush();
+
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("auto-start never prompts: across a start and every skip, no select, input or confirm dialog is opened", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { autoStart: true });
+  const scenarios: Array<[string, Parameters<typeof autoSetup>[0]]> = [
+    ["a start", {}],
+    ["a trust confirmation needed", { global: { autoStart: true, server: { trustRemoteCode: true } } }],
+    ["a non-loopback host", { global: { autoStart: true, server: { host: "0.0.0.0" } } }],
+    ["something answering", { setup: { probePort: async () => true } }],
+    ["a missing runtime", { setup: { runtimeInstalled: async () => false } }],
+    ["a missing profile", { global: { autoStart: true, ...FAST_AND_OTHER }, record: { model: QWEN_ID, profile: "gone" } }],
+    ["a project file asking for autoStart", { setup: { ctx: { cwd } } }],
+    ["an unreadable record", { record: "this is not json\n" }],
+  ];
+  for (const [label, options] of scenarios) {
+    const { h } = await autoSetup({ ...options, setup: { ...options?.setup, ctx: { ...options?.setup?.ctx, confirm: true } } });
+    let dialogs = 0;
+    for (const method of ["select", "input", "confirm"] as const) {
+      h.ctx.ui[method] = (async () => {
+        dialogs += 1;
+        return method === "confirm" ? true : undefined;
+      }) as never;
+    }
+
+    await sessionStart(h);
+
+    assert.equal(dialogs, 0, `${label}: no dialog was opened`);
+    assert.deepEqual(h.prompts, [], label);
+    assert.deepEqual(h.confirms, [], label);
+  }
+});
