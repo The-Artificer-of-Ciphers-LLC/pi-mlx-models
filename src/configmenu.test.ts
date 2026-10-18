@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { confirmationFor, renderConfig } from "./configedit.js";
+import { confirmationFor, renderConfig, setAt } from "./configedit.js";
 import { ACTION, type ConfigMenuUi, MENU, NEW_ENTRY, NEW_PROFILE, NO_DEFAULT, PROFILE_ACTION, runConfigMenu } from "./configmenu.js";
 import { PROFILE_NAME_SHORT_RULE, SETTINGS, prepareSettings, readLayerFile } from "./settings.js";
 import { makeCtx, scriptInput, scriptSelect } from "./testkit.js";
@@ -25,6 +25,8 @@ interface SessionOptions {
   confirm?: boolean | ((title: string, message: string) => boolean);
   serverRunning?: boolean;
   hasUI?: boolean;
+  /** Put the config file in a directory that does not exist yet. */
+  nested?: boolean;
   /** Replaces methods of the UI, for a dialog that throws or answers undefined. */
   ui?: Partial<ConfigMenuUi>;
 }
@@ -32,7 +34,7 @@ interface SessionOptions {
 /** A scripted menu session over a real temporary config file. */
 function session(t: { after(fn: () => void): void }, options: SessionOptions = {}) {
   const dir = tempDir(t);
-  const path = join(dir, "config.json");
+  const path = options.nested === true ? join(dir, "data", "config.json") : join(dir, "config.json");
   if (options.file !== undefined) writeFileSync(path, typeof options.file === "string" ? options.file : pretty(options.file));
   const select = scriptSelect(...(options.select ?? []));
   const input = scriptInput(...(options.input ?? []));
@@ -381,5 +383,160 @@ test("configmenu rename is add plus delete: a profile added under a new name wit
   });
   await s.run();
   assert.deepEqual(s.json(), { models: { qwen3_4b: { profiles: { b: { sampling: { temperature: 0.2 } } } } } });
+  s.assertScriptsUsed();
+});
+
+test("configmenu without a UI: the config is printed with a read-only warning, no dialog opens and nothing is written", async (t) => {
+  const before = pretty({ server: { port: 8081 } });
+  const s = session(t, { file: before, hasUI: false, select: [MENU.general, "server.port", ACTION.set], input: ["9000"] });
+  await s.run();
+  assert.equal(s.prompts.length, 0);
+  assert.equal(s.select.remaining(), 3);
+  assert.equal(s.input.remaining(), 1);
+  assert.equal(s.notes.length, 2);
+  assert.deepEqual(s.notes[0], { message: renderConfig(readLayerFile(s.path), s.path), type: "info" });
+  assert.equal(s.notes[1].type, "warning");
+  assert.match(s.notes[1].message, /interactive pi session/);
+  assert.match(s.notes[1].message, /read-only/);
+  assert.equal(s.text(), before);
+});
+
+test("configmenu fails closed: a dialog that throws is a dismissal, a confirm that throws or is dismissed is a no, and a notify that throws does not stop the menu", async (t) => {
+  const boom = async (): Promise<never> => {
+    throw new Error("dialog failed");
+  };
+
+  const top = session(t, { select: [MENU.general], ui: { select: boom } });
+  await top.run();
+  assert.equal(existsSync(top.path), false);
+  assert.equal(top.select.remaining(), 1, "the failed select ended the menu without asking again");
+
+  const before = pretty({ server: { port: 8080 } });
+  const typed = session(t, { file: before, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["8081"], ui: { input: boom } });
+  await typed.run();
+  assert.equal(typed.text(), before);
+  assert.equal(typed.select.remaining(), 0, "the menu went on after the failed input");
+
+  const noisy = session(t, {
+    file: {},
+    select: [MENU.general, "server.port", ACTION.set, MENU.general, "server.logLevel", ACTION.set, MENU.done],
+    input: ["8081", "DEBUG"],
+    ui: { notify: () => { throw new Error("notify failed"); } },
+  });
+  await noisy.run();
+  assert.deepEqual(noisy.json(), { server: { port: 8081, logLevel: "DEBUG" } });
+  assert.equal(noisy.select.remaining(), 0);
+});
+
+const SENSITIVE = [
+  { key: "server.trustRemoteCode", bool: true, value: true },
+  { key: "server.host", text: "0.0.0.0", value: "0.0.0.0" },
+  { key: "server.allowedOrigins", text: "https://example.com", value: ["https://example.com"] },
+  { key: "baseUrl", text: "http://192.168.1.5:8080/v1", value: "http://192.168.1.5:8080/v1" },
+  { key: "mlxLm.pipIndex", text: "https://pypi.example.org/simple", value: "https://pypi.example.org/simple" },
+  { key: "autoStart", bool: true, value: true },
+];
+
+test("configmenu a sensitive key is written only after a yes: no, undefined and a throw each write nothing", async (t) => {
+  const before = pretty({ server: { port: 8080 } });
+  const answers: Array<[string, Partial<ConfigMenuUi> | undefined, boolean]> = [
+    ["yes", undefined, true],
+    ["no", { confirm: async () => false }, false],
+    ["undefined", { confirm: async () => undefined as unknown as boolean }, false],
+    ["throw", { confirm: async () => { throw new Error("dialog failed"); } }, false],
+  ];
+  for (const sensitive of SENSITIVE) {
+    for (const [answer, ui, writes] of answers) {
+      const label = `${sensitive.key} with ${answer}`;
+      const steps = sensitive.bool === true ? [MENU.general, sensitive.key, "true", MENU.done] : [MENU.general, sensitive.key, ACTION.set, MENU.done];
+      const s = session(t, { file: before, confirm: true, select: steps, input: sensitive.text === undefined ? [] : [sensitive.text], ui });
+      await s.run();
+      s.assertScriptsUsed();
+      if (writes) {
+        assert.deepEqual(s.json(), JSON.parse(JSON.stringify(setAt({ server: { port: 8080 } }, sensitive.key.split("."), sensitive.value))), label);
+      } else {
+        assert.equal(s.text(), before, label);
+      }
+    }
+  }
+});
+
+test("configmenu a value that is not sensitive does not prompt: a loopback host and a port are written without a dialog", async (t) => {
+  const s = session(t, { file: {}, select: [MENU.general, "server.host", ACTION.set, MENU.general, "server.port", ACTION.set, MENU.done], input: ["127.0.0.1", "8085"] });
+  await s.run();
+  assert.deepEqual(s.json(), { server: { host: "127.0.0.1", port: 8085 } });
+  assert.equal(s.confirms.length, 0);
+  s.assertScriptsUsed();
+});
+
+test("configmenu unreadable file: the notice names the file and says it was not changed, the file is untouched and the menu ends", async (t) => {
+  const before = "{ this is not json";
+  const s = session(t, { file: before, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["8081"] });
+  await s.run();
+  assert.equal(s.text(), before);
+  const error = s.notes.find((note) => note.type === "error");
+  assert.ok(error, JSON.stringify(s.notes));
+  assert.ok(error.message.includes("config.json"), error.message);
+  assert.match(error.message, /not changed/);
+  assert.equal(s.select.remaining(), 1, "the menu ended instead of asking again");
+});
+
+test("configmenu unreadable file in the default-profile flow: the same notice and the menu ends", async (t) => {
+  const before = "[1, 2]";
+  const s = session(t, { file: before, select: [MENU.defaultProfile, MENU.done] });
+  await s.run();
+  assert.equal(s.text(), before);
+  assert.ok(s.notes.some((note) => note.type === "error" && /not changed/.test(note.message)), JSON.stringify(s.notes));
+  assert.equal(s.select.remaining(), 1);
+});
+
+test("configmenu first edit creates the file: with no data directory a first edit creates it and the notice says so", async (t) => {
+  const s = session(t, { nested: true, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["8081"] });
+  assert.equal(existsSync(s.path), false);
+  await s.run();
+  assert.deepEqual(s.json(), { server: { port: 8081 } });
+  const saved = s.notes.find((note) => note.message.includes("server.port"));
+  assert.ok(saved);
+  assert.match(saved.message, /was created/);
+  s.assertScriptsUsed();
+});
+
+test("configmenu an exhausted script ends the menu, and a UI that always gives the same answer cannot keep it running forever", async (t) => {
+  const exhausted = session(t, { select: [MENU.view] });
+  await exhausted.run();
+  assert.equal(exhausted.notes.length, 1);
+
+  const stuck = session(t, { ui: { select: async () => MENU.view } });
+  await stuck.run();
+  assert.ok(stuck.notes.length > 0 && stuck.notes.length < 10000, `${stuck.notes.length} notices`);
+});
+
+test("configmenu only the given path is written: the directory holds the config file and nothing else, and a project file is unchanged", async (t) => {
+  const s = session(t, {
+    file: { models: { qwen3_4b: {} } },
+    select: [MENU.general, "server.port", ACTION.set, MENU.modelBlock, "model.sampling.temperature", ACTION.set, MENU.profiles, "qwen3_4b", NEW_PROFILE, PROFILE_ACTION.back, MENU.done],
+    input: ["8081", "0.3", "fast"],
+  });
+  const project = join(s.dir, "proj", ".pi", "pi-mlx-models.json");
+  mkdirSync(join(s.dir, "proj", ".pi"), { recursive: true });
+  const projectText = pretty({ server: { port: 9999 } });
+  writeFileSync(project, projectText);
+  await s.run();
+  assert.deepEqual(readdirSync(s.dir).sort(), ["config.json", "proj"]);
+  assert.equal(readFileSync(project, "utf8"), projectText);
+  assert.equal(s.confirms.length, 0);
+  s.assertScriptsUsed();
+  assert.deepEqual(s.json(), { models: { qwen3_4b: { profiles: { fast: {} } } }, server: { port: 8081 }, model: { sampling: { temperature: 0.3 } } });
+});
+
+test("configmenu an invalid combined result: a file that already holds an unknown key refuses an edit of another key and lists the problem", async (t) => {
+  const before = pretty({ server: { port: 8080, bogusKey: 1 } });
+  const s = session(t, { file: before, select: [MENU.general, "server.logLevel", ACTION.set, MENU.done], input: ["DEBUG"] });
+  await s.run();
+  assert.equal(s.text(), before);
+  const error = s.notes.find((note) => note.type === "error");
+  assert.ok(error, JSON.stringify(s.notes));
+  assert.match(error.message, /bogusKey/);
+  assert.match(error.message, /may already have been in the file/);
   s.assertScriptsUsed();
 });
