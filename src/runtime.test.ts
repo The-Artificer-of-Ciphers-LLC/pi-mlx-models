@@ -429,6 +429,50 @@ test("run's onLine lines are cleaned of control characters", async () => {
   for (const line of lines) assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f]/);
 });
 
+// IN-03: a child that never ends must not hang the caller for good.
+type RunWithTimeout = (cmd: string, args: string[], onLine: ((line: string) => void) | undefined, options: { timeoutMs: number }) => Promise<void>;
+
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test("run with a timeout kills a child that does not end and rejects with a fixed phrase", { timeout: 20_000 }, async () => {
+  const script = "process.stdout.write('pid=' + process.pid + '\\n'); setInterval(() => {}, 1000)";
+  let pid = 0;
+  const started = Date.now();
+  await assert.rejects((run as unknown as RunWithTimeout)(process.execPath, ["-e", script], (line) => {
+    const m = line.match(/^pid=(\d+)$/);
+    if (m) pid = Number(m[1]);
+  }, { timeoutMs: 500 }), /timed out/);
+  assert.ok(Date.now() - started < 10_000, "rejected soon after the bound");
+  assert.ok(pid > 0, "premise: the child reported its pid");
+  for (let i = 0; i < 40 && isAlive(pid); i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(isAlive(pid), false, "the child was killed");
+});
+
+test("run with a timeout that is not reached resolves as before", async () => {
+  await (run as unknown as RunWithTimeout)(process.execPath, ["-e", "process.exit(0)"], undefined, { timeoutMs: 20_000 });
+});
+
+test("runtimeInstalled: the import check is run with a bound, so a wedged import cannot hang auto-start", async () => {
+  const seen: unknown[] = [];
+  const { host } = fakeHost({
+    venv: true,
+    run: (async (_cmd: string, _args: string[], _onLine: unknown, options: unknown) => {
+      seen.push(options);
+    }) as unknown as RuntimeHost["run"],
+  });
+  assert.equal(await runtimeInstalled(host), true);
+  const options = seen[0] as { timeoutMs?: unknown } | undefined;
+  assert.equal(typeof options?.timeoutMs, "number");
+  assert.ok((options?.timeoutMs as number) > 0);
+});
+
 // WR-07: a venv built by an older Python cannot take mlx-lm; it is recreated with a compatible interpreter.
 /** A host whose venv exists and whose `--version` probe reports `venvVersion`; the import check fails unless `importable`. */
 function venvHost(venvVersion: string, importable = false) {
