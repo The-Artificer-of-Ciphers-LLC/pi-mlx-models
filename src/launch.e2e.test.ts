@@ -1778,3 +1778,26 @@ test("mlx-restart e2e: an edit of the global file takes effect on the next resta
   assert.deepEqual(h.argv().filter((arg) => arg.startsWith("--temp")), ["--temp=0.5"]);
   await h.stop();
 });
+
+test("mlx-restart e2e: with nothing running a fresh instance starts the remembered launch with the same arguments and says so", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const first = await harness(t);
+  first.writeConfig(FAST_PROFILE_FILE(port));
+  await first.start("qwen3_4b --profile fast");
+  assert.deepEqual(errorNotes(first.notes), []);
+  const firstArgv = first.argv();
+  await first.stop();
+  assert.equal(await connectRefused(port), true);
+  rmSync(first.argvFile);
+
+  const second = await reopened(t, first);
+  await second.restart();
+
+  assert.deepEqual(errorNotes(second.notes), []);
+  assert.deepEqual(second.argv(), firstArgv, "the same model, the same profile, the same server arguments");
+  const said = second.notes.filter((n) => n.type === "info" && n.message.includes("nothing was running, starting"));
+  assert.equal(said.length, 1);
+  assert.ok(said[0].message.includes(QWEN.modelId), said[0].message);
+  assert.ok(startNotes(second.notes)[0].message.includes("\nprofile: fast (previous launch)"), startNotes(second.notes)[0].message);
+  await second.stop();
+});

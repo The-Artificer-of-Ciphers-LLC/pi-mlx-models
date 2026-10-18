@@ -5083,3 +5083,207 @@ test("mlx-status record shows flags marked skipped, as the start message showed 
 
   assert.ok(linesOf(block).includes(startFlags), block);
 });
+
+// ---- /mlx-restart: refusals leave the running server alone, the confirmations are asked again, nothing running falls back to the last launch (plan 06-09: CMD-04, D-15, D-16) ----
+
+const restartCommand = (h: Harness, args = "") => h.commands.get("mlx-restart")!(args, h.ctx);
+const RESTART_PROBE = { probeHealth: async () => PROBE_ANSWERS() };
+/** A harness with a ready launch of qwen3_4b with profile fast, then the notices cleared so a test sees only what a restart adds. */
+async function runningFast(options: { global?: unknown; setup?: Parameters<typeof setup>[0] } = {}) {
+  const made = await lastSetup({
+    global: options.global ?? FAST_AND_OTHER,
+    setup: { ...RESTART_PROBE, ...options.setup },
+  });
+  await startMlx(made.h, "qwen3_4b --profile fast");
+  assert.deepEqual(errors(made.h.notes), [], "premise: the first start succeeded");
+  assert.equal(made.h.server.startCalls.length, 1, "premise: one start");
+  return made;
+}
+
+/** The server was neither stopped nor started again, and the status still shows this session's launch. */
+async function assertServerUntouched(h: Harness) {
+  assert.equal(h.server.stopCalls, 0, "a refused restart never stops the running server");
+  assert.equal(h.server.startCalls.length, 1, "a refused restart never starts a second one");
+  const block = await statusBlock(h);
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes("profile: fast (/mlx-start)"), block);
+}
+
+test("mlx-restart takes no model: a model argument is an error, nothing starts and the server is not stopped", async () => {
+  const { h } = await runningFast();
+  const before = h.notes.length;
+
+  await restartCommand(h, "qwen3_4b");
+
+  const added = h.notes.slice(before);
+  assert.equal(added.length, 1);
+  assert.equal(added[0].type, "error");
+  assert.ok(/^mlx-restart failed: unexpected argument .*\(\/mlx-restart takes no model\)/.test(added[0].message), added[0].message);
+  await assertServerUntouched(h);
+});
+
+test("mlx-restart with an unknown flag is an error that lists the valid flags and leaves the server alone", async () => {
+  const { h } = await runningFast();
+  const before = h.notes.length;
+
+  await restartCommand(h, "--bogus 1");
+
+  const added = h.notes.slice(before);
+  assert.equal(added.length, 1);
+  assert.ok(added[0].message.startsWith("mlx-restart failed: unknown flag --bogus (valid flags: "), added[0].message);
+  assert.ok(added[0].message.includes("--profile"), added[0].message);
+  await assertServerUntouched(h);
+});
+
+test("mlx-restart with an empty profile flag is refused and leaves the server alone", async () => {
+  const { h } = await runningFast();
+  const before = h.notes.length;
+
+  await restartCommand(h, "--profile=");
+
+  assert.deepEqual(h.notes.slice(before), [{ type: "error", message: "mlx-restart failed: --profile needs a profile name" }]);
+  await assertServerUntouched(h);
+});
+
+test("mlx-restart leaves the running server alone when an override is invalid", async () => {
+  const { h } = await runningFast();
+  const before = h.notes.length;
+
+  await restartCommand(h, "--port abc");
+
+  const added = h.notes.slice(before);
+  assert.equal(added.length, 1);
+  assert.equal(added[0].type, "error");
+  assert.ok(added[0].message.startsWith("mlx-restart failed: invalid configuration"), added[0].message);
+  await assertServerUntouched(h);
+});
+
+test("mlx-restart leaves the running server alone when the global file became invalid", async () => {
+  const { h, settings } = await runningFast();
+  writeGlobal(settings, { server: { port: 99999 } });
+  const before = h.notes.length;
+
+  await restartCommand(h);
+
+  const added = h.notes.slice(before);
+  assert.equal(added.length, 1);
+  assert.ok(added[0].message.startsWith("mlx-restart failed: invalid configuration"), added[0].message);
+  assert.equal(h.server.stopCalls, 0);
+  assert.equal(h.server.startCalls.length, 1);
+  writeGlobal(settings, FAST_AND_OTHER);
+  await assertServerUntouched(h);
+});
+
+test("mlx-restart leaves the running server alone when a project file asks for trustRemoteCode, with no dialog", async () => {
+  const cwd = newCwd();
+  const { h, settings } = await runningFast({ setup: { ctx: { cwd } } });
+  writeProject(cwd, { server: { trustRemoteCode: true } });
+  const before = h.notes.length;
+
+  await restartCommand(h);
+
+  assert.deepEqual(errors(h.notes.slice(before)), [
+    refusalText(settings, ["  server.trustRemoteCode: lets the model repository run Python code"]).replace(/^mlx-start failed:/, "mlx-restart failed:"),
+  ]);
+  assert.equal(h.confirms.length, 0, "no dialog can override the refusal");
+  await assertServerUntouched(h);
+});
+
+test("mlx-restart leaves the running server alone when the trust confirmation is declined", async () => {
+  const { h } = await runningFast({ global: { ...FAST_AND_OTHER, server: { trustRemoteCode: true } } });
+  scriptConfirms(h, [false]);
+  assert.equal(h.confirms.length, 1, "premise: the first start asked once");
+  const before = h.notes.length;
+
+  await restartCommand(h);
+
+  assert.equal(h.confirms.length, 2, "the restart asked again");
+  assert.deepEqual(h.notes.slice(before), [{ type: "info", message: "mlx-restart cancelled: --trust-remote-code was not confirmed." }]);
+  assert.equal(h.server.stopCalls, 0);
+  assert.equal(h.server.startCalls.length, 1);
+});
+
+test("mlx-restart asks the trust confirmation again: nothing about the earlier approval is remembered", async () => {
+  const { h } = await runningFast({ global: { ...FAST_AND_OTHER, server: { trustRemoteCode: true } } });
+  assert.equal(h.confirms.length, 1, "premise: the first start asked once");
+
+  await restartCommand(h);
+
+  assert.equal(h.confirms.length, 2, "two dialogs in total");
+  assert.equal(h.confirms[1].title, h.confirms[0].title);
+  assert.equal(h.confirms[1].title, TRUST_TITLE);
+  assert.equal(h.server.startCalls.length, 2, "the accepted restart started again");
+  assert.ok(h.server.launches[1]?.extraArgs.includes("--trust-remote-code"), JSON.stringify(h.server.launches[1]?.extraArgs));
+});
+
+test("mlx-restart with a trust risk and no UI is refused with the /mlx-restart name and leaves the server alone", async () => {
+  const { h } = await runningFast({ global: { ...FAST_AND_OTHER, server: { trustRemoteCode: true } } });
+  h.ctx.hasUI = false;
+  const before = h.notes.length;
+
+  await restartCommand(h);
+
+  assert.deepEqual(h.notes.slice(before), [
+    {
+      type: "error",
+      message: "mlx-restart failed: --trust-remote-code needs interactive confirmation; run /mlx-restart in an interactive pi session",
+    },
+  ]);
+  await assertServerUntouched(h);
+});
+
+test("mlx-restart with nothing running starts the remembered launch after a note that names the model", async () => {
+  const { h } = await lastSetup({ global: FAST_AND_OTHER, record: FAST_RECORD, setup: RESTART_PROBE });
+
+  await restartCommand(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN_ID]);
+  assert.equal(h.server.stopCalls, 0);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--temp=0.2"]);
+  const messages = infos(h.notes);
+  const noteAt = messages.findIndex((m) => m.includes("nothing was running, starting"));
+  const startAt = messages.findIndex((m) => m.startsWith("Starting MLX server with"));
+  assert.ok(noteAt >= 0, JSON.stringify(messages));
+  assert.ok(messages[noteAt].startsWith("mlx-restart: nothing was running, starting "), messages[noteAt]);
+  assert.ok(messages[noteAt].includes(QWEN_ID), messages[noteAt]);
+  assert.ok(noteAt < startAt, "the note comes before the start");
+  assert.equal(startingNotes(h.notes)[0].split("\n")[1], "profile: fast (previous launch)");
+});
+
+test("mlx-restart after /mlx-stop uses the remembered launch the same way", async () => {
+  const { h } = await runningFast();
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  const before = h.notes.length;
+
+  await restartCommand(h);
+
+  const added = h.notes.slice(before);
+  assert.deepEqual(errors(added), []);
+  assert.ok(added.some((n) => n.type === "info" && n.message.includes("nothing was running, starting") && n.message.includes(QWEN_ID)), JSON.stringify(added));
+  assert.equal(h.server.startCalls.length, 2);
+  assert.equal(startingNotes(added)[0].split("\n")[1], "profile: fast (previous launch)");
+});
+
+test("mlx-restart with nothing running and nothing remembered points to /mlx-start and starts nothing", async () => {
+  const { h, recordFile } = await lastSetup({ setup: RESTART_PROBE });
+
+  await restartCommand(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.notes, [{ type: "info", message: "mlx-restart: nothing is running and nothing is remembered. Run /mlx-start to pick a model." }]);
+  assertNothingHappened(h);
+  assert.equal(existsSync(recordFile), false, "reading creates nothing");
+});
+
+test("mlx-restart with nothing running and an unreadable record says the file is unreadable and starts nothing", async () => {
+  const { h, recordFile } = await lastSetup({ record: "this is not json\n", setup: RESTART_PROBE });
+
+  await restartCommand(h);
+
+  assert.deepEqual(errors(h.notes), [
+    "mlx-restart failed: the remembered launch file is not valid JSON; treating it as nothing remembered. Run /mlx-start to choose a model; a successful start replaces the file.",
+  ]);
+  assertNothingHappened(h);
+  assert.equal(readFileSync(recordFile, "utf8"), "this is not json\n", "the file is left as it was");
+});
