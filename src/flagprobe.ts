@@ -16,6 +16,9 @@ export type ProbeResult =
   | { ok: true; version: string; flags: ReadonlySet<string> }
   | { ok: false; reason: string };
 
+/** The answer of the cheap version query: the installed mlx-lm version, or why it could not be read. */
+export type VersionResult = { ok: true; version: string } | { ok: false; reason: string };
+
 export interface ProbeCommandOptions {
   /** Exactly the environment the child gets; nothing is merged in. */
   env: NodeJS.ProcessEnv;
@@ -150,7 +153,7 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
  * A probe over one python. `probe()` never throws: any trouble is `{ ok: false, reason }`, and a failure is never
  * cached, so the next launch tries again.
  */
-export function createFlagProbe(deps: FlagProbeDeps): { probe(): Promise<ProbeResult> } {
+export function createFlagProbe(deps: FlagProbeDeps): { probe(): Promise<ProbeResult>; installedVersion(): Promise<VersionResult> } {
   const run = deps.run ?? runProbeCommand;
   const limits = { timeoutMs: deps.timeoutMs ?? DEFAULT_TIMEOUT_MS, maxBytes: deps.maxBytes ?? DEFAULT_MAX_BYTES };
   const cache = new Map<string, ReadonlySet<string>>();
@@ -188,6 +191,11 @@ export function createFlagProbe(deps: FlagProbeDeps): { probe(): Promise<ProbeRe
   };
 
   return {
+    /** Only the cheap version query (no `--help`, no mlx import); nothing is cached and it never throws. */
+    async installedVersion(): Promise<VersionResult> {
+      const read = await readVersion(probeEnv(deps.env ?? process.env));
+      return "reason" in read ? { ok: false, reason: reasonText(read.reason) } : { ok: true, version: read.version };
+    },
     async probe() {
       const env = probeEnv(deps.env ?? process.env);
       const read = await readVersion(env);

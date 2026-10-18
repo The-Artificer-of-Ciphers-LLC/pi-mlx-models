@@ -1410,6 +1410,38 @@ export function describeInstall(install: InstallSettings): string {
   return `mlx-lm ${install.version} (${install.versionSource ?? "default"}) from ${showInDialog(install.pipIndex)} (${install.pipIndexSource ?? "default"})`;
 }
 
+/** The leading release number of a version text (digits and dots) and what follows it, lower-cased. */
+function splitVersion(text: string): { release: string[]; suffix: string } | undefined {
+  const lower = text.trim().toLowerCase();
+  const match = /^[0-9]+(?:\.[0-9]+)*/.exec(lower);
+  if (match === null) return undefined;
+  const release = match[0].split(".");
+  // PEP 440 pads the release with zeros: 0.32 and 0.32.0 are the same version. At least the first part stays.
+  while (release.length > 1 && /^0+$/.test(release[release.length - 1])) release.pop();
+  return { release: release.map((part) => String(Number(part))), suffix: lower.slice(match[0].length) };
+}
+
+/**
+ * Whether two version texts name the same release: equal after the trailing `.0` parts of the release number are
+ * dropped, with whatever follows it (`rc1`, `.post1`, `.dev1`) compared exactly. Not a full PEP 440 parser (D-08).
+ */
+export function sameVersion(a: string, b: string): boolean {
+  const left = splitVersion(a);
+  const right = splitVersion(b);
+  if (left === undefined || right === undefined) return a.trim().toLowerCase() === b.trim().toLowerCase();
+  return left.release.join(".") === right.release.join(".") && left.suffix === right.suffix;
+}
+
+/**
+ * The one warning /mlx-start shows when an exact pin is configured and the installed mlx-lm is another version (D-07).
+ * Undefined when the policy floats or the two are the same release. Every part is cleaned and clipped.
+ */
+export function pinNotice(install: InstallSettings, installed: string): string | undefined {
+  if (install.version === "latest" || sameVersion(install.version, installed)) return undefined;
+  const source = install.versionSource === undefined ? "" : ` (${show(install.versionSource)})`;
+  return `mlx-lm pinned ${show(install.version)}${source}, installed ${show(installed)}; run /mlx-init to apply`;
+}
+
 /**
  * The risks in the effective merged values whose layer is not the project file (that one is refused by
  * `projectViolations` before this is asked), in the order trustRemoteCode, host, baseUrl. An empty list means

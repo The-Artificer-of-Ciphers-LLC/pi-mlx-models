@@ -14,7 +14,7 @@ import {
 } from "./config.js";
 import { cleanLabel } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
-import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult } from "./flagprobe.js";
+import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
 import { createProgress, type Progress } from "./progress.js";
 import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
@@ -29,10 +29,12 @@ import {
   formatProjectRefusal,
   initFlagSpecs,
   kvNotices,
+  pinNotice,
   prepareSettings,
   readLayerFile,
   toLaunchSpec,
   trustRisks,
+  type InstallSettings,
   type Prepared,
   type ResolvedLaunch,
   type SettingsSource,
@@ -65,6 +67,8 @@ export interface ExtensionDeps {
   settings: SettingsSource;
   /** Asks the installed mlx-lm which server flags it supports (the venv must exist). */
   probeFlags: () => Promise<ProbeResult>;
+  /** Asks the installed mlx-lm for its version only (cheap, no mlx import); used when an exact pin is configured. */
+  installedVersion: () => Promise<VersionResult>;
   /** How long session_shutdown waits for the server to stop before letting pi exit. */
   shutdownWaitMs: number;
   sleep: (ms: number) => Promise<void>;
@@ -121,13 +125,15 @@ const unrefSleep = (ms: number) =>
   });
 
 function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
+  // One probe per extension instance: its cache is keyed by the installed mlx-lm version and lives as long as the session.
+  const probe = createFlagProbe({ python: VENV_PYTHON });
   return {
     server: overrides.server ?? createMlxServer(),
     ensureInstalled: overrides.ensureInstalled ?? ensureInstalled,
     discoverModelIds: overrides.discoverModelIds ?? ((baseUrl) => discoverModelIds({ baseUrl })),
     settings: overrides.settings ?? { env: process.env, globalConfigPath: GLOBAL_CONFIG_PATH, home: homedir() },
-    // One probe per extension instance: its cache is keyed by the installed mlx-lm version and lives as long as the session.
-    probeFlags: overrides.probeFlags ?? createFlagProbe({ python: VENV_PYTHON }).probe,
+    probeFlags: overrides.probeFlags ?? probe.probe,
+    installedVersion: overrides.installedVersion ?? probe.installedVersion,
     shutdownWaitMs: overrides.shutdownWaitMs ?? 5000,
     sleep: overrides.sleep ?? unrefSleep,
   };
@@ -312,13 +318,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     initEpoch += 1;
     startInFlight = mine;
     try {
-      await runStart(pi, ctx, built.launch, mine);
+      await runStart(pi, ctx, built.launch, prepared.install, mine);
     } finally {
       if (startInFlight === mine) startInFlight = null;
     }
   }
 
-  async function runStart(pi: PiHost, ctx: any, launch: ResolvedLaunch, mine: number) {
+  async function runStart(pi: PiHost, ctx: any, launch: ResolvedLaunch, installSettings: InstallSettings, mine: number) {
     const isStale = () => startEpoch !== mine;
     const { modelId: model, presetKey } = launch.model;
     currentModel = model;
@@ -351,6 +357,17 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         },
       });
       if (isStale()) return; // stopped or superseded while installing
+
+      // An exact pin that is not what is installed is only reported: this start never upgrades or downgrades, and only
+      // /mlx-init changes the install (D-07). The cheap version query runs here, so a floating policy pays nothing.
+      if (installSettings.version !== "latest") {
+        const installed = await deps.installedVersion();
+        if (isStale()) return;
+        if (installed.ok) {
+          const mismatch = pinNotice(installSettings, installed.version);
+          if (mismatch !== undefined) ctx.ui.notify(mismatch, "warning");
+        }
+      }
 
       // Ask the installed server which of the configured optional flags it supports. Only a launch that has some
       // pays for it (a default launch is exactly as fast as before), and only now: the venv has to exist (D-18).
