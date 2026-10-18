@@ -4,6 +4,20 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 ## Unreleased
 
+### Added
+
+- **Performance options.** `server.decodeConcurrency`, `server.promptConcurrency`, `server.prefillStepSize`, `server.promptCacheSize` and `server.promptCacheBytes`, each also a `/mlx-start` flag. The concurrency flags need mlx-lm 0.30.6 and the other three 0.31.1; an older install skips them with a warning.
+- **KV cache quantization.** `server.kvBits`, `server.kvGroupSize` and `server.quantizedKvStart`, which need mlx-lm 0.32.0. A launch with `kvBits` warns that it disables batching, and says when concurrency settings then have no effect.
+- **mlx-lm version policy.** `mlxLm.version` is `latest` or an exact version, set in either file, by `PI_MLX_MODELS_MLX_LM_VERSION` or by `/mlx-init --mlx-lm-version`. `/mlx-init` installs exactly the pinned version. When the installed mlx-lm differs from the pin, `/mlx-start` warns and launches what is installed.
+- **Pip index.** `mlxLm.pipIndex`, `PI_MLX_MODELS_PIP_INDEX` and `/mlx-init --pip-index` install mlx-lm from another index. It is user-level only: a project file that sets it is refused.
+
+### Changed
+
+- `/mlx-init` now reads the layered configuration and refuses to run on an invalid file or on a project file that asks for something it may not.
+- `/mlx-start`'s first install, when there is no virtual environment yet, uses the configured index and version. An existing install still makes no network call.
+- The notice for a skipped flag names the pin when one is set: `mlx-lm is pinned to X by SOURCE; raise or remove the pin, then run /mlx-init`.
+- pip is now passed the index as one `--index-url=` argument, and its failures name the spec and the index.
+
 ## 0.2.3 - 2026-10-17
 
 ### Changed

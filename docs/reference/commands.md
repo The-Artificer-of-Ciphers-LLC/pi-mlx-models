@@ -5,15 +5,25 @@ The three commands `@taoc/pi-mlx-models` adds to pi. Settings, flags and their p
 ## `/mlx-init`
 
 ```
-/mlx-init
+/mlx-init [--pip-index url] [--mlx-lm-version latest|X]
 ```
 
-Creates or updates the local runtime: finds a Python 3.11 or newer interpreter, creates a virtual environment under `<agent dir>/pi-mlx-models/venv`, upgrades pip and installs or upgrades `mlx-lm`.
+Creates or updates the local runtime: finds a Python 3.11 or newer interpreter, creates a virtual environment under `<agent dir>/pi-mlx-models/venv`, upgrades pip and installs mlx-lm.
 
+| Flag | Meaning |
+|------|---------|
+| `--mlx-lm-version latest` | Install the newest mlx-lm, never below 0.24.0. This is the default. |
+| `--mlx-lm-version X` | Install exactly version `X`, for example `0.32.2`, upgrading or downgrading as needed. |
+| `--pip-index url` | Install from this package index instead of `https://pypi.org/simple/`. |
+
+The flags apply to that run only. What `/mlx-init` installs is decided by the same layers as other settings: the flag, then the environment (`PI_MLX_MODELS_MLX_LM_VERSION`, `PI_MLX_MODELS_PIP_INDEX`), then the project file (version only), then the global file. The rules for both values are in [mlx-lm version and install source](configuration.md#mlx-lm-version-and-install-source).
+
+- It reads the global file, the project file and the environment, and prints what it will install before it starts: `Installing mlx-lm latest (default) from https://pypi.org/simple/ (default)`. Each part names its source.
+- It refuses, and installs nothing, when a file is invalid (an unrelated bad key also stops it), when the project file sets an option that runs code, opens the network or chooses the pip index, and while a start is in progress. For the last, run `/mlx-stop` first.
+- A failure names the spec and the index, for example `Installing mlx-lm==0.31.1 from https://mirror.example/simple/ failed: ...`, followed by pip's own message.
 - Python is chosen from `PI_MLX_MODELS_PYTHON` when set, then from a list of common locations, then from `PATH`, newest version first.
 - A virtual environment built on a Python older than 3.11 is recreated.
-- It is refused while a start is in progress. Run `/mlx-stop` first.
-- `/mlx-start` installs the runtime when it is missing, but never upgrades an existing one. Use `/mlx-init` to upgrade `mlx-lm`.
+- `/mlx-start` installs the runtime only when no working install exists, and then with the same index and version setting. It never upgrades or downgrades an existing install. When the installed version is not the pinned one, `/mlx-start` says so and launches what is installed. Use `/mlx-init` to apply the pin.
 
 ## `/mlx-start`
 
@@ -33,6 +43,8 @@ Starts the local MLX server for a model, waits until it answers a completion, an
 The flags, their syntax and their precedence are in the [configuration reference](configuration.md#mlx-start-arguments).
 
 Before it starts anything, `/mlx-start` checks the arguments and the configuration. A problem is reported in one message and nothing is installed or started. It may then ask for confirmation of settings that [run code or open the network](configuration.md#settings-that-ask-for-permission).
+
+It can also show these warnings, described in the [configuration reference](configuration.md#what-a-start-shows): the installed mlx-lm is not the pinned version, a flag is skipped because the install does not support it, and, after the start message, quantized KV cache turns batching off.
 
 Starting a model while another is running replaces the running server.
 

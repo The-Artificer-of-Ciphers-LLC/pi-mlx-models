@@ -22,13 +22,16 @@ The exception is the environment. A bad environment variable is ignored with a w
 
 Opening a repository in pi is not the same as trusting it. A project file is part of that repository, so whoever wrote the repository wrote it.
 
-Three settings are dangerous in untrusted hands:
+Four settings are dangerous in untrusted hands:
 
 - `trustRemoteCode` lets a model repository run Python on your machine.
 - A non-loopback `host` makes the server reachable from your network, and it has no authentication.
 - A non-loopback `baseUrl` sends your conversations to another machine.
+- `mlxLm.pipIndex` chooses where `/mlx-init` runs `pip install` from. Whoever chooses the index chooses which code is installed on your machine.
 
-A project file may set none of them. The extension refuses the start and says where to move the setting. The same values in your own global file, or typed by you, are fine, but they ask first, at every start. A decision made once and remembered would apply to a different model the next time.
+A project file may set none of them. The extension refuses the start, or the `/mlx-init`, and says where to move the setting. The same values in your own global file, or typed by you, are fine, but they ask first, at every start. A decision made once and remembered would apply to a different model the next time.
+
+The pip index is the odd one out in one respect. It asks for no confirmation from you, because it is your own setting and `/mlx-init` always prints it before installing. A version pin is different: it only chooses among the versions of the index you configured, so a project may pin.
 
 The check looks at the project file on its own, before the layers are merged. It would be easy to say "the value is overridden anyway, so ignore it", but then removing the override later would silently activate the dangerous value. Refusing the file closes that gap.
 
@@ -41,6 +44,8 @@ The server is a Python program started from wherever pi runs. By default Python 
 ## Why the installed mlx-lm is asked what it supports
 
 New server flags arrive with new mlx-lm releases. A flag an older install does not know makes the server exit at once. Rather than require everyone to be current, the extension asks the install which flags it lists and leaves out the ones it lacks, with one warning naming them. The start still works, and the warning says how to upgrade.
+
+When you have pinned the mlx-lm version, the warning names the pin as the reason. Upgrading is not what a pinned install needs, so the notice says to raise or remove the pin and then run `/mlx-init`. The pin is never applied by `/mlx-start`: a mismatch is reported on every start, and the install changes only when you run `/mlx-init`.
 
 The check runs only when a launch uses optional flags, so a default launch is as fast as before. If the check itself fails, the extension passes everything and says so. A failed check should not become a reason to refuse a launch that might have worked.
 
