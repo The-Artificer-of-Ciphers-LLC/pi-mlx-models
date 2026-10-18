@@ -2694,15 +2694,20 @@ test("with no pin, or the word latest, the installed version is never asked and 
   }
 });
 
-test("when the installed version cannot be read there is no warning and the start goes on", async () => {
+test("when the installed version cannot be read the pin is reported as not compared and the start goes on", async () => {
   const cwd = newCwd();
   writeProject(cwd, { mlxLm: { version: "0.31.1" } });
   const h = await setup({ ctx: { cwd }, installed: async () => ({ ok: false, reason: "could not read the mlx-lm version (python exited with 1)" }) });
 
   await startMlx(h, "qwen3_4b");
 
+  const NOT_COMPARED =
+    "mlx-lm pinned 0.31.1 (project file) was not compared with the installed version: could not read the mlx-lm version (python exited with 1)";
   assert.equal(h.installedCalls, 1);
-  assert.deepEqual(warningTexts(h.notes), []);
+  assert.deepEqual(warningTexts(h.notes), [NOT_COMPARED]);
+  const warningAt = h.notes.findIndex((n) => n.message === NOT_COMPARED);
+  const startingAt = h.notes.findIndex((n) => n.message.startsWith("Starting MLX server with"));
+  assert.ok(warningAt >= 0 && startingAt > warningAt, `the warning (${warningAt}) comes before the start message (${startingAt})`);
   assert.deepEqual(errors(h.notes), []);
   assert.equal(h.server.startCalls.length, 1);
 });

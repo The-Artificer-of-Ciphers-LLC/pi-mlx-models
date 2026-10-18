@@ -15,6 +15,7 @@ import {
   initFlagSpecs,
   kvNotices,
   pinNotice,
+  pinUnreadableNotice,
   prepareSettings,
   readLayerFile,
   sameVersion,
@@ -2881,6 +2882,25 @@ test("pinNotice: with no known source the parenthesised part is left out, and un
   const shown = pinNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, `0.32.2\u001b[31m${"9".repeat(100)}`) ?? "";
   assert.ok(!shown.includes("\u001b"), "no control character reaches the notification");
   assert.ok(shown.length < 160, `clipped: ${shown.length}`);
+});
+
+test("pinUnreadableNotice: names the pin, its source and the reason, and says nothing for a floating policy", () => {
+  const reason = "could not read the mlx-lm version (python exited with 1)";
+  assert.equal(
+    pinUnreadableNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX, versionSource: "project file" }, reason),
+    "mlx-lm pinned 0.31.1 (project file) was not compared with the installed version: could not read the mlx-lm version (python exited with 1)",
+  );
+  assert.equal(
+    pinUnreadableNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, reason),
+    "mlx-lm pinned 0.31.1 was not compared with the installed version: could not read the mlx-lm version (python exited with 1)",
+  );
+  assert.equal(pinUnreadableNotice({ version: "latest", pipIndex: DEFAULT_PIP_INDEX }, reason), undefined);
+});
+
+test("pinUnreadableNotice: an escape character is removed and a long reason is clipped", () => {
+  const shown = pinUnreadableNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, `unreadable\u001b[31m${"9".repeat(100)}`) ?? "";
+  assert.ok(!shown.includes("\u001b"), "no control character reaches the notification");
+  assert.ok(shown.length < 200, `clipped: ${shown.length}`);
 });
 
 // ---- review hardening of the pip index: WR-01 credentials never shown, WR-02 one parser, WR-03 fail closed ----
