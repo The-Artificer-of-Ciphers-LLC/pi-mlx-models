@@ -204,6 +204,55 @@ test("an unreadable config.json through the real reader gives the fallback windo
   await h.stop();
 });
 
+const R1_DISTILL = MODEL_PRESETS[0];
+
+test("starting the DeepSeek-R1 distill preset registers a reasoning model with the compat flags and a 32768 output limit", { timeout: 30_000 }, async (t) => {
+  const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
+  t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
+  writeHfCache(cacheRoot, R1_DISTILL.modelId, hfFixture("deepseek-r1-distill-qwen-1.5b-4bit"));
+  const h = await harness(t, {}, {}, ALL_SUPPORTED, {
+    readModelConfig: createModelConfigReader({ cacheRoot, fetch: noNetwork, env: {} }),
+  });
+
+  await h.start("deepseek_r1_1_5b");
+
+  const models = h.providerCalls.at(-1)?.config.models;
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, R1_DISTILL.modelId);
+  assert.equal(models[0].reasoning, true);
+  assert.equal(models[0].contextWindow, 131072);
+  assert.equal(models[0].maxTokens, 32768);
+  assert.deepEqual(models[0].input, ["text"]);
+  assert.deepEqual(models[0].compat, { supportsDeveloperRole: false, supportsReasoningEffort: false });
+  const line = h.notes.find((n) => n.message.startsWith("model: "));
+  assert.ok(line, "the start shows a model line");
+  assert.ok(line.message.includes("max output 32768 (default)"), line.message);
+  assert.ok(line.message.includes("reasoning yes (preset)"), line.message);
+  await h.stop();
+});
+
+test("starting the Qwen3 preset registers a plain text-only model with 8192 and no compat property", { timeout: 30_000 }, async (t) => {
+  const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
+  t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
+  writeHfCache(cacheRoot, QWEN.modelId, hfFixture("qwen3-4b-instruct-2507-4bit"));
+  const h = await harness(t, {}, {}, ALL_SUPPORTED, {
+    readModelConfig: createModelConfigReader({ cacheRoot, fetch: noNetwork, env: {} }),
+  });
+
+  await h.start("qwen3_4b");
+
+  const models = h.providerCalls.at(-1)?.config.models;
+  assert.equal(models.length, 1);
+  assert.equal(models[0].reasoning, false);
+  assert.equal(models[0].maxTokens, 8192);
+  assert.deepEqual(models[0].input, ["text"]);
+  assert.equal("compat" in models[0], false);
+  const line = h.notes.find((n) => n.message.startsWith("model: "));
+  assert.ok(line, "the start shows a model line");
+  assert.ok(line.message.includes("reasoning no (preset)"), line.message);
+  await h.stop();
+});
+
 test("a port and log level in the global file reach the process, the provider and the start message",{ timeout: 30_000 }, async (t) => {
   const port = await freePort();
   const h = await harness(t);

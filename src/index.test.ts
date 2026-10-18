@@ -3626,7 +3626,7 @@ test("a completed start shows one model line after the registration and before t
   assert.equal(lines[0].type, "info");
   assert.equal(
     lines[0].message,
-    "model: context 262144 (config.json), max output 8192 (default), reasoning no (default), input text (default)",
+    "model: context 262144 (config.json), max output 8192 (default), reasoning no (preset), input text (default)",
   );
   const registered = h.providerCalls.at(-1)?.config.models[0];
   assert.equal(registered.contextWindow, 262144);
