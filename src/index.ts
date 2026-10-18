@@ -16,7 +16,7 @@ import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
-import { createModelConfigReader, type ReadModelConfig } from "./modelinfo.js";
+import { createModelConfigReader, deriveModelInfo, type ModelConfigRead, type ModelInfo, type ReadModelConfig } from "./modelinfo.js";
 import { createProgress, type Progress } from "./progress.js";
 import { applyRequestOverrides, type ActiveLaunch } from "./request.js";
 import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
@@ -134,17 +134,20 @@ async function pickPreset(ctx: any): Promise<ModelPreset | undefined> {
   return MODEL_PRESETS[idx];
 }
 
-function asProviderModels(ids: string[]) {
-  return ids.map((id) => ({
-    id,
-    // The id is what the server expects; only the display name is cleaned of terminal control characters.
-    name: `${cleanLabel(id)} (Local)`,
-    reasoning: false,
-    input: ["text"] as ("text" | "image")[],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 8192,
-  }));
+function asProviderModels(ids: string[], infoOf: (id: string) => ModelInfo) {
+  return ids.map((id) => {
+    const info = infoOf(id);
+    return {
+      id,
+      // The id is what the server expects; only the display name is cleaned of terminal control characters.
+      name: `${cleanLabel(id)} (Local)`,
+      reasoning: info.reasoning,
+      input: [...info.input],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: info.contextWindow,
+      maxTokens: info.maxTokens,
+    };
+  });
 }
 
 const INIT_STEPS: Record<RuntimeEvent["phase"], number> = { python: 0, venv: 1, pip: 2, "mlx-lm": 3 };
@@ -182,8 +185,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   let active: ActiveLaunch | null = null;
   /** `provider.listAllModels` of the latest launch (the ambient value before any): whether the provider lists every model the server reports. */
   let listAllModels = false;
-  /** The model the running server has loaded: set when a start becomes ready, null before any start, while one is under way and after a stop. */
-  let loaded: { id: string } | null = null;
+  /**
+   * The model the running server has loaded and what pi is told about it: set when a start becomes ready, null before any
+   * start, while one is under way and after a stop.
+   */
+  let loaded: { id: string; info: ModelInfo } | null = null;
   /** Config warnings already shown, so each distinct text appears once per extension instance. */
   const shownWarnings = new Set<string>();
   /** Whether the bad-payload notice has been shown in this extension instance (D-11). */
@@ -298,7 +304,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       baseUrl: activeBaseUrl,
       apiKey: "DUMMY",
       api: "openai-completions",
-      models: asProviderModels(modelIds),
+      // The loaded model carries the metadata read for it; any other id the server reports gets the defaults.
+      models: asProviderModels(modelIds, (id) => (loaded !== null && loaded.id === id ? loaded.info : deriveModelInfo({ id }))),
     });
   }
 
@@ -525,8 +532,19 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
       if (isStale()) return;
       active = { modelId: model, request: launch.request };
-      loaded = { id: model };
       activate(5, "Refreshing provider model list");
+      // By now the server has downloaded the model, so its config.json is normally in the cache. A reader that fails gives
+      // the fallback window and never fails the start (D-03).
+      let read: ModelConfigRead;
+      try {
+        read = await deps.readModelConfig(model, { hub: true });
+      } catch {
+        read = { ok: false, reason: "the model reader failed" };
+      }
+      if (isStale()) return;
+      // The local value, never the closure's, after an await.
+      const info = deriveModelInfo({ id: model, config: read });
+      loaded = { id: model, info };
       await registerProvider(pi, { includeFallback: true });
       if (isStale()) return;
       progress.done(5, "Provider ready");

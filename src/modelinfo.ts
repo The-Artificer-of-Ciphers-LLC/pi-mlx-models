@@ -2,6 +2,9 @@
  * What pi is told about a model: its context window, output limit, reasoning flag and input kinds, and where each value
  * came from (MOD-01). The context window is read from the model's own `config.json`.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { HF_HOME } from "./config.js";
 
 /** The context window registered for a model whose `config.json` cannot be read or holds no usable value (D-03). */
 export const FALLBACK_CONTEXT_WINDOW = 32768;
@@ -46,27 +49,128 @@ export interface ModelInfo {
   fallbackReason?: string;
 }
 
-export function contextWindowOf(_config: unknown): number | undefined {
-  return undefined;
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** `holder.max_position_embeddings` when it is an own property holding a positive safe integer. */
+const windowOf = (holder: unknown): number | undefined => {
+  if (!isRecord(holder) || !Object.hasOwn(holder, "max_position_embeddings")) return undefined;
+  const value = holder.max_position_embeddings;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+};
+
+/**
+ * The context window a `config.json` declares (D-01): `text_config.max_position_embeddings` when that is a positive safe
+ * integer (multimodal models such as gemma-4 and KAT-Coder keep it there and have no top-level value), else the top-level
+ * `max_position_embeddings`, else nothing. Only two named own properties are read, so a `__proto__` key or an inherited
+ * value changes nothing (T-05-06).
+ */
+export function contextWindowOf(config: unknown): number | undefined {
+  if (!isRecord(config)) return undefined;
+  const nested = Object.hasOwn(config, "text_config") ? windowOf(config.text_config) : undefined;
+  return nested ?? windowOf(config);
 }
 
-export function createModelConfigReader(_options: ModelConfigReaderOptions = {}): ReadModelConfig {
-  return async () => ({ ok: false, reason: "not implemented" });
+/**
+ * A Hugging Face repository id: one name, or `org/name`, of letters, digits, `.`, `_` and `-`, the first character
+ * alphanumeric. It is checked before an id is joined into any path (T-05-04): no `..` segment, no extra slash, no NUL.
+ */
+export const isHfRepoId = (id: string): boolean =>
+  id.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/.test(id);
+
+/**
+ * The Hugging Face hub cache directory the server writes to: `HF_HUB_CACHE` when it is set and not blank, else the hub
+ * folder under the `HF_HOME` the extension launches the server with, never the user's default `~/.cache/huggingface` (D-02).
+ */
+export function resolveCacheRoot(env: Record<string, string | undefined>, hfHome: string = HF_HOME): string {
+  const hubCache = env.HF_HUB_CACHE?.trim();
+  return hubCache ? hubCache : join(hfHome, "hub");
 }
 
-export function defaultMaxTokens(_contextWindow: number, _reasoning: boolean): number {
-  return 8192;
+const NOT_AN_ID = "not a Hugging Face repository id or an absolute path";
+const NOT_IN_CACHE = "not in the Hugging Face cache";
+const NOT_JSON = "config.json is not valid JSON";
+const NOT_AN_OBJECT = "config.json is not a JSON object";
+const UNREADABLE = "config.json could not be read";
+
+const parseConfig = (text: string, source: "cache" | "hub" | "path"): ModelConfigRead => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: false, reason: NOT_JSON };
+  }
+  return isRecord(parsed) ? { ok: true, config: parsed, source } : { ok: false, reason: NOT_AN_OBJECT };
+};
+
+function readFromCache(cacheRoot: string, modelId: string): ModelConfigRead {
+  const entry = join(cacheRoot, `models--${modelId.replace("/", "--")}`);
+  let revision: string;
+  try {
+    revision = readFileSync(join(entry, "refs", "main"), "utf8").trim();
+  } catch {
+    return { ok: false, reason: NOT_IN_CACHE };
+  }
+  if (!/^[0-9a-f]{40}$/.test(revision)) return { ok: false, reason: NOT_IN_CACHE };
+  let text: string;
+  try {
+    text = readFileSync(join(entry, "snapshots", revision, "config.json"), "utf8");
+  } catch {
+    return { ok: false, reason: NOT_IN_CACHE };
+  }
+  return parseConfig(text, "cache");
 }
 
-export function deriveModelInfo(_input: { id: string; config?: ModelConfigRead }): ModelInfo {
-  return {
-    contextWindow: 128000,
-    contextSource: "default",
-    maxTokens: 8192,
+/**
+ * Create the reader of a model's `config.json`: the Hugging Face cache snapshot of the model. It never throws: every
+ * outcome is a `ModelConfigRead`, and a reason never holds a path, a token or file text.
+ */
+export function createModelConfigReader(options: ModelConfigReaderOptions = {}): ReadModelConfig {
+  const cacheRoot = options.cacheRoot ?? resolveCacheRoot(options.env ?? process.env);
+  return async (modelId) => {
+    try {
+      if (!isHfRepoId(modelId)) return { ok: false, reason: NOT_AN_ID };
+      return readFromCache(cacheRoot, modelId);
+    } catch {
+      return { ok: false, reason: UNREADABLE };
+    }
+  };
+}
+
+/**
+ * The output limit pi is told when nothing else sets it (D-07): a quarter of the window, at most 8192 for a model that
+ * does not reason and 32768 for one that does, and at least 1.
+ */
+export function defaultMaxTokens(contextWindow: number, reasoning: boolean): number {
+  return Math.max(1, Math.min(reasoning ? 32768 : 8192, Math.floor(contextWindow / 4)));
+}
+
+/**
+ * Everything pi is told about one model, and where each value came from. Pure: the same read always gives the same
+ * record. Reasoning and input are the defaults here; later plans detect them and let the profile override them.
+ */
+export function deriveModelInfo(input: { id: string; config?: ModelConfigRead }): ModelInfo {
+  const { config } = input;
+  const declared = config?.ok ? contextWindowOf(config.config) : undefined;
+  const contextWindow = declared ?? FALLBACK_CONTEXT_WINDOW;
+  const reasoning = false;
+  const info: ModelInfo = {
+    contextWindow,
+    contextSource: declared === undefined ? "fallback" : "config.json",
+    maxTokens: defaultMaxTokens(contextWindow, reasoning),
     maxTokensSource: "default",
-    reasoning: false,
+    reasoning,
     reasoningSource: "default",
     input: ["text"],
     inputSource: "default",
   };
+  if (declared === undefined) {
+    info.fallbackReason =
+      config === undefined
+        ? "config.json was not read"
+        : config.ok
+          ? "config.json has no usable max_position_embeddings"
+          : config.reason;
+  }
+  return info;
 }
