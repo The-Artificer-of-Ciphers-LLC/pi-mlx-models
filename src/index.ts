@@ -22,6 +22,7 @@ import {
   deriveModelInfo,
   extrasFallbackNotice,
   fallbackNotice,
+  outputLimitNotice,
   type ModelConfigRead,
   type ModelInfo,
   type ReadModelConfig,
@@ -599,6 +600,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       // A window that could not be read is registered as the fallback and said so once per model and reason (D-03). The
       // once-per-text set means "once per model id and reason" for the life of this extension instance.
       if (info.fallbackReason !== undefined) showConfigWarnings(ctx, [fallbackNotice(model, info.fallbackReason)]);
+      // A sampling.maxTokens above the output limit pi is told about is said on every launch that has it: the condition
+      // belongs to the launch, so no once-per-text set is used (D-08). The two settings stay independent.
+      const requestedMaxTokens = launch.request.sampling.maxTokens;
+      if (typeof requestedMaxTokens === "number") {
+        const notice = outputLimitNotice(requestedMaxTokens, info);
+        if (notice !== undefined) ctx.ui.notify(notice, "warning");
+      }
       // What pi was told, and where each value came from, ahead of the ready message.
       ctx.ui.notify(describeModel(info), "info");
       progress.done(5, "Provider ready");

@@ -475,7 +475,9 @@ export function extrasFallbackNotice(count: number, reason: string): string {
  * numbers are named with the source of the limit. The source is cleaned, redacted and clipped like every shown source.
  */
 export function outputLimitNotice(requested: number, info: ModelInfo): string | undefined {
-  void requested;
-  void info;
-  return undefined;
+  if (!(requested > info.maxTokens)) return undefined;
+  return (
+    `sampling.maxTokens ${requested} is above the output limit pi is told about, ${info.maxTokens} (${shownSource(info.maxTokensSource)}); ` +
+    `pi sizes its context for ${info.maxTokens}. Set limits.maxTokens in the profile to match.`
+  );
 }
