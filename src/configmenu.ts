@@ -254,7 +254,8 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
       dialogs.notify(`Not added: ${checked.message}.`, "error");
       return undefined;
     }
-    if (!isPlausibleModelKey(checked.value)) {
+    // Only a key that would create a new entry is asked about: a key already in the file adds nothing.
+    if (!keys.includes(checked.value) && !isPlausibleModelKey(checked.value)) {
       const confirmed = await dialogs.confirm(
         `Add ${shown(checked.value)} anyway?`,
         `${shown(checked.value)} is not a preset key (${presets}), has no slash like org/name and is not a local path, so no start will use settings stored under it. A common cause is typing a profile name where the model key belongs: choose the model first, then add the profile. Yes adds it anyway. No or Esc cancels.`,

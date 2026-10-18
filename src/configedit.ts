@@ -353,8 +353,9 @@ const MAX_MODEL_KEY_LENGTH = 4096;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
 
 /**
- * A model key the user types for `models`: one line, not empty after trimming, at most 4096 characters, no control character
- * and no leading dash, the rule the settings module puts on a model id. Any other text, `__proto__` included, is a plain key.
+ * A model key the user types for `models`. This checks only the shape: one line, not empty after trimming, at most 4096
+ * characters, no control character and no leading dash. Any other text, `__proto__` included, is a plain key. Whether a key can
+ * ever match a start is a separate, advisory question answered by `isPlausibleModelKey`, which never rejects a key.
  */
 export function validateModelKey(text: string): Checked {
   const value = text.trim();
