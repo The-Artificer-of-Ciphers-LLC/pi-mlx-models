@@ -12,6 +12,7 @@ import { ensureInstalled, type RuntimeHost } from "./runtime.js";
 import { SETTINGS, initFlagSpecs } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
 import type { ModelConfigRead, ReadModelConfig } from "./modelinfo.js";
+import type { HealthProbe, ProbeHealth } from "./status.js";
 import { makeCtx, makeFakeModelConfig, makeFakePi, makeFakeRegistry, type CtxOptions } from "./testkit.js";
 
 type ProviderCall = { name: string; config: any };
@@ -128,6 +129,8 @@ async function setup(
     installed?: () => Promise<VersionResult>;
     /** What reads a model's config.json; default: a stand-in answering a 131072 window, so no test reaches the real cache. */
     readModelConfig?: ReadModelConfig;
+    /** What the health probe of /mlx-status finds; default: nothing accepts a connection. No test opens a socket. */
+    probeHealth?: ProbeHealth;
   } = {},
 ) {
   const fakeModelConfig = makeFakeModelConfig();
@@ -139,6 +142,8 @@ async function setup(
   let installedCalls = 0;
   /** How many times the extension asked the server which models it reports. */
   let discoveryCalls = 0;
+  /** Every address and base URL the extension asked the health probe about. */
+  const healthCalls: Array<{ address: { host: string; port: number }; baseUrl: string }> = [];
   const fakePi = makeFakePi();
   const fakeCtx = makeCtx(options.select, options.ctx);
   const extension = createExtension({
@@ -161,12 +166,17 @@ async function setup(
       installedCalls += 1;
       return options.installed ? options.installed() : { ok: true, version: "0.32.2" };
     },
+    probeHealth: async (address, baseUrl) => {
+      healthCalls.push({ address: { host: address.host, port: address.port }, baseUrl });
+      return options.probeHealth ? options.probeHealth(address, baseUrl) : { accepts: false, models: { answers: false } };
+    },
     ...(options.sleep ? { sleep: options.sleep } : {}),
   });
   await extension(fakePi.pi);
   return {
     server,
     installCalls,
+    healthCalls,
     ...fakePi,
     ...fakeCtx,
     get probeCalls() {
@@ -4698,4 +4708,223 @@ test("remember survives a write failure: the start still reports ready, with one
   assert.equal(h.notes.filter((n) => n.message === READY_NOTE).length, 2, "both starts reached ready");
   assert.equal(rememberWarnings(h.notes).length, 1, rememberWarnings(h.notes).join("|"));
   assert.ok(rememberWarnings(h.notes)[0].endsWith("/mlx-last keeps using the previous one."), rememberWarnings(h.notes)[0]);
+});
+
+// ---- /mlx-status: health states, a start in flight, a server this session did not start, refusals (plan 06-08: CMD-03, D-08 to D-12) ----
+
+const PROBE_ANSWERS = (ids: string[] = [QWEN_ID]): HealthProbe => ({ accepts: true, models: { answers: true, ids } });
+const PROBE_SILENT: HealthProbe = { accepts: true, models: { answers: false } };
+const PROBE_NOTHING: HealthProbe = { accepts: false, models: { answers: false } };
+const FAST_REQUEST_ONLY = {
+  models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2, repetitionPenalty: 1.1 } } } } },
+};
+const statusCommand = (h: Harness, args = "") => h.commands.get("mlx-status")!(args, h.ctx);
+/** Runs /mlx-status and returns the one notice it added. */
+async function statusBlock(h: Harness, args = ""): Promise<string> {
+  const before = h.notes.length;
+  await statusCommand(h, args);
+  const added = h.notes.slice(before);
+  assert.equal(added.length, 1, JSON.stringify(added));
+  assert.equal(added[0].type, "info");
+  return added[0].message;
+}
+const linesOf = (block: string) => block.split("\n");
+
+test("mlx-status takes no arguments: a model or a flag is an error and the probe is not called", async () => {
+  const h = await setup({ probeHealth: async () => PROBE_ANSWERS() });
+
+  await statusCommand(h, "extra");
+  await statusCommand(h, "--port 1");
+
+  const messages = errors(h.notes);
+  assert.equal(messages.length, 2);
+  for (const message of messages) assert.ok(message.startsWith("mlx-status failed:"), message);
+  assert.ok(messages[0].includes("takes no model"), messages[0]);
+  assert.ok(messages[1].includes("unknown flag --port"), messages[1]);
+  assert.equal(h.healthCalls.length, 0);
+});
+
+test("mlx-status reports ready with the start's own profile, flags, request and model lines", async () => {
+  const { h } = await lastSetup({ global: FAST_REQUEST_ONLY, setup: { probeHealth: async () => PROBE_ANSWERS() } });
+  await startMlx(h, "qwen3_4b --profile fast");
+  assert.deepEqual(errors(h.notes), []);
+  const startLines = linesOf(startingNotes(h.notes)[0]).slice(1);
+  assert.ok(startLines.length >= 3, "premise: the start shows a profile, a flags and a request line");
+  const modelNote = h.notes.find((n) => n.message.startsWith("model: "));
+  assert.ok(modelNote, "premise: the start shows a model line");
+
+  const block = await statusBlock(h);
+
+  assert.ok(block.startsWith("status: ready"), block);
+  for (const line of startLines) assert.ok(linesOf(block).includes(line), `missing "${line}" in ${block}`);
+  assert.ok(linesOf(block).includes(modelNote.message), block);
+  assert.ok(block.includes("preset qwen3_4b"), block);
+  assert.ok(block.includes(":8080"), block);
+});
+
+test("mlx-status says loading during a start even when /v1/models answers, and ready after it", async () => {
+  const gate = deferred();
+  const { h } = await lastSetup({
+    setup: {
+      probeHealth: async () => PROBE_ANSWERS(),
+      server: {
+        start: async () => {
+          await gate.promise;
+        },
+      },
+    },
+  });
+
+  const starting = startMlx(h, "qwen3_4b");
+  await flush();
+  assert.equal(h.server.startCalls.length, 1, "premise: server.start is in flight");
+  const during = await statusBlock(h);
+  gate.resolve();
+  await starting;
+  const after = await statusBlock(h);
+
+  assert.ok(during.startsWith("status: loading"), during);
+  assert.ok(during.includes("a start is under way"), during);
+  assert.ok(after.startsWith("status: ready"), after);
+});
+
+test("mlx-status says loading when the finished start's server accepts without answering", async () => {
+  let probe: HealthProbe = PROBE_ANSWERS();
+  const { h } = await lastSetup({ setup: { probeHealth: async () => probe } });
+  await startMlx(h, "qwen3_4b");
+  probe = PROBE_SILENT;
+
+  const block = await statusBlock(h);
+
+  assert.ok(block.startsWith("status: loading"), block);
+  assert.ok(block.includes("busy or not answering yet"), block);
+});
+
+test("mlx-status says down when nothing accepts a connection on the launch's address", async () => {
+  let probe: HealthProbe = PROBE_ANSWERS();
+  const { h } = await lastSetup({ setup: { probeHealth: async () => probe } });
+  await startMlx(h, "qwen3_4b");
+  probe = PROBE_NOTHING;
+
+  const block = await statusBlock(h);
+
+  assert.ok(block.startsWith("status: down"), block);
+});
+
+test("mlx-status for a server this session did not start: its port, health and ids, with the profile and flags unknown", async () => {
+  const { h } = await lastSetup({ global: { server: { port: 9300 } }, setup: { probeHealth: async () => PROBE_ANSWERS(["org/a", "org/b"]) } });
+
+  const block = await statusBlock(h);
+
+  assert.equal(h.healthCalls.length, 1);
+  assert.equal(h.healthCalls[0].address.port, 9300);
+  assert.ok(h.healthCalls[0].baseUrl.includes(":9300"), h.healthCalls[0].baseUrl);
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes(":9300"), block);
+  assert.ok(block.includes("not started by this session"), block);
+  assert.ok(block.includes("org/a") && block.includes("org/b"), block);
+  assert.ok(linesOf(block).includes("profile: unknown"), block);
+  assert.ok(linesOf(block).includes("flags: unknown"), block);
+  assert.equal(linesOf(block).some((line) => line.startsWith("model: ")), false, "no model line is shown");
+  assert.ok(block.includes("the model line is not shown"), block);
+  assert.deepEqual(h.server.startCalls, []);
+});
+
+test("mlx-status for a server this session did not start that accepts without answering says not answering", async () => {
+  const { h } = await lastSetup({ global: { server: { port: 9300 } }, setup: { probeHealth: async () => PROBE_SILENT } });
+
+  const block = await statusBlock(h);
+
+  assert.ok(block.startsWith("status: not answering"), block);
+});
+
+test("mlx-status takes its address from the environment when no session launch exists", async () => {
+  const h = await setup({ env: { PI_MLX_MODELS_PORT: "9301" }, probeHealth: async () => PROBE_ANSWERS() });
+
+  await statusBlock(h);
+
+  assert.equal(h.healthCalls[0].address.port, 9301);
+});
+
+test("mlx-status takes its address from the project file over the global file, as a start would", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { port: 9302 } });
+  const { h } = await lastSetup({ global: { server: { port: 9300 } }, setup: { ctx: { cwd }, probeHealth: async () => PROBE_ANSWERS() } });
+
+  const block = await statusBlock(h);
+
+  assert.equal(h.healthCalls[0].address.port, 9302);
+  assert.ok(block.includes(":9302"), block);
+});
+
+test("mlx-status refuses an invalid configuration before any connection", async () => {
+  const { h } = await lastSetup({ global: { server: { port: "eighty" } }, setup: { probeHealth: async () => PROBE_ANSWERS() } });
+
+  await statusCommand(h);
+
+  const messages = errors(h.notes);
+  assert.equal(messages.length, 1, JSON.stringify(h.notes));
+  assert.ok(messages[0].startsWith("mlx-status failed: invalid configuration"), messages[0]);
+  assert.equal(h.healthCalls.length, 0);
+});
+
+test("mlx-status refuses a project file that asks for trustRemoteCode before any connection", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { trustRemoteCode: true } });
+  const { h, settings } = await lastSetup({ setup: { ctx: { cwd }, probeHealth: async () => PROBE_ANSWERS() } });
+
+  await statusCommand(h);
+
+  assert.deepEqual(errors(h.notes), [
+    refusalText(settings, ["  server.trustRemoteCode: lets the model repository run Python code"]).replace(/^mlx-start failed:/, "mlx-status failed:"),
+  ]);
+  assert.equal(h.healthCalls.length, 0);
+});
+
+test("mlx-status refuses a project file that points the server at another host, so a cloned project cannot choose where it connects", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { host: "10.1.2.3", port: 9303 } });
+  const { h } = await lastSetup({ setup: { ctx: { cwd }, probeHealth: async () => PROBE_ANSWERS() } });
+
+  await statusCommand(h);
+
+  const messages = errors(h.notes);
+  assert.equal(messages.length, 1, JSON.stringify(h.notes));
+  assert.ok(messages[0].startsWith("mlx-status failed:"), messages[0]);
+  assert.equal(h.healthCalls.length, 0);
+});
+
+test("mlx-status cleans what a server says: escapes, credentials and length are removed and the list is capped at 10", async () => {
+  const hostile = ["\u001b[31mred\u001b[0m", "https://user:hunter2@example.com/model", "x".repeat(500)];
+  const others = Array.from({ length: 22 }, (_, i) => `m${i + 1}`);
+  const { h } = await lastSetup({ global: { server: { port: 9300 } }, setup: { probeHealth: async () => PROBE_ANSWERS([...hostile, ...others]) } });
+
+  const block = await statusBlock(h);
+
+  assert.equal(block.includes("\u001b"), false, "no escape sequence reaches the notice");
+  assert.equal(block.includes("hunter2"), false, "no password reaches the notice");
+  assert.equal(block.includes("x".repeat(200)), false, "an id is clipped");
+  assert.ok(block.includes("and 15 more"), block);
+  assert.equal(block.includes("m8"), false, "only the first ten ids are listed");
+});
+
+test("mlx-status is read only: it registers nothing, sets no status and reads no model configuration or discovery", async () => {
+  const h = await setup({ probeHealth: async () => PROBE_ANSWERS(["org/a"]) });
+  const providers = h.providerCalls.length;
+  const statuses = h.statuses.length;
+  const discoveries = h.discoveryCalls;
+  const reads = h.readCalls.length;
+
+  const first = await statusBlock(h);
+  const second = await statusBlock(h);
+
+  assert.equal(first, second);
+  assert.equal(h.providerCalls.length, providers);
+  assert.equal(h.statuses.length, statuses);
+  assert.equal(h.discoveryCalls, discoveries);
+  assert.equal(h.readCalls.length, reads);
+  assert.equal(h.installCalls.length, 0);
+  assert.deepEqual(h.server.startCalls, []);
+  assert.equal(h.server.stopCalls, 0);
+  assert.deepEqual(h.widgets, []);
 });
