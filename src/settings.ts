@@ -851,6 +851,13 @@ export interface PrepareInput {
   env: Record<string, string | undefined>;
   piFlags?: Record<string, string | undefined>;
   args?: Record<string, string | true>;
+  /**
+   * Only the extension-load path may set this. The install rows (the `mlxLm` block) are not read from any layer, not
+   * resolved and not checked, so a bad pip index or pin produces no problem and no warning and cannot hide the
+   * provider URL and the default model. The result's `install` then holds the defaults and `sources` has no install
+   * entry, so a caller that sets it must never install from the result.
+   */
+  ignoreInstall?: boolean;
 }
 
 export interface LaunchFlag {

@@ -2962,3 +2962,54 @@ test("a global file whose baseUrl is 200000 slashes is refused at once: nothing 
   assert.equal(result.ok, false);
   assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
 });
+
+// ---- the extension-load resolution leaves the install rows out (plan 03-07, WR-02, T-03-27, T-03-28) ----
+
+test("ignoreInstall: a bad PI_MLX_MODELS_PIP_INDEX refuses as before, and with the option the other settings still apply", () => {
+  const env = { PI_MLX_MODELS_PIP_INDEX: "http://example.com/simple/", PI_MLX_MODELS_PORT: "9001" };
+  const refusedResult = resolve({ env });
+  assert.equal(refusedResult.ok, false, "without the option the bad index refuses");
+  assert.ok(!refusedResult.ok && refusedResult.errors.some((line) => line.includes("PI_MLX_MODELS_PIP_INDEX")), JSON.stringify(refusedResult));
+
+  const { prepared, warnings } = resolved({ env, ignoreInstall: true });
+  assert.equal(prepared.address.port, 9001);
+  assert.deepEqual(warnings, []);
+  assert.equal(prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+  assert.equal(prepared.sources.has("mlxLm.pipIndex"), false, "no install entry in the sources");
+
+  const version = { PI_MLX_MODELS_MLX_LM_VERSION: "^0.32" };
+  assert.equal(resolved({ env: version }).warnings.length, 1, "without the option a bad pin variable warns");
+  assert.deepEqual(resolved({ env: version, ignoreInstall: true }).warnings, []);
+});
+
+test("ignoreInstall: a bad mlxLm.pipIndex and mlxLm.version in the global file refuse as before, and with the option the file's other values apply", () => {
+  const global = ok({ baseUrl: "http://127.0.0.1:9100/v1", mlxLm: { pipIndex: "http://example.com/simple/", version: "^0.32" } });
+  const refusedResult = resolve({ global });
+  assert.equal(refusedResult.ok, false);
+  const errorLines = refusedResult.ok ? [] : refusedResult.errors;
+  assert.equal(errorLines.length, 2, JSON.stringify(errorLines));
+  assert.ok(errorLines.some((line) => line.startsWith("mlxLm.pipIndex")), JSON.stringify(errorLines));
+  assert.ok(errorLines.some((line) => line.startsWith("mlxLm.version")), JSON.stringify(errorLines));
+
+  const { prepared } = resolved({ global, ignoreInstall: true });
+  assert.equal(prepared.baseUrl, "http://127.0.0.1:9100/v1");
+  assert.equal(prepared.install.version, "latest");
+  assert.equal(prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+});
+
+test("ignoreInstall is not general leniency: the performance and KV rows resolve and validate as before (SRV-04, SRV-05)", () => {
+  const { prepared } = resolved({ global: ok({ server: { kvBits: 4, decodeConcurrency: 2 } }), ignoreInstall: true });
+  const args = prepared.flags.flatMap((flag) => flag.args);
+  assert.ok(args.includes("--decode-concurrency=2"), JSON.stringify(args));
+  assert.ok(args.includes("--kv-bits=4"), JSON.stringify(args));
+
+  const bad = resolve({ global: ok({ server: { kvBits: 9 } }), ignoreInstall: true });
+  assert.equal(bad.ok, false);
+  assert.ok(!bad.ok && bad.errors.some((line) => line.startsWith("server.kvBits")), JSON.stringify(bad));
+});
+
+test("ignoreInstall still reports a typo inside the mlxLm block as an unknown key that suggests the right one", () => {
+  const result = resolve({ global: ok({ mlxLm: { pipindex: "https://mirror.example/simple/" } }), ignoreInstall: true });
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.errors.some((line) => line.includes("unknown key") && line.includes("mlxLm.pipIndex")), JSON.stringify(result));
+});

@@ -2764,3 +2764,36 @@ test("an existing install makes exactly one host call, the import check, even wh
   assert.deepEqual(warningTexts(h.notes), ["mlx-lm pinned 0.31.1 (global file), installed 0.32.2; run /mlx-init to apply"]);
   assert.equal(h.server.startCalls.length, 1);
 });
+
+// ---- a bad install-only setting does not change the provider pi registers at load; the install commands still refuse (plan 03-07, WR-02, T-03-27, T-03-28) ----
+
+test("a bad PI_MLX_MODELS_PIP_INDEX leaves the provider on PI_MLX_MODELS_BASE_URL, and /mlx-init and /mlx-start still refuse naming it", async () => {
+  const env = { PI_MLX_MODELS_PIP_INDEX: "http://example.com/simple/", PI_MLX_MODELS_BASE_URL: "http://127.0.0.1:9000/v1" };
+  const loaded = await setup({ env });
+  assert.equal(loaded.providerCalls[0].config.baseUrl, "http://127.0.0.1:9000/v1");
+
+  const init = await setup({ env });
+  await init.commands.get("mlx-init")!("", init.ctx);
+  assert.equal(errors(init.notes).length, 1, errors(init.notes).join("|"));
+  assert.ok(errors(init.notes)[0].includes("PI_MLX_MODELS_PIP_INDEX"), errors(init.notes)[0]);
+  assertNothingHappened(init);
+
+  const start = await setup({ env });
+  await startMlx(start, "qwen3_4b");
+  assert.equal(errors(start.notes).length, 1, errors(start.notes).join("|"));
+  assert.ok(errors(start.notes)[0].includes("PI_MLX_MODELS_PIP_INDEX"), errors(start.notes)[0]);
+  assertNothingHappened(start);
+});
+
+test("a bad mlxLm.version in the global file leaves the provider on the file's baseUrl, and /mlx-init still refuses naming it", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { baseUrl: "http://127.0.0.1:9100/v1", mlxLm: { version: "^0.32" } });
+  const loaded = await setup({ settings });
+  assert.equal(loaded.providerCalls[0].config.baseUrl, "http://127.0.0.1:9100/v1");
+
+  await loaded.commands.get("mlx-init")!("", loaded.ctx);
+  assert.equal(errors(loaded.notes).length, 1, errors(loaded.notes).join("|"));
+  assert.ok(errors(loaded.notes)[0].includes("mlxLm.version"), errors(loaded.notes)[0]);
+  assert.equal(loaded.installCalls.length, 0, "nothing was installed");
+  assert.deepEqual(loaded.server.startCalls, []);
+});
