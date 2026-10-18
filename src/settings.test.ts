@@ -3555,7 +3555,9 @@ test("describeProfile words the profile line, and is empty for a launch without 
   assert.equal(describeProfile(launchWith({ global: FAST_FILE() }, {})), "");
 });
 
-test("limits is reserved: an empty limits object is accepted and changes nothing", () => {
+// ---- profile limits (MOD-02, MOD-03): plan 05-05 ----
+
+test("an empty limits object is accepted and changes nothing", () => {
   const plain = launchWith({ global: FAST_FILE() }, FAST);
   const withLimits = launchWith(
     { global: ok({ models: { qwen3_4b: { profiles: { fast: { ...FAST_PROFILE, limits: {} } } } } }) },
@@ -3565,12 +3567,18 @@ test("limits is reserved: an empty limits object is accepted and changes nothing
   assert.deepEqual(withLimits.request, plain.request);
 });
 
-test("a key inside limits is refused: limits is reserved and accepts no keys yet", () => {
-  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { limits: { contextWindow: 1 } } } } } }) });
+test("a key that limits does not define is an unknown key with no hint, and the reserved wording is gone", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { limits: { thinkingTokens: 1 } } } } } }) });
   assert.ok(!result.ok);
-  assert.deepEqual(result.errors, [
-    'models["qwen3_4b"].profiles["fast"].limits.contextWindow (global config.json): unknown key (limits is reserved and accepts no keys yet)',
-  ]);
+  assert.deepEqual(result.errors, ['models["qwen3_4b"].profiles["fast"].limits.thinkingTokens (global config.json): unknown key']);
+});
+
+test("a profile's limits.maxTokens and limits.reasoning land on launch.limits with the profile as their label", () => {
+  const file = ok({ models: { qwen3_4b: { profiles: { fast: { limits: { maxTokens: 4096, reasoning: false } } } } } });
+  assert.deepEqual(launchWith({ global: file }, FAST).limits, {
+    maxTokens: { value: 4096, label: "profile fast" },
+    reasoning: { value: false, label: "profile fast" },
+  });
 });
 
 test("limits that is not an object is refused with the usual object line", () => {

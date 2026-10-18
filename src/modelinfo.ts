@@ -75,6 +75,20 @@ export interface ModelInfo {
   fallbackReason?: string;
 }
 
+/** A value a profile sets for a model, and the label of where it came from (`profile NAME`). */
+export interface LimitValue<T> {
+  value: T;
+  label: string;
+}
+
+/** What a profile's `limits` object tells pi about a model (D-10); each entry is present only when the profile sets it. */
+export interface LaunchLimits {
+  contextWindow?: LimitValue<number>;
+  maxTokens?: LimitValue<number>;
+  reasoning?: LimitValue<boolean>;
+  input?: LimitValue<InputKind[]>;
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -382,7 +396,7 @@ export function defaultMaxTokens(contextWindow: number, reasoning: boolean): num
  * record. The reasoning flag is the preset's when the id is a preset's model id, else the curated name rule's (D-04);
  * input is text for every model (D-05). A later plan lets the profile override both.
  */
-export function deriveModelInfo(input: { id: string; config?: ModelConfigRead }): ModelInfo {
+export function deriveModelInfo(input: { id: string; config?: ModelConfigRead; limits?: LaunchLimits }): ModelInfo {
   const { config } = input;
   const declared = config?.ok ? contextWindowOf(config.config) : undefined;
   const contextWindow = declared ?? FALLBACK_CONTEXT_WINDOW;

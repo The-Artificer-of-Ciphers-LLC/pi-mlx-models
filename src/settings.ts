@@ -2,6 +2,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import type { LaunchLimits } from "./modelinfo.js";
 import type { RequestOverrides, SamplingValues } from "./request.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
 import type { CliFlagSpec } from "./startargs.js";
@@ -1569,6 +1570,8 @@ export interface ResolvedLaunch {
   request: RequestOverrides;
   /** The request-only sampling values with their layer, in schema order, for the `request:` line of the start message. */
   requestNotes: RequestNote[];
+  /** What the profile tells pi about the model (D-10); never part of the flags or the request, and `{}` without a profile. */
+  limits: LaunchLimits;
   /** The profile this launch applies and where its name came from; absent for a launch without one (D-06). */
   profile?: { name: string; source: string };
 }
@@ -1812,6 +1815,7 @@ export function buildLaunch(
       flags: [...prepared.flags, ...modelFlags],
       request,
       requestNotes,
+      limits: {},
       ...(selected === undefined ? {} : { profile: { name: selected, source } }),
     },
   };

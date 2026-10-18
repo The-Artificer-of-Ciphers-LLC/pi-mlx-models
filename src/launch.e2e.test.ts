@@ -253,6 +253,51 @@ test("starting the Qwen3 preset registers a plain text-only model with 8192 and 
   await h.stop();
 });
 
+const KAT_CODER_ID = "mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit";
+
+test("a KAT-Coder profile with limits.reasoning and limits.maxTokens registers a reasoning model with that output limit, and the server gets no --max-tokens", { timeout: 30_000 }, async (t) => {
+  const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
+  t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
+  writeHfCache(cacheRoot, KAT_CODER_ID, hfFixture("kat-coder-v2.5-dev-optiq-4bit"));
+  const port = await freePort();
+  const h = await harness(t, {}, {}, ALL_SUPPORTED, {
+    readModelConfig: createModelConfigReader({ cacheRoot, fetch: noNetwork, env: {} }),
+  });
+  h.writeConfig({
+    server: { port },
+    models: {
+      [KAT_CODER_ID]: {
+        profiles: { think: { limits: { reasoning: true, maxTokens: 16384 }, chatTemplateArgs: { enable_thinking: true } } },
+      },
+    },
+  });
+
+  await h.start(`${KAT_CODER_ID} --profile think`);
+
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  assert.ok(h.notes.some((n) => n.message.startsWith("MLX server is ready for prompts. Use /model and pick pi-mlx-models/")));
+  const models = h.providerCalls.at(-1)?.config.models;
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, KAT_CODER_ID);
+  assert.equal(models[0].contextWindow, 262144);
+  assert.equal(models[0].reasoning, true);
+  assert.equal(models[0].maxTokens, 16384);
+  assert.deepEqual(models[0].input, ["text"]);
+  assert.deepEqual(models[0].compat, { supportsDeveloperRole: false, supportsReasoningEffort: false });
+  const line = h.notes.find((n) => n.message.startsWith("model: "));
+  assert.ok(line, "the start shows a model line");
+  assert.ok(line.message.includes("max output 16384 (profile think)"), line.message);
+  assert.ok(line.message.includes("reasoning yes (profile think)"), line.message);
+  assert.ok(line.message.includes("context 262144 (config.json)"), line.message);
+  const argv = h.argv();
+  assert.ok(argv.includes('--chat-template-args={"enable_thinking":true}'), JSON.stringify(argv));
+  assert.equal(argv.some((arg) => arg.startsWith("--max-tokens")), false, JSON.stringify(argv));
+  const payload = { model: KAT_CODER_ID, messages: [{ role: "user", content: "hi" }], max_completion_tokens: 8192 };
+  const rewritten = (await h.runHook(payload, PROVIDER_ID, KAT_CODER_ID)) as Record<string, unknown>;
+  assert.equal(rewritten.max_completion_tokens, 8192);
+  await h.stop();
+});
+
 test("a port and log level in the global file reach the process, the provider and the start message",{ timeout: 30_000 }, async (t) => {
   const port = await freePort();
   const h = await harness(t);
