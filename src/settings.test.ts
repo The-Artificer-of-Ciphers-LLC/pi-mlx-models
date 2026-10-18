@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_MODEL_ID } from "./config.js";
+import { DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX } from "./config.js";
 import {
   PI_FLAGS,
   SETTINGS,
@@ -2644,4 +2644,24 @@ test("a typed mlxLm.version is labelled with the /mlx-init spelling, failing or 
   assert.deepEqual(refused({ args: { "mlxLm.version": "^0.32" } }), [pinLine('"^0.32"', "/mlx-init --mlx-lm-version")]);
   const { prepared } = resolved({ args: { "mlxLm.version": "0.31.1" } });
   assert.equal(prepared.install.versionSource, "/mlx-init");
+});
+
+// ---- pip index (RUN-04) ----
+
+test("mlxLm.pipIndex from the global file is kept verbatim and labelled global file", () => {
+  const { prepared, warnings } = resolved({ global: ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" } }) });
+  assert.equal(prepared.install.pipIndex, "https://mirror.example/simple/");
+  assert.equal(prepared.install.pipIndexSource, "global file");
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(prepared.flags, [], "the index is not a server flag");
+});
+
+test("with no layer setting it the pip index is the default and has no source", () => {
+  const { prepared } = resolved({});
+  assert.equal(prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+  assert.equal(prepared.install.pipIndexSource, undefined);
+});
+
+test("a typo of pipIndex inside the mlxLm block is an unknown key that names mlxLm.pipIndex", () => {
+  assert.equal(unknownLine({ mlxLm: { pipindex: "https://mirror.example/simple/" } }), `mlxLm.pipindex (${GLOBAL}): unknown key (did you mean mlxLm.pipIndex?)`);
 });

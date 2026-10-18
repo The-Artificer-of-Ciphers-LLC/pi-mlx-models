@@ -2455,3 +2455,32 @@ test("mlx-init says which mlx-lm version and index it uses and where each came f
   await filed.commands.get("mlx-init")!("", filed.ctx);
   assert.ok(infos(filed.notes).includes("Installing mlx-lm 0.32.2 (global file) from https://pypi.org/simple/ (default)"), infos(filed.notes).join("|"));
 });
+
+// ---- the pip index reaches pip through /mlx-init (plan 03-04, RUN-04) ----
+
+const MIRROR = "https://mirror.example/simple/";
+
+test("a mirror in the global file is the only index in both pip steps, as one element each", async () => {
+  const h = await setupRealInstall({ mlxLm: { pipIndex: MIRROR } });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  const mirrorArg = `--index-url=${MIRROR}`;
+  assert.deepEqual(
+    h.hostCalls.filter((call) => call.includes("pip")),
+    [
+      [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "pip", mirrorArg],
+      [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "mlx-lm>=0.24.0", mirrorArg],
+    ],
+  );
+  assert.ok(!h.hostCalls.flat().some((element) => element.includes("pypi.org")), "no element names the default index");
+  assert.deepEqual(errors(h.notes), []);
+});
+
+test("mlx-init shows the configured index and where it came from in its progress line", async () => {
+  const h = await setupRealInstall({ mlxLm: { pipIndex: MIRROR } });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.ok(infos(h.notes).includes(`Installing mlx-lm latest (default) from ${MIRROR} (global file)`), infos(h.notes).join("|"));
+});
