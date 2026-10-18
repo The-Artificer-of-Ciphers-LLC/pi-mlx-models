@@ -4,7 +4,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { VENV_DIR, VENV_PYTHON } from "./config.js";
-import { ensureInstalled, findPython, pythonCandidates, run, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
+import { ensureInstalled, findPython, pythonCandidates, run, runtimeInstalled, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
 
 function fakeHost(overrides: Partial<RuntimeHost> & { venv?: boolean } = {}) {
   const calls: string[][] = [];
@@ -503,4 +503,83 @@ test("pip's own output does not replace the index in either pip step's progress 
     }
   }
   assert.ok(fromPip("mlx-lm")[0].detail?.includes("mlx-lm==0.31.1"));
+});
+
+// ---- runtimeInstalled: the one answer to "has /mlx-init been run" (plan 06-03, D-27) ----
+
+test("runtimeInstalled: a host without the venv Python is not installed and nothing is run", async () => {
+  const { host, calls } = fakeHost({ venv: false });
+  assert.equal(await runtimeInstalled(host), false);
+  assert.deepEqual(calls, []);
+});
+
+test("runtimeInstalled: the venv Python that imports mlx_lm is installed, with one fixed command", async () => {
+  const { host, calls } = fakeHost({ venv: true });
+  assert.equal(await runtimeInstalled(host), true);
+  assert.deepEqual(calls, [[VENV_PYTHON, "-c", "import mlx_lm"]]);
+});
+
+test("runtimeInstalled: a run that rejects is not installed", async () => {
+  const { host } = fakeHost({
+    venv: true,
+    run: async () => {
+      throw new Error("No module named mlx_lm");
+    },
+  });
+  assert.equal(await runtimeInstalled(host), false);
+});
+
+test("runtimeInstalled: a run that throws before it returns a promise is not installed", async () => {
+  const { host } = fakeHost({
+    venv: true,
+    run: () => {
+      throw new Error("spawn failed");
+    },
+  });
+  assert.equal(await runtimeInstalled(host), false);
+});
+
+test("runtimeInstalled: an exists that throws is not installed and nothing is run", async () => {
+  const { host, calls } = fakeHost({
+    exists: () => {
+      throw new Error("EACCES");
+    },
+  });
+  assert.equal(await runtimeInstalled(host), false);
+  assert.deepEqual(calls, []);
+});
+
+test("runtimeInstalled: is callable with no argument, which means the system host", () => {
+  assert.equal(typeof runtimeInstalled, "function");
+  assert.equal(runtimeInstalled.length, 0, "the host parameter has a default");
+});
+
+test("runtimeInstalled: ensureInstalled with an installed runtime still reports it and never looks for Python", async () => {
+  const { host, calls } = fakeHost({
+    venv: true,
+    findPython: () => {
+      throw new Error("findPython must not be called");
+    },
+  });
+  const events: RuntimeEvent[] = [];
+  await ensureInstalled({ host, onEvent: (e) => events.push(e) });
+  assert.deepEqual(calls, [[VENV_PYTHON, "-c", "import mlx_lm"]]);
+  assert.deepEqual(events, [{ phase: "mlx-lm", state: "done", detail: "mlx-lm already installed" }]);
+});
+
+test("runtimeInstalled: ensureInstalled with upgrade does not ask whether the venv exists up front", async () => {
+  let existsCalls = 0;
+  const { host } = fakeHost({
+    exists: () => {
+      existsCalls += 1;
+      return true;
+    },
+  });
+  // The pip steps and the venv step still look at the venv; the short cut must not add a call of its own.
+  await ensureInstalled({ host, upgrade: true });
+  const withUpgrade = existsCalls;
+  existsCalls = 0;
+  await ensureInstalled({ host });
+  assert.equal(withUpgrade, 1, "only the venv step asks");
+  assert.equal(existsCalls, 1, "the short cut asks once and an installed runtime stops there");
 });

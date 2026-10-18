@@ -128,6 +128,10 @@ export const systemHost: RuntimeHost = {
   run,
 };
 
+export async function runtimeInstalled(_host: RuntimeHost = systemHost): Promise<boolean> {
+  throw new Error("not implemented");
+}
+
 /** Minor version of the venv's own interpreter, or null when it cannot be run or its output is not a Python 3 version. */
 async function venvPythonMinor(host: RuntimeHost): Promise<number | null> {
   let minor: number | null = null;
