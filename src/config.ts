@@ -138,7 +138,7 @@ export const DATA_DIR = join(
   }),
   "pi-mlx-models",
 );
-/** The user-level config file. Read on every /mlx-start; never created by the extension. */
+/** The user-level config file. Read on every command; created only by /mlx-config, on the user's first confirmed edit. */
 export const GLOBAL_CONFIG_PATH = join(DATA_DIR, "config.json");
 export const VENV_DIR = join(DATA_DIR, "venv");
 export const VENV_PYTHON = join(VENV_DIR, "bin", "python3");

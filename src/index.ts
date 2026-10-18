@@ -12,6 +12,7 @@ import {
   VENV_PYTHON,
   deriveBaseUrl,
 } from "./config.js";
+import { runConfigMenu } from "./configmenu.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
@@ -65,7 +66,7 @@ const PROGRESS_WIDGET = "mlx-progress";
 type LaunchCommand = "mlx-start" | "mlx-last" | "mlx-restart";
 
 /** Every command whose failures and refusals are worded by `failed`: the launch commands and the read-only ones. Constants only. */
-type CommandName = LaunchCommand | "mlx-status";
+type CommandName = LaunchCommand | "mlx-status" | "mlx-config";
 
 /** The text of a refused or failed launch of `command`. The only place a command name is joined to a failure message. */
 const failed = (command: CommandName, text: string): string => `${command} failed: ${text}`;
@@ -1116,6 +1117,26 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           served: probe.models.answers ? probe.models.ids : [],
         };
         ctx.ui.notify(formatStatus(view), "info");
+      },
+    });
+
+    pi.registerCommand("mlx-config", {
+      description: "View and edit the global config file and its profiles in a menu. Edits take effect on the next start; no arguments",
+      handler: async (args, ctx) => {
+        // No arguments: nothing typed here can name a key, a value or a path (D-17, T-06-31). Refused before the menu opens.
+        const parsed = parseStartArgs(args ?? "", [], { command: "/mlx-config", takesModel: false });
+        if (!parsed.ok) {
+          ctx.ui.notify(failed("mlx-config", parsed.error), "error");
+          return;
+        }
+        // Only the global file is handed over, so no project file is offered or written (D-18). The command never starts, stops
+        // or restarts anything (D-22); `serverRunning` only decides whether a saved notice points to /mlx-restart.
+        await runConfigMenu({
+          ui: ctx.ui,
+          hasUI: ctx.hasUI === true,
+          path: deps.settings.globalConfigPath,
+          serverRunning: launchRecord !== null,
+        });
       },
     });
 
