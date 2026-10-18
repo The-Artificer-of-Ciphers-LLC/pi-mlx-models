@@ -2635,9 +2635,12 @@ test("the project file may set mlxLm.version: it is not a project violation", ()
   assert.equal(prepared.install.versionSource, "project file");
 });
 
-test("initFlagSpecs lists only --mlx-lm-version and /mlx-start has no such flag", () => {
-  assert.deepEqual(initFlagSpecs(), [{ flag: "--mlx-lm-version", path: "mlxLm.version", takesValue: true }]);
-  assert.ok(!cliFlagSpecs().some((spec) => spec.flag === "--mlx-lm-version"));
+test("initFlagSpecs lists only --mlx-lm-version and --pip-index and /mlx-start has neither", () => {
+  assert.deepEqual(initFlagSpecs(), [
+    { flag: "--mlx-lm-version", path: "mlxLm.version", takesValue: true },
+    { flag: "--pip-index", path: "mlxLm.pipIndex", takesValue: true },
+  ]);
+  assert.ok(!cliFlagSpecs().some((spec) => spec.flag === "--mlx-lm-version" || spec.flag === "--pip-index"));
 });
 
 test("a typed mlxLm.version is labelled with the /mlx-init spelling, failing or not", () => {

@@ -123,6 +123,8 @@ export interface SettingDef {
   initCli?: string;
   /** The pi flag that sets this row, without its dashes, for example `mlx-port`. */
   piFlag?: string;
+  /** The project file never supplies this row's value; a valid project value is a project violation instead (D-01). */
+  userLevelOnly?: boolean;
   /** The mlx_lm.server flag this row becomes. */
   mlxFlag?: string;
   /** The `/mlx-start` flag takes no value: writing it turns the setting on. */
@@ -257,6 +259,35 @@ function checkPin(value: unknown): CheckResult {
   return value === "latest" || PIN_TEXT.test(value) ? ok(value) : bad;
 }
 
+/** The longest package index URL that is looked at; real ones are far shorter. */
+const MAX_PIP_INDEX_LENGTH = 4096;
+/** Whitespace and control characters anywhere in the raw text: `new URL` would silently trim or encode them. */
+const PIP_INDEX_FORBIDDEN = /[\s\u0000-\u001f\u007f-\u009f]/;
+/** The authority part of a URL as written: between `scheme://` and the next `/`, `?` or `#`. */
+const URL_AUTHORITY = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/;
+
+/**
+ * The package index pip installs from: an https URL, or plain http only for a loopback host, with no whitespace,
+ * no control character and no credentials (use pip's netrc or keyring). The value is kept as written, because pip
+ * takes it as written, and can only ever form the tail of the single argv element `--index-url=VALUE` (T-03-14,
+ * T-03-15, T-03-17). The loopback decision uses the parsed host name, never a string prefix.
+ */
+function checkPipIndex(value: unknown): CheckResult {
+  if (typeof value !== "string" || value.length < 1 || value.length > MAX_PIP_INDEX_LENGTH) return bad;
+  if (PIP_INDEX_FORBIDDEN.test(value)) return bad;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return bad;
+  }
+  if (url.hostname === "") return bad;
+  // An '@' anywhere in the authority is credentials, or a look-alike such as https://pypi.org@evil.example/.
+  if (url.username !== "" || url.password !== "" || (URL_AUTHORITY.exec(value)?.[1] ?? "").includes("@")) return bad;
+  if (url.protocol === "https:") return ok(value);
+  return url.protocol === "http:" && isLoopbackHost(url.hostname) ? ok(value) : bad;
+}
+
 const checkDraftTokens = checkIntegerAtLeast(1);
 const checkKvBits = checkIntegerRange(2, 8);
 
@@ -344,6 +375,7 @@ const PHRASES = {
   forbiddenKey: (key: string) => (shown: string) => `${shown} contains the key ${showKey(key)}, which is not allowed`,
   argsTooLarge: (shown: string) => `${shown} is larger than 16 KiB`,
   pin: (shown: string) => `${shown} must be "latest" or an exact version such as 0.32.2`,
+  pipIndex: (shown: string) => `${shown} must be an https URL without credentials or spaces (http only for a loopback host)`,
   tooDeep: (shown: string) => `${shown} is nested too deeply`,
   notJson: (shown: string) => `${shown} contains a value that is not JSON`,
 };
@@ -588,6 +620,20 @@ export const SETTINGS: readonly SettingDef[] = [
     parseText: (raw) => checkPin(raw.trim()),
     env: "PI_MLX_MODELS_MLX_LM_VERSION",
     initCli: "--mlx-lm-version",
+    emit: () => [],
+  },
+  {
+    // Where /mlx-init installs from. Whoever chooses the index chooses which code gets installed, so a project file may
+    // never set it (D-01): the project layer is skipped for this row and a project value is a project violation.
+    path: "mlxLm.pipIndex",
+    kind: "string",
+    userLevelOnly: true,
+    expected: "an https URL without credentials (http only for a loopback host)",
+    check: checkPipIndex,
+    problem: PHRASES.pipIndex,
+    parseText: (raw) => checkPipIndex(raw.trim()),
+    env: "PI_MLX_MODELS_PIP_INDEX",
+    initCli: "--pip-index",
     emit: () => [],
   },
 ];
@@ -976,6 +1022,7 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
     switch (layer) {
       case "global":
       case "project":
+        if (layer === "project" && row.userLevelOnly === true) return undefined;
         return fileValues[layer].get(row.path);
       case "env": {
         if (row.env === undefined) return undefined;
@@ -1083,8 +1130,9 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
       projectViolations: projectViolationsOf(fileValues.project),
       install: {
         version: String(value("mlxLm.version") ?? "latest"),
-        pipIndex: DEFAULT_PIP_INDEX,
+        pipIndex: String(value("mlxLm.pipIndex") ?? DEFAULT_PIP_INDEX),
         ...(sources.has("mlxLm.version") ? { versionSource: sources.get("mlxLm.version")!.label } : {}),
+        ...(sources.has("mlxLm.pipIndex") ? { pipIndexSource: sources.get("mlxLm.pipIndex")!.label } : {}),
       },
       modelSettings: {
         layers: (["global", "project"] as const).map((layer) => ({

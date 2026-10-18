@@ -2377,7 +2377,7 @@ test("mlx-init with an unknown flag is refused, with its own flag list, and noth
 
   await h.commands.get("mlx-init")!("--bogus 1", h.ctx);
 
-  assert.deepEqual(errors(h.notes), ["mlx-init failed: unknown flag --bogus (valid flags: --mlx-lm-version)"]);
+  assert.deepEqual(errors(h.notes), ["mlx-init failed: unknown flag --bogus (valid flags: --mlx-lm-version, --pip-index)"]);
   assertNothingHappened(h);
 });
 
