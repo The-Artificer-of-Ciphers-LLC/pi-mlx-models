@@ -537,7 +537,7 @@ Auto-start never confirms. There is nobody to ask, so a launch that needs a [con
 
 - A `/mlx-start` or `/mlx-stop` that you make while auto-start is still checking ends it quietly: whoever acted last owns the server.
 - `/mlx-stop` is not remembered. With the option on, the next pi session starts the last model again when nothing answers.
-- A project file can still set options that are not trust settings, for example a draft model, an adapter path or a chat template inside the project directory. They apply to the unprompted launch as they apply to any launch in that project. Trust settings in a project file are refused, not confirmed.
+- Auto-start reads no project file, so a cloned repository cannot change what an unprompted launch does. `/mlx-last` and `/mlx-start` still read it.
 
 ## The remembered launch
 
