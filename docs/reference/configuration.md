@@ -527,7 +527,7 @@ It does not change the model that is selected in pi. A started launch is remembe
 | 5 | The remembered launch file cannot be read | One warning: `auto-start skipped: the remembered launch file REASON; run /mlx-start to choose a model`. |
 | 6 | The configuration is invalid | One notice with the same problem lines as `/mlx-start`, starting `auto-start skipped:`. |
 | 7 | Something already answers on the configured port | One info notice: `auto-start skipped: something already answers on port N`. The server is never registered, adopted or stopped. |
-| 8 | The runtime is not installed | One notice: `auto-start skipped: the MLX runtime is not installed; run /mlx-init, then /mlx-start`. Nothing is installed. |
+| 8 | The runtime is not installed | One notice: `auto-start skipped: the MLX runtime is not installed; run /mlx-init, then /mlx-start`. Nothing is installed. When the check that mlx-lm can be imported does not finish within 60 seconds, the notice is instead `auto-start skipped: the check that mlx-lm can be imported timed out; run /mlx-start to start by hand`. |
 | 9 | The remembered profile is no longer defined for the model | One notice with the unknown-profile message, which lists the model's profiles, and the line `Run /mlx-start to start by hand.` |
 | 10 | The launch needs a confirmation: remote code, or a non-loopback host or base URL | One warning: `auto-start skipped: ... your confirmation; run /mlx-start to confirm`. |
 
