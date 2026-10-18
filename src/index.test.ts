@@ -2627,6 +2627,24 @@ test("mlx-init --pip-index applies to that run only and a bad one is refused wit
   assertNothingHappened(bad);
 });
 
+test("a pasted pip index secret that contains a slash never reaches a note, from the environment to the mlx-init error (WR-01)", async () => {
+  const h = await setup({ env: { PI_MLX_MODELS_PIP_INDEX: "https://__token__:abc/def+ghi@mirror.example/simple/" } });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  const failures = errors(h.notes);
+  assert.equal(failures.length, 1, failures.join("|"));
+  assert.ok(failures[0].startsWith("mlx-init failed:"), failures[0]);
+  assert.ok(failures[0].includes("PI_MLX_MODELS_PIP_INDEX"), failures[0]);
+  assert.ok(failures[0].includes("https://***@mirror.example"), failures[0]);
+  for (const note of h.notes) {
+    for (const secret of ["abc/def", "ghi", "__token__"]) {
+      assert.ok(!note.message.includes(secret), `a ${note.type} note shows ${secret}: ${note.message}`);
+    }
+  }
+  assertNothingHappened(h);
+});
+
 // ---- a pin that differs from the installed mlx-lm is reported on every start and applied only by mlx-init (plan 03-05, D-07, D-08) ----
 
 const PIN_MISMATCH = "mlx-lm pinned 0.31.1 (project file), installed 0.32.2; run /mlx-init to apply";
