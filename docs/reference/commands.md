@@ -47,6 +47,8 @@ Before it starts anything, `/mlx-start` checks the arguments and the configurati
 
 It can also show these warnings, described in the [configuration reference](configuration.md#what-a-start-shows): the installed mlx-lm is not the pinned version, the installed version could not be read to compare it with the pin, a flag is skipped because the install does not support it, and, after the start message, quantized KV cache turns batching off.
 
+Once the server is ready, pi lists only that model, unless `provider.listAllModels` is `true`. A `model:` line shows the context window, output limit, reasoning flag and input kinds pi was told about it, each with its source. The rules and the warnings that can come with it are in [Model metadata and the model list](configuration.md#model-metadata-and-the-model-list).
+
 Starting a model while another is running replaces the running server.
 
 ## `/mlx-stop`
@@ -55,7 +57,7 @@ Starting a model while another is running replaces the running server.
 /mlx-stop
 ```
 
-Stops the server, waits for it to exit and for its port to be released, and removes the provider's models from pi. It also cancels a start that is still in progress.
+Stops the server, waits for it to exit and for its port to be released, and removes the provider's models from pi. With the default settings the list stays empty until the next `/mlx-start`. It also cancels a start that is still in progress.
 
 Quitting pi stops the server too, waiting a few seconds for it to exit.
 

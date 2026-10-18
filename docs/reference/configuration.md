@@ -62,6 +62,9 @@ Values in files are checked strictly: a number must be a JSON number, a boolean 
     "chatTemplateArgs": { "enable_thinking": false },
     "sampling": { "temperature": 0.7, "maxTokens": 2048 }
   },
+  "provider": {
+    "listAllModels": false
+  },
   "models": {
     "qwen3_4b": {
       "numDraftTokens": 2,
@@ -69,7 +72,8 @@ Values in files are checked strictly: a number must be a JSON number, a boolean 
       "profiles": {
         "careful": {
           "sampling": { "temperature": 0.2, "topP": 0.9 },
-          "chatTemplateArgs": { "enable_thinking": false }
+          "chatTemplateArgs": { "enable_thinking": false },
+          "limits": { "maxTokens": 4096 }
         }
       }
     }
@@ -79,7 +83,7 @@ Values in files are checked strictly: a number must be a JSON number, a boolean 
 }
 ```
 
-`baseUrl`, `defaultModel` and `models` are top-level keys. Every other key lives inside its block. `mlxLm` is a block like `server`: it holds `version` and `pipIndex`. An unknown key stops the start; the message names the key and the file layer.
+`baseUrl`, `defaultModel` and `models` are top-level keys. Every other key lives inside its block. `mlxLm` is a block like `server`: it holds `version` and `pipIndex`. `provider` is a block too: it holds `listAllModels`. An unknown key stops the start; the message names the key and the file layer.
 
 ## Settings
 
@@ -114,12 +118,19 @@ The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and po
 | `model.sampling.maxTokens` | integer of at least 1 | none | `--max-tokens` | | | |
 | `model.sampling.stop` | a non-empty string, or a list of 1 to 4 non-empty strings of at most 256 characters each | none | none (request only) | | | |
 | `model.sampling.seed` | integer | none | none (request only) | | | |
+| `model.limits.contextWindow` | integer of at least 1 | derived, see [Model metadata](#model-metadata-and-the-model-list) | none (tells pi only) | | | |
+| `model.limits.maxTokens` | integer of at least 1 | derived, see [Model metadata](#model-metadata-and-the-model-list) | none (tells pi only) | | | |
+| `model.limits.reasoning` | `true` or `false` | derived, see [Model metadata](#model-metadata-and-the-model-list) | none (tells pi only) | | | |
+| `model.limits.input` | a list of `text` and `image` that includes `text` | `["text"]` | none (tells pi only) | | | |
+| `provider.listAllModels` | `true` or `false` | `false` | none | | | |
 | `baseUrl` | `http` or `https` URL; a trailing slash is removed | `http://<host>:<port>/v1` | | | | `PI_MLX_MODELS_BASE_URL` |
 | `defaultModel` | non-empty model id or preset key | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | | | | `PI_MLX_MODELS_DEFAULT_MODEL` |
 | `mlxLm.version` | the word `latest` or an exact version such as `0.32.2` | `latest` | | | | `PI_MLX_MODELS_MLX_LM_VERSION` |
 | `mlxLm.pipIndex` | `https` URL without credentials, spaces, a query string or a fragment (`http` only for a loopback host) | `https://pypi.org/simple/` | | | | `PI_MLX_MODELS_PIP_INDEX` |
 
 The eight `model.sampling.*` rows can only be set in a file, either in a `model` block, a `models` entry or a profile; they have no `/mlx-start` flag, pi flag or environment variable. See [Sampling and profiles](#sampling-and-profiles).
+
+The four `model.limits.*` rows are written inside a profile only, as a `limits` object; they are not allowed in the `model` block or in a `models` entry, and they have no `/mlx-start` flag, pi flag or environment variable. They change what pi is told about a model and never reach the server's command line or a request. `provider.listAllModels` can only be set in a file, the global one or the project one, and has no flag or environment variable. See [Model metadata and the model list](#model-metadata-and-the-model-list).
 
 The two `mlxLm` rows are settings of `/mlx-init`, not of the server. Their command-line forms are the `/mlx-init` flags `--mlx-lm-version` and `--pip-index`, not `/mlx-start` flags. They have no pi flag. When pi loads the extension these two settings are not looked at: a bad value does not change the provider URL or the default model, and only `/mlx-init` and `/mlx-start` report it.
 
@@ -143,6 +154,17 @@ A valued flag is passed to the server as one argument, `--flag=value`. The `--ho
 | `PI_CODING_AGENT_DIR` | pi's agent directory. Sets where `pi-mlx-models` keeps its files. |
 
 A bad value in a file, a pi flag or a `/mlx-start` flag stops the start. A bad value in an environment variable is ignored with a warning and the next source down is used. The exception is `PI_MLX_MODELS_PIP_INDEX`: a bad value refuses `/mlx-init` and `/mlx-start` instead.
+
+#### Hugging Face variables
+
+The extension also reads four variables that belong to Hugging Face, not to this package. They are used only to find a model's `config.json` (see [Context window](#context-window)). They have no `PI_MLX_MODELS_` form and no setting in a file.
+
+| Variable | Notes |
+|----------|-------|
+| `HF_TOKEN` | Sent as a bearer token to the Hub when the cache has no `config.json`, for a gated or private repository. It is read from the environment only: no config key holds a token, nothing is written to a file, and it is never shown in a message. |
+| `HF_HUB_OFFLINE` | `1`, `true`, `yes` or `on` (any letter case) stops the Hub request, so only the cache is used. Any other value, or none, allows it. |
+| `HF_ENDPOINT` | The Hub's base URL. Used only when it is a plain `https` URL without credentials, a query string or a fragment; otherwise `https://huggingface.co` is used. |
+| `HF_HUB_CACHE` | The cache directory looked in first. Default: `<agent dir>/pi-mlx-models/models/hub`. An empty value counts as unset. |
 
 ## Performance and KV cache options
 
@@ -270,8 +292,8 @@ A profile is a named set of per-model options for one model.
 
 - **Where.** A profile lives in the `profiles` object of a `models` entry, keyed by a preset key or a model id, in either file. It is not allowed in the `model` block. A profile is reachable only for the model of its entry. When a preset key entry and a model id entry both define the same profile name, the two are merged key by key, and the model id entry's value wins for a key both set. A key only the preset key entry sets is kept. The same merge applies across the global and project files, where the project file's value wins.
 - **What it may hold.** The keys of the `model` block (`adapterPath`, `draftModel`, `numDraftTokens`, `chatTemplate`, `useDefaultChatTemplate`, `chatTemplateArgs`), a `sampling` object, and a `limits` object. Each profile is flat.
-- **What it may not hold.** Every `server` key (`port`, `host`, `logLevel`, `allowedOrigins`, `trustRemoteCode`, the concurrency, cache and KV cache keys), a nested `profiles` object, `extends`, and any key inside `limits`. The start is refused with a message that names the key and the file.
-- **limits is reserved.** Every profile may carry an optional flat `limits` object, but it accepts no keys yet, so any key inside it is an error. A later release defines the model limits that go there. Until then the output limit of a profile is `sampling.maxTokens`. `limits` anywhere other than inside a profile is an unknown key.
+- **What it may not hold.** Every `server` key (`port`, `host`, `logLevel`, `allowedOrigins`, `trustRemoteCode`, the concurrency, cache and KV cache keys), a nested `profiles` object, and `extends`. Any key inside `limits` other than the four listed below is refused too. The start is refused with a message that names the key and the file.
+- **limits.** Every profile may carry an optional flat `limits` object with up to four keys: `contextWindow`, `maxTokens`, `reasoning` and `input`. They set what pi is told about the model and are described in [Model metadata and the model list](#model-metadata-and-the-model-list). `limits` anywhere other than inside a profile is an unknown key; in the `model` block or a `models` entry the message says it belongs inside a profile.
 - **Names.** 1 to 64 characters: letters, digits, `.`, `_` and `-`, starting with a letter or digit.
 
 Choosing a profile:
@@ -309,6 +331,112 @@ pi sends each request to the launched model itself. A hook changes that request 
 To check what the server receives, set `server.logLevel` to `DEBUG`; see [How to use profiles and sampling](../how-to/use-profiles-and-sampling.md#check-what-the-server-receives).
 
 > Changed in this release: `model.chatTemplateArgs` set in a config file used to reach the server only as the `--chat-template-args` launch flag. They are now also sent with every request to the launched model, replacing pi's `chat_template_kwargs` and removing pi's `reasoning_effort`.
+
+## Model metadata and the model list
+
+pi needs four facts about each model it lists: the context window, the output limit, whether the model reasons, and which kinds of input it takes. A step-by-step guide is in [How to set a model's context window, thinking flag and output limit](../how-to/set-model-limits.md).
+
+### What pi is told about a model
+
+| Value | Where it comes from | Default | Override (inside a profile) |
+|-------|---------------------|---------|-----------------------------|
+| Context window | The model's own `config.json`; see [Context window](#context-window) | 32768 when it cannot be read | `limits.contextWindow` |
+| Output limit | A quarter of the context window, at most 8192 (32768 for a reasoning model), at least 1; see [Output limit](#output-limit) | as described | `limits.maxTokens` |
+| Reasoning | The preset's flag, else a short list of names; see [Reasoning](#reasoning) | no | `limits.reasoning` |
+| Input | Text for every model; see [Image input](#image-input) | `["text"]` | `limits.input` |
+
+A value from `limits` always wins over what is detected. The values are held for the launched model and are worked out at every `/mlx-start`, so an edit applies from the next start. Each start shows them on a `model:` line; see [What a start shows](#what-a-start-shows).
+
+### Context window
+
+The window is the value of `max_position_embeddings` in the model's `config.json`. A `text_config.max_position_embeddings` that is a positive integer is used first, because multimodal models such as gemma-4 and KAT-Coder keep the value there and have none at the top level. Otherwise the top-level value is used. A value that is missing, not an integer, zero or negative counts as unreadable.
+
+Where the file is looked for, in order:
+
+1. **The Hugging Face cache.** The directory is `HF_HUB_CACHE` when set, otherwise `<agent dir>/pi-mlx-models/models/hub`, which is where the server's downloads go. A model `ORG/NAME` is `models--ORG--NAME/snapshots/REVISION/config.json` there. `REVISION` is the one named by `refs/main`; when that is missing or has no file, the newest snapshot that holds a `config.json`. A model given as an absolute path, or starting with `./` or `../`, is read from `config.json` in that directory.
+2. **The Hub.** Only for the launched model, only when the cache has no copy, and only after the server has started, when the model has normally been downloaded already. The request is `GET https://huggingface.co/ORG/NAME/resolve/main/config.json` (`HF_ENDPOINT` changes the host). `HF_TOKEN` is sent as a bearer token to that host only, so a gated repository can be read. The request, any redirects (at most three, never from `https` to `http`) and the body share a limit of 3000 ms, and the body may be at most 2 MiB. `HF_HUB_OFFLINE` set to a true value stops the request. See [Hugging Face variables](#hugging-face-variables).
+
+A `config.json` must be a regular file of at most 2 MiB holding a JSON object. The other models listed when `provider.listAllModels` is `true` are read from the cache only; the Hub is never asked for them.
+
+When no window can be read, the model still starts and is registered with **32768**. One warning says why, once for each model and reason while pi runs:
+
+```
+context window unavailable for mlx-community/SmolLM3-3B-4bit (not in the local cache; the Hugging Face Hub could not be reached); using 32768
+```
+
+The text in parentheses is one of a small set of reasons, such as `not in the Hugging Face cache`, `not in the local cache; ...` followed by what the Hub answered, `config.json is not valid JSON`, `config.json is larger than 2 MiB`, `config.json has no usable max_position_embeddings`, or `not a Hugging Face repository id or an absolute path`. It never holds a path, a token or file text.
+
+`limits.contextWindow` sets the window by hand. It replaces whatever `config.json` says and skips the read: nothing is looked up, no Hub request is made and no notice is shown. Use it when the file cannot be read, or when the window you can use differs from the file. A model extended by rope scaling can declare a smaller `max_position_embeddings` than it handles.
+
+The windows of the cached presets and KAT-Coder:
+
+| Model | Context window | Where |
+|-------|----------------|-------|
+| `mlx-community/Qwen3-4B-Instruct-2507-4bit` | 262144 | top level |
+| `mlx-community/SmolLM3-3B-4bit` | 65536 | top level |
+| `mlx-community/gemma-4-e2b-it-4bit` | 131072 | `text_config` |
+| `mlx-community/Llama-3.2-3B-Instruct-4bit` | 131072 | top level |
+| `mlx-community/DeepSeek-R1-Distill-Qwen-1.5B-4bit` | 131072 | top level |
+| `mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit` | 262144 | `text_config` |
+
+### Reasoning
+
+Whether a model reasons is decided in this order:
+
+1. `limits.reasoning` in the profile, `true` or `false`.
+2. The preset's flag, when the model id is a preset's. Only the DeepSeek-R1 distill preset reasons.
+3. The model's name. The last part of the id (after the final `/`) is lower-cased and split on every run of characters that is not a letter or a digit. The model reasons when one of the pieces is exactly `r1`, `qwq`, `thinking`, `reasoning`, `reasoner` or `magistral`. The organisation never counts, and neither does a word that only contains one of these.
+4. Otherwise no.
+
+The chat template is not consulted: a template can mention thinking for a model that does not think. `mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit` is not on the list and is not detected; it is the example for `limits.reasoning`.
+
+A model flagged as reasoning is registered as `reasoning`, with compat flags that make pi send neither the `developer` role nor `reasoning_effort`, because mlx-lm chat templates reject both. pi's thinking-level selector therefore appears but sends nothing. `chatTemplateArgs` with `enable_thinking` is the only lever on whether the model thinks.
+
+### Image input
+
+Every model is registered as text only, the gemma-4 preset included. Nothing is detected automatically. `limits.input` replaces the list: a non-empty list of `text` and `image` that includes `text`; a repeated entry is collapsed. It tells pi to offer images and nothing more; the model and the server have to handle them.
+
+### Output limit
+
+The output limit is the most a reply may be, as pi is told. Unless `limits.maxTokens` sets it, it is the smaller of 8192 (32768 for a reasoning model) and a quarter of the context window, and at least 1.
+
+| Model | Output limit |
+|-------|--------------|
+| Qwen3, SmolLM3, gemma-4, Llama-3.2 | 8192 |
+| DeepSeek-R1 distill (reasoning) | 32768 |
+| Any model whose window fell back to 32768 | 8192 |
+
+`limits.maxTokens` is a whole number of at least 1. pi asks the server for at most that many tokens per reply, and sizes its context for it, unless `sampling.maxTokens` overwrites the value in the request.
+
+`limits.maxTokens` and `sampling.maxTokens` are separate. The first is what pi is told; the second is what the server and the requests carry (`--max-tokens` and `max_completion_tokens`). A profile with only `limits.maxTokens` adds no `--max-tokens` and changes no request. When `sampling.maxTokens` is above the output limit pi is told about, every start shows one warning that names both numbers and the source of the limit:
+
+```
+sampling.maxTokens 20000 is above the output limit pi is told about, 8192 (default); pi sizes its context for 8192. Set limits.maxTokens in the profile to match.
+```
+
+### Thinking tokens
+
+mlx-lm 0.32.2 and its main branch have no thinking-budget parameter, and every upstream proposal for one is closed and unmerged. One cap covers the thinking and the answer together: the request's `max_completion_tokens`, else `max_tokens`, else the server's `--max-tokens`, which is 512 by default. A long thought can use all of it. The levers are:
+
+- `limits.maxTokens`, what pi is told and so what it asks for.
+- `sampling.maxTokens`, what the server and the requests carry.
+- `chatTemplateArgs` with `enable_thinking`, for a model whose chat template reads it.
+
+The extension sends configured `chatTemplateArgs` with every request to the launched model, as well as at launch (see [Request settings](#request-settings)). An open mlx-lm report, issue 1803, says per-request `chat_template_kwargs` may bypass the prompt cache. It is unconfirmed: one commenter could not reproduce it.
+
+### Which models pi lists
+
+By default pi lists only the model that is loaded. Before the first `/mlx-start` the list is empty, and `/mlx-stop` and the end of the session leave it empty again; each registers an empty list.
+
+`provider.listAllModels` set to `true` lists every model the server reports, each with its own metadata. The loaded model keeps the values from its start. The others are read from the cache only, and one warning gives the count of those that fell back to 32768 and the first reason, without their ids:
+
+```
+context window unavailable for 2 other listed models (not in the Hugging Face cache); using 32768 for them
+```
+
+The key can be set in the global file or the project file. It is read at every `/mlx-start`; when pi loads, only the global file and the environment are looked at.
+
+A server you started yourself, reached through `PI_MLX_MODELS_BASE_URL` or `baseUrl`, is not started by `/mlx-start`, so nothing is loaded and the default list is empty. Set `provider.listAllModels` to `true` to list its models.
 
 ## `/mlx-init` arguments
 
@@ -397,6 +525,21 @@ Before the start message, a start can show a [pin warning](#when-the-pin-and-the
 
 A configuration problem is reported once, as one message that names every offending key, its source and what is allowed. Nothing is installed or started when that happens.
 
+### The model line and the metadata warnings
+
+Once the server is ready and the provider is registered, a start shows what pi was told about the model. These messages come after the start message and before the ready message, in this order:
+
+1. When `provider.listAllModels` is `true`, one warning for the other listed models that fell back, such as `context window unavailable for 2 other listed models (...); using 32768 for them`.
+2. A warning when the launched model's context window could not be read, for example `context window unavailable for mlx-community/SmolLM3-3B-4bit (...); using 32768`. Warnings 1 and 2 are shown once for each text while pi runs. A profile that sets `limits.contextWindow` never shows warning 2.
+3. A warning when `sampling.maxTokens` is above the output limit pi is told about. It is shown on every start that has the condition.
+4. The `model:` line, with each value and its source:
+
+   ```
+   model: context 262144 (config.json), max output 8192 (default), reasoning no (preset), input text (default)
+   ```
+
+   The source is `config.json`, `fallback`, `default`, `preset`, `model name` or `profile NAME`. The rules behind each value are in [Model metadata and the model list](#model-metadata-and-the-model-list).
+
 ## Server process
 
 The server is started with `PYTHONSAFEPATH=1`, so that the project directory is not searched for Python modules.
@@ -407,4 +550,5 @@ The server is started with `PYTHONSAFEPATH=1`, so that the project directory is 
 |------|----------|
 | `<agent dir>/pi-mlx-models/venv` | Python virtual environment with mlx-lm |
 | `<agent dir>/pi-mlx-models/models` | Downloaded model files |
+| `<agent dir>/pi-mlx-models/models/hub` | The Hugging Face cache the server writes to, and where each model's `config.json` is looked for first (`HF_HUB_CACHE` replaces this path for the lookup) |
 | `<agent dir>/pi-mlx-models/config.json` | Global configuration file |
