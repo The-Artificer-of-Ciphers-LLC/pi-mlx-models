@@ -16,7 +16,8 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 - `/mlx-init` now reads the layered configuration and refuses to run on an invalid file or on a project file that asks for something it may not.
 - `/mlx-start`'s first install, when there is no virtual environment yet, uses the configured index and version. An existing install still makes no network call.
 - The notice for a skipped flag names the pin when one is set: `mlx-lm is pinned to X by SOURCE; raise or remove the pin, then run /mlx-init`.
-- pip is now passed the index as one `--index-url=` argument, and its failures name the spec and the index.
+- pip is now passed the index as one `--index-url=` argument, and its failures name the spec and the index. The index stays in the progress line while pip prints.
+- An invalid `PI_MLX_MODELS_PIP_INDEX` refuses `/mlx-init` and `/mlx-start` instead of installing from the default index. A refused index never shows its user name or password, and only the plain `http(s)://` spelling is accepted.
 
 ## 0.2.3 - 2026-10-17
 

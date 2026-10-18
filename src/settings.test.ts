@@ -2703,7 +2703,9 @@ const BAD_PIP_INDEXES: unknown[] = [
 ];
 for (const pipIndex of BAD_PIP_INDEXES) {
   test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is refused naming the allowed form`, () => {
-    assert.deepEqual(refused({ global: ok({ mlxLm: { pipIndex } }) }), [pipLine(JSON.stringify(pipIndex))]);
+    // Credentials are never repeated back (WR-01): the user and password of a refused URL show as ***.
+    const shown = JSON.stringify(pipIndex).replace(/([/\\]{2})[^\s/\\?#"]*@/g, "$1***@");
+    assert.deepEqual(refused({ global: ok({ mlxLm: { pipIndex } }) }), [pipLine(shown)]);
   });
 }
 
@@ -2714,15 +2716,13 @@ test("PI_MLX_MODELS_PIP_INDEX is used and its source is the variable", () => {
   assert.deepEqual(warnings, []);
 });
 
-test("an invalid PI_MLX_MODELS_PIP_INDEX is ignored with a warning naming the variable and the next layer is used", () => {
-  const { prepared, warnings } = resolved({
+test("an invalid PI_MLX_MODELS_PIP_INDEX refuses with an error naming the variable, whatever a lower layer says (WR-03)", () => {
+  const result = resolve({
     global: ok({ mlxLm: { pipIndex: "https://global.example/simple/" } }),
     env: { PI_MLX_MODELS_PIP_INDEX: "http://example.com/simple/" },
   });
-  assert.equal(prepared.install.pipIndex, "https://global.example/simple/");
-  assert.equal(prepared.install.pipIndexSource, "global file");
-  assert.deepEqual(warnings, [
-    'PI_MLX_MODELS_PIP_INDEX="http://example.com/simple/" is not an https URL without credentials (http only for a loopback host); ignoring it.',
+  assert.deepEqual(result.ok ? undefined : result.errors, [
+    'PI_MLX_MODELS_PIP_INDEX="http://example.com/simple/" is not an https URL without credentials (http only for a loopback host)',
   ]);
 });
 
@@ -2862,4 +2862,56 @@ test("pinNotice: with no known source the parenthesised part is left out, and un
   const shown = pinNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, `0.32.2\u001b[31m${"9".repeat(100)}`) ?? "";
   assert.ok(!shown.includes("\u001b"), "no control character reaches the notification");
   assert.ok(shown.length < 160, `clipped: ${shown.length}`);
+});
+
+// ---- review hardening of the pip index: WR-01 credentials never shown, WR-02 one parser, WR-03 fail closed ----
+
+const SECRET_INDEX = "https://bob:s3cr3tTOKEN@mirror.example/simple/";
+const everyText = (result: ReturnType<typeof resolve>): string =>
+  JSON.stringify(result.ok ? result.warnings : [result.errors, result.warnings]);
+
+test("a pip index with credentials is refused without its credentials appearing in any message", () => {
+  const texts = [
+    everyText(resolve({ env: { PI_MLX_MODELS_PIP_INDEX: SECRET_INDEX } })),
+    everyText(resolve({ args: { "mlxLm.pipIndex": SECRET_INDEX } })),
+    everyText(resolve({ global: ok({ mlxLm: { pipIndex: SECRET_INDEX } }) })),
+  ];
+  for (const text of texts) {
+    assert.ok(!text.includes("s3cr3tTOKEN"), text);
+    assert.ok(!text.includes("bob"), text);
+    assert.ok(text.includes("mirror.example"), `the host stays visible to find the mistake: ${text}`);
+  }
+});
+
+test("a project pip index with credentials is a violation that does not show them", () => {
+  const { prepared } = resolved({ project: ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" } }) });
+  assert.equal(prepared.projectViolations[0].shown, "https://mirror.example/simple/");
+});
+
+test("the pip index check accepts only the canonical http(s):// form that pip parses the same way", () => {
+  const accepted = (pipIndex: string) => resolve({ global: ok({ mlxLm: { pipIndex } }) }).ok;
+  assert.equal(accepted("https://mirror.example/simple/"), true);
+  assert.equal(accepted("http://127.0.0.1:8081/simple"), true);
+  assert.equal(accepted("http://localhost/simple"), true);
+  for (const spelling of [
+    "http://localhost\\.evil.example/simple",
+    "https://mirror.example\\simple",
+    "https:mirror.example/simple",
+    "http:127.0.0.1/simple",
+    "https:/mirror.example/simple",
+    "http://localhost%2eevil.example/simple",
+  ]) {
+    assert.equal(accepted(spelling), false, spelling);
+  }
+});
+
+test("an invalid PI_MLX_MODELS_PIP_INDEX refuses instead of falling back to the default index", () => {
+  const result = resolve({ env: { PI_MLX_MODELS_PIP_INDEX: "http://mirror.example/simple/" } });
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.errors.some((line) => line.includes("PI_MLX_MODELS_PIP_INDEX")), JSON.stringify(result));
+});
+
+test("an unset or blank PI_MLX_MODELS_PIP_INDEX still means the next layer down", () => {
+  assert.equal(resolved({ env: { PI_MLX_MODELS_PIP_INDEX: "" } }).prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+  assert.equal(resolved({ env: { PI_MLX_MODELS_PIP_INDEX: "   " } }).prepared.install.pipIndex, DEFAULT_PIP_INDEX);
 });

@@ -118,7 +118,7 @@ A valued flag is passed to the server as one argument, `--flag=value`. The `--ho
 | `PI_MLX_MODELS_BASE_URL` | An empty value counts as unset. |
 | `PI_MLX_MODELS_DEFAULT_MODEL` | |
 | `PI_MLX_MODELS_MLX_LM_VERSION` | `latest` or an exact version. An invalid value is ignored with a warning. An empty value counts as unset. |
-| `PI_MLX_MODELS_PIP_INDEX` | The pip index URL. An invalid value is ignored with a warning. An empty value counts as unset. |
+| `PI_MLX_MODELS_PIP_INDEX` | The pip index URL. An invalid value refuses `/mlx-init` and `/mlx-start` with an error, so an install never silently falls back to another index. An empty value counts as unset. |
 | `PI_MLX_MODELS_PYTHON` | Path to the Python interpreter used to build the virtual environment. Must be Python 3.11 or newer. If it is set but unusable, `/mlx-init` fails and names it instead of choosing another Python. |
 | `PI_CODING_AGENT_DIR` | pi's agent directory. Sets where `pi-mlx-models` keeps its files. |
 
@@ -176,6 +176,7 @@ Nothing else is accepted: no ranges, no specifiers such as `>=`, no URLs. The pr
 - It must be an `https` URL, or `http` for `127.0.0.1`, `localhost` or `::1`. It must contain no whitespace and no credentials; use pip's netrc file or keyring for those.
 - It is passed to pip as `--index-url=VALUE` in both pip steps, the pip upgrade and the mlx-lm install. The index must therefore carry `pip` itself.
 - Only `--index-url` is passed. pip's own environment and configuration, for example `PIP_EXTRA_INDEX_URL`, still apply.
+- A refused value is shown with its user name and password replaced by `***`. Only the plain `http://` or `https://` spelling is accepted: a backslash, a single slash after the scheme and an escaped character in the host are refused, because pip reads them differently from the check.
 - It can be set in the global file, by `PI_MLX_MODELS_PIP_INDEX` or by `/mlx-init --pip-index`. A project file cannot set it; see [Settings that ask for permission](#settings-that-ask-for-permission).
 
 Only `/mlx-init` changes the installed mlx-lm. `/mlx-start` never upgrades or downgrades, and runs pip only when there is no working install at all. In that case it uses the same index and pin as `/mlx-init`, so a configured mirror applies on the first launch.

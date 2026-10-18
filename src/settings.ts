@@ -113,6 +113,8 @@ export interface SettingDef {
   env?: string;
   /** An empty-but-defined environment variable is an invalid value, not an unset one. */
   blankEnvInvalid?: boolean;
+  /** An invalid environment value refuses the command instead of being ignored: the next layer down is not what was asked for. */
+  failClosedEnv?: boolean;
   /** The flag spelling `/mlx-start` accepts for this row, for example `--port`; a row without one cannot be set there. */
   cli?: string;
   /**
@@ -263,6 +265,8 @@ function checkPin(value: unknown): CheckResult {
 const MAX_PIP_INDEX_LENGTH = 4096;
 /** Whitespace and control characters anywhere in the raw text: `new URL` would silently trim or encode them. */
 const PIP_INDEX_FORBIDDEN = /[\s\u0000-\u001f\u007f-\u009f]/;
+/** The canonical start of an index URL: the scheme and both slashes, exactly as pip's own parser reads them (WR-02). */
+const PIP_INDEX_START = /^https?:\/\//i;
 /** The authority part of a URL as written: between `scheme://` and the next `/`, `?` or `#`. */
 const URL_AUTHORITY = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/;
 
@@ -275,6 +279,9 @@ const URL_AUTHORITY = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/;
 function checkPipIndex(value: unknown): CheckResult {
   if (typeof value !== "string" || value.length < 1 || value.length > MAX_PIP_INDEX_LENGTH) return bad;
   if (PIP_INDEX_FORBIDDEN.test(value)) return bad;
+  // WHATWG and Python's urlsplit read a backslash, a missing slash and an escaped host differently; only the canonical
+  // spelling is accepted, so the host that is checked is the host pip connects to.
+  if (!PIP_INDEX_START.test(value) || value.includes("\\") || (URL_AUTHORITY.exec(value)?.[1] ?? "").includes("%")) return bad;
   let url: URL;
   try {
     url = new URL(value);
@@ -628,6 +635,7 @@ export const SETTINGS: readonly SettingDef[] = [
     path: "mlxLm.pipIndex",
     kind: "string",
     userLevelOnly: true,
+    failClosedEnv: true,
     expected: "an https URL without credentials (http only for a loopback host)",
     check: checkPipIndex,
     problem: PHRASES.pipIndex,
@@ -773,8 +781,11 @@ function unknownKeyHint(key: string, block: string | undefined, container: strin
 
 const FILE_LABEL = { global:"global config.json", project: "project .pi/pi-mlx-models.json" } as const;
 
+/** The user and password of a URL, replaced by `***` wherever the text is shown: a refused index is often one with a pasted secret (WR-01). */
+const redactCredentials = (text: string): string => text.replace(/([/\\]{2})[^\s/\\?#"]*@/g, "$1***@");
+
 /** Text that came from a file, the environment or a flag, made safe and bounded before it is shown (D-24). */
-const show = (text: string): string => clipDiagnostic(cleanLabel(text), 60, "start");
+const show = (text: string): string => clipDiagnostic(redactCredentials(cleanLabel(text)), 60, "start");
 const showValue = (value: unknown): string => {
   try {
     return show(JSON.stringify(value) ?? String(value));
@@ -1038,7 +1049,8 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
         if (!row.blankEnvInvalid && envText(raw) === undefined) return undefined;
         const result = row.parseText(raw);
         if (result.ok) return result.value;
-        warnings.push(`${row.env}=${showValue(raw)} is not ${row.expected}; ignoring it.`);
+        if (row.failClosedEnv === true) problems.env.push(`${row.env}=${showValue(raw)} is not ${row.expected}`);
+        else warnings.push(`${row.env}=${showValue(raw)} is not ${row.expected}; ignoring it.`);
         return undefined;
       }
       case "args":
