@@ -3597,3 +3597,218 @@ test("a row added under model.limits is read from a profile with no change to th
     table.pop();
   }
 });
+
+// ---- defaultProfile, the layering rules and the entry-specificity rules (plan 04-04, Task 2) ----
+
+const FAST_ARGV = ['--chat-template-args={"enable_thinking":false}', "--temp=0.2", "--max-tokens=2048"];
+const WITH_DEFAULT = (extra: Record<string, unknown> = {}) => ({ models: { qwen3_4b: { defaultProfile: "fast", profiles: { fast: FAST_PROFILE }, ...extra } } });
+
+test("a defaultProfile in the global file applies when /mlx-start names no profile, and says which file supplied it", () => {
+  const input = { global: ok(WITH_DEFAULT()) };
+  assert.deepEqual(launchWith(input, {}).profile, { name: "fast", source: "global file" });
+  assert.deepEqual(argvWith(input, {}), FAST_ARGV);
+  assert.equal(describeProfile(launchWith(input, {})), "profile: fast (global file)");
+});
+
+test("a defaultProfile in the project file names the project file as its source", () => {
+  const launch = launchWith({ project: ok(WITH_DEFAULT()) }, {});
+  assert.deepEqual(launch.profile, { name: "fast", source: "project file" });
+  assert.equal(launch.flags[0].label, "profile fast");
+});
+
+test("when both files set a default, the project file's default wins", () => {
+  const global = ok({
+    models: { qwen3_4b: { defaultProfile: "slow", profiles: { slow: { sampling: { temperature: 0.9 } }, fast: { sampling: { temperature: 0.2 } } } } },
+  });
+  const project = ok({ models: { qwen3_4b: { defaultProfile: "fast" } } });
+  const launch = launchWith({ global, project }, {});
+  assert.deepEqual(launch.profile, { name: "fast", source: "project file" });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.2"]);
+});
+
+test("a default in the model-id entry beats the default in the preset-key entry of the same file", () => {
+  const global = ok({
+    models: {
+      qwen3_4b: { defaultProfile: "a", profiles: { a: { sampling: { temperature: 0.1 } }, b: { sampling: { temperature: 0.2 } } } },
+      [QWEN.modelId]: { defaultProfile: "b" },
+    },
+  });
+  const launch = launchWith({ global }, {});
+  assert.deepEqual(launch.profile, { name: "b", source: "global file" });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.2"]);
+});
+
+test("a typed profile beats the default and shows /mlx-start as its source", () => {
+  const global = ok({
+    models: { qwen3_4b: { defaultProfile: "fast", profiles: { fast: { sampling: { temperature: 0.2 } }, careful: { sampling: { temperature: 0.1 } } } } },
+  });
+  const launch = launchWith({ global }, { profile: "careful" });
+  assert.deepEqual(launch.profile, { name: "careful", source: "/mlx-start" });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.1"]);
+});
+
+test("a default that names a missing profile refuses the start when it is the profile in use", () => {
+  const global = ok({ models: { qwen3_4b: { defaultProfile: "gone", profiles: { fast: FAST_PROFILE } } } });
+  assert.deepEqual(errorsWith({ global }, {}), [
+    `defaultProfile "gone" (global file): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+});
+
+test("a dangling default is ignored when a valid profile is typed (assumption A5)", () => {
+  const global = ok({ models: { qwen3_4b: { defaultProfile: "gone", profiles: { fast: FAST_PROFILE } } } });
+  const launch = launchWith({ global }, FAST);
+  assert.deepEqual(launch.profile, { name: "fast", source: "/mlx-start" });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, FAST_ARGV);
+});
+
+test("a default with no profiles defined says that none are defined", () => {
+  assert.deepEqual(errorsWith({ global: ok({ models: { qwen3_4b: { defaultProfile: "fast" } } }) }, {}), [
+    `defaultProfile "fast" (global file): not defined for ${QWEN.modelId}; no profiles are defined for this model`,
+  ]);
+});
+
+test("a dangling default in the project file names the project file", () => {
+  assert.deepEqual(errorsWith({ project: ok({ models: { qwen3_4b: { defaultProfile: "gone" } } }) }, {}), [
+    `defaultProfile "gone" (project file): not defined for ${QWEN.modelId}; no profiles are defined for this model`,
+  ]);
+});
+
+test("a dangling default for another model never blocks this model's start", () => {
+  const global = ok({ models: { llama3_2_3b: { defaultProfile: "gone" } } });
+  const launch = launchWith({ global }, {});
+  assert.equal(launch.profile, undefined);
+  assert.deepEqual(launch.flags, []);
+});
+
+test("profiles defined with no default and no typed profile leave the launch exactly as without profiles", () => {
+  const launch = launchWith({ global: FAST_FILE() }, {});
+  assert.equal(launch.profile, undefined);
+  assert.deepEqual(launch.flags, []);
+  assert.deepEqual(launch.request, { sampling: {} });
+  assert.equal(describeProfile(launch), "");
+});
+
+const NOT_A_PROFILE_NAME = 'is not a profile name (1 to 64 characters: letters, digits, ".", "_" and "-", starting with a letter or digit)';
+for (const [value, shown] of [
+  [5, "5"],
+  [true, "true"],
+  [null, "null"],
+  [[], "[]"],
+  [{}, "{}"],
+  ["bad name!", '"bad name!"'],
+] as const) {
+  test(`defaultProfile ${shown} is refused as not a profile name`, () => {
+    const result = resolve({ global: ok({ models: { qwen3_4b: { defaultProfile: value } } }) });
+    assert.ok(!result.ok);
+    assert.deepEqual(result.errors, [`models["qwen3_4b"].defaultProfile (global config.json): ${shown} ${NOT_A_PROFILE_NAME}`]);
+  });
+}
+
+test("profiles in the model block are refused: they belong to one model", () => {
+  const result = resolve({ global: ok({ model: { profiles: { fast: {} } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ['model.profiles (global config.json): profiles belong to one model; define them inside a "models" entry']);
+});
+
+test("defaultProfile in the model block is refused: it belongs to one model", () => {
+  const result = resolve({ project: ok({ model: { defaultProfile: "fast" } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, [
+    'model.defaultProfile (project .pi/pi-mlx-models.json): defaultProfile belongs to one model; set it inside a "models" entry',
+  ]);
+});
+
+test("limits is per profile only: in the model block it is an unknown key with no hint", () => {
+  const result = resolve({ global: ok({ model: { limits: {} } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ["model.limits (global config.json): unknown key"]);
+});
+
+test("limits is per profile only: in a models entry it is an unknown key with no hint", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { limits: {} } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ['models["qwen3_4b"].limits (global config.json): unknown key']);
+});
+
+test("layering: a profile in the global file beats a project model block for the same key", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } } }),
+    project: ok({ model: { sampling: { temperature: 0.9 } } }),
+  };
+  const launch = launchWith(input, FAST);
+  assert.deepEqual(flagSummary(launch), [{ flag: "--temp", args: ["--temp=0.2"], label: "profile fast" }]);
+  assert.deepEqual(flagSummary(launchWith(input, {})), [{ flag: "--temp", args: ["--temp=0.9"], label: "project file" }]);
+});
+
+test("layering: typed template arguments merge over the profile's, which merge over the base's", () => {
+  const launch = launchWith(
+    {
+      global: ok({
+        model: { chatTemplateArgs: { a: 1, b: 2 } },
+        models: { qwen3_4b: { profiles: { fast: { chatTemplateArgs: { b: 3 } } } } },
+      }),
+      args: { "model.chatTemplateArgs": '{"z":4}' },
+    },
+    FAST,
+  );
+  assert.deepEqual(launch.request.chatTemplateArgs, { a: 1, b: 3, z: 4 });
+  assert.equal(launch.flags[0].label, "/mlx-start");
+});
+
+test("layering: the same profile name in both files merges key by key, the project file over the global one", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2, topP: 0.9 } } } } } }),
+    project: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.3 } } } } } }),
+  };
+  assert.deepEqual(flagSummary(launchWith(input, FAST)), [
+    { flag: "--temp", args: ["--temp=0.3"], label: "profile fast" },
+    { flag: "--top-p", args: ["--top-p=0.9"], label: "profile fast" },
+  ]);
+});
+
+test("layering: template arguments of the global profile and the project profile merge key by key over the base", () => {
+  const input = {
+    global: ok({ model: { chatTemplateArgs: { a: 1 } }, models: { qwen3_4b: { profiles: { fast: { chatTemplateArgs: { b: 2 } } } } } }),
+    project: ok({ models: { qwen3_4b: { profiles: { fast: { chatTemplateArgs: { c: 3 } } } } } }),
+  };
+  assert.deepEqual(launchWith(input, FAST).request.chatTemplateArgs, { a: 1, b: 2, c: 3 });
+});
+
+test("layering: a global profile beats a project models entry for the same key", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } } }),
+    project: ok({ models: { qwen3_4b: { sampling: { temperature: 0.9 } } } }),
+  };
+  assert.deepEqual(flagSummary(launchWith(input, FAST)), [{ flag: "--temp", args: ["--temp=0.2"], label: "profile fast" }]);
+});
+
+test("entries: a profile in both the preset-key entry and the model-id entry takes the model-id entry's keys, key by key", () => {
+  const global = ok({
+    models: {
+      qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.1, topP: 0.5 } } } },
+      [QWEN.modelId]: { profiles: { fast: { sampling: { temperature: 0.2 } } } },
+    },
+  });
+  assert.deepEqual(argvWith({ global }, FAST), ["--temp=0.2", "--top-p=0.5"]);
+});
+
+test("entries: the profiles listed for an unknown name are the sorted union of both entries", () => {
+  const global = ok({
+    models: {
+      qwen3_4b: { profiles: { zeta: {}, alpha: {} } },
+      [QWEN.modelId]: { profiles: { mid: {}, alpha: {} } },
+    },
+  });
+  assert.deepEqual(errorsWith({ global }, { profile: "nope" }), [MISSING_PROFILE("nope", "available profiles: alpha, mid, zeta")]);
+});
+
+test("entries: a profile defined only in the preset-key entry is selectable for a model that also has a model-id entry", () => {
+  const global = ok({
+    models: {
+      qwen3_4b: { profiles: { fromKey: { sampling: { temperature: 0.1 } } } },
+      [QWEN.modelId]: { profiles: { fromId: { sampling: { temperature: 0.2 } } } },
+    },
+  });
+  assert.deepEqual(argvWith({ global }, { profile: "fromKey" }), ["--temp=0.1"]);
+  assert.deepEqual(argvWith({ global }, { profile: "fromId" }), ["--temp=0.2"]);
+});
