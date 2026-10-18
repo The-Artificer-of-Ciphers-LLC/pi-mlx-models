@@ -999,6 +999,8 @@ const FILE_LABEL = { global:"global config.json", project: "project .pi/pi-mlx-m
 const show = (text: string): string => clipDiagnostic(redactCredentials(cleanLabel(text)), 60, "start");
 const showValue = (value: unknown): string => {
   try {
+    // JSON.stringify turns Infinity, -Infinity and NaN into "null", which is not what the user wrote (IN-02).
+    if (typeof value === "number" && !Number.isFinite(value)) return String(value);
     return show(JSON.stringify(value) ?? String(value));
   } catch {
     // A value nested too deeply to serialize, or one that cannot be: still reported, never thrown.
