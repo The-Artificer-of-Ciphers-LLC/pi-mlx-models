@@ -209,28 +209,31 @@ export async function ensureInstalled(options: {
   }
   emit({ phase: "venv", state: "done", detail: "Virtual environment ready" });
 
-  const pipStep = (phase: "pip" | "mlx-lm") => (rawLine: string) => {
+  // The step keeps announcing what it does and where from while pip talks, so pip's own text never hides the index.
+  const pipStep = (phase: "pip" | "mlx-lm", announcement: string) => (rawLine: string) => {
     const line = cleanLabel(rawLine);
     const m = line.match(/(\d+)%/);
-    emit({ phase, state: "active", detail: line.slice(0, 120), progress: m ? Number(m[1]) / 100 : undefined });
+    emit({ phase, state: "active", detail: `${announcement}: ${line.slice(0, 120)}`, progress: m ? Number(m[1]) / 100 : undefined });
   };
 
   // A failure keeps pip's own text whole (already cleaned and clipped to its last 800 characters by `run`), after a
   // prefix that says which spec and which index were being used, so a mistyped pin or an unreachable mirror reads at once.
   const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-  emit({ phase: "pip", state: "active", detail: `Upgrading pip (index ${shownIndex})` });
+  const pipAnnouncement = `Upgrading pip (index ${shownIndex})`;
+  emit({ phase: "pip", state: "active", detail: pipAnnouncement });
   try {
-    await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", "pip", indexArg], pipStep("pip"));
+    await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", "pip", indexArg], pipStep("pip", pipAnnouncement));
   } catch (error) {
     if (index === DEFAULT_PIP_INDEX) throw error;
     throw new Error(`pip could not be upgraded from ${shownIndex}: ${messageOf(error)}`);
   }
   emit({ phase: "pip", state: "done", detail: "pip upgraded" });
 
-  emit({ phase: "mlx-lm", state: "active", detail: `Installing ${mlxLmSpec} (index ${shownIndex})` });
+  const mlxLmAnnouncement = `Installing ${mlxLmSpec} (index ${shownIndex})`;
+  emit({ phase: "mlx-lm", state: "active", detail: mlxLmAnnouncement });
   try {
-    await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", mlxLmSpec, indexArg], pipStep("mlx-lm"));
+    await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", mlxLmSpec, indexArg], pipStep("mlx-lm", mlxLmAnnouncement));
   } catch (error) {
     throw new Error(`Installing ${mlxLmSpec} from ${shownIndex} failed: ${messageOf(error)}`);
   }

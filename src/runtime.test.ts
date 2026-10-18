@@ -489,3 +489,18 @@ test("a working install is not probed for its version at all", async () => {
   await ensureInstalled({ host });
   assert.ok(!calls.some((c) => c.includes("--version")));
 });
+
+test("pip's own output does not replace the index in either pip step's progress line", async () => {
+  const { host } = fakeHost({ venv: true });
+  const events: RuntimeEvent[] = [];
+  await ensureInstalled({ host, upgrade: true, policy: { version: "0.31.1", pipIndex: MIRROR }, onEvent: (e) => events.push(e) });
+  const fromPip = (phase: RuntimeEvent["phase"]) => events.filter((e) => e.phase === phase && e.state === "active" && e.progress != null);
+  for (const phase of ["pip", "mlx-lm"] as const) {
+    assert.ok(fromPip(phase).length > 0, `${phase} reported pip output`);
+    for (const event of fromPip(phase)) {
+      assert.ok(event.detail?.includes(`(index ${MIRROR})`), `${phase}: ${event.detail}`);
+      assert.ok(event.detail?.includes("Downloading 42%"), "pip's line is still shown");
+    }
+  }
+  assert.ok(fromPip("mlx-lm")[0].detail?.includes("mlx-lm==0.31.1"));
+});
