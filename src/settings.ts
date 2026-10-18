@@ -1067,6 +1067,14 @@ function samplingKeyHint(key: string): string | undefined {
   return undefined;
 }
 
+/**
+ * The hint for an unknown key of the model block or of a `models` entry that is `limits`, which is written inside a
+ * profile only (D-11): its normalised spelling equals `limits`. Only a fixed phrase is added to the line (T-02-27).
+ */
+function limitsKeyHint(key: string): string | undefined {
+  return normalizeKey(key) === LIMITS_KEY ? ` (${LIMITS_KEY} belongs inside a profile)` : undefined;
+}
+
 const FILE_LABEL = { global:"global config.json", project: "project .pi/pi-mlx-models.json" } as const;
 
 /**
@@ -1334,7 +1342,7 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
     // the model block, the `sampling` object is.
     const row = key.includes(".") ? undefined : ROWS_BY_PATH.get(path);
     if (row === undefined) {
-      const misplaced = block === MODEL_BLOCK ? samplingKeyHint(key) : undefined;
+      const misplaced = block === MODEL_BLOCK ? (samplingKeyHint(key) ?? limitsKeyHint(key)) : undefined;
       problems.push(`${showKey(path)} (${label}): unknown key${misplaced ?? unknownKeyHint(key, block, `"${block}"`)}`);
       return;
     }
@@ -1372,7 +1380,7 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
     const where = `${entryPath(id)}.${showKey(key)}`;
     const row = key.includes(".") ? undefined : ROWS_BY_PATH.get(`${MODEL_BLOCK}.${key}`);
     if (row === undefined) {
-      problems.push(`${where} (${label}): unknown key${samplingKeyHint(key) ?? unknownKeyHint(key, MODEL_BLOCK, `a "${MODELS_KEY}" entry`)}`);
+      problems.push(`${where} (${label}): unknown key${samplingKeyHint(key) ?? limitsKeyHint(key) ?? unknownKeyHint(key, MODEL_BLOCK, `a "${MODELS_KEY}" entry`)}`);
       return;
     }
     const result = row.check(value);

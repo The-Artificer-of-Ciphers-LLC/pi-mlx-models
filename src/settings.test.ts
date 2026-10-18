@@ -3737,16 +3737,16 @@ test("defaultProfile in the model block is refused: it belongs to one model", ()
   ]);
 });
 
-test("limits is per profile only: in the model block it is an unknown key with no hint", () => {
+test("limits is per profile only: in the model block it is an unknown key that says where limits belongs", () => {
   const result = resolve({ global: ok({ model: { limits: {} } }) });
   assert.ok(!result.ok);
-  assert.deepEqual(result.errors, ["model.limits (global config.json): unknown key"]);
+  assert.deepEqual(result.errors, ["model.limits (global config.json): unknown key (limits belongs inside a profile)"]);
 });
 
-test("limits is per profile only: in a models entry it is an unknown key with no hint", () => {
+test("limits is per profile only: in a models entry it is an unknown key that says where limits belongs", () => {
   const result = resolve({ global: ok({ models: { qwen3_4b: { limits: {} } } }) });
   assert.ok(!result.ok);
-  assert.deepEqual(result.errors, ['models["qwen3_4b"].limits (global config.json): unknown key']);
+  assert.deepEqual(result.errors, ['models["qwen3_4b"].limits (global config.json): unknown key (limits belongs inside a profile)']);
 });
 
 test("layering: a profile in the global file beats a project model block for the same key", () => {
