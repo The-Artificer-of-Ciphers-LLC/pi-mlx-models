@@ -28,6 +28,6 @@ The release is live only after step 5.
 - **The version is staged but the commit or tag was not pushed.** Reject the staged version with `npm stage reject <stage-id>` (or on the Staged Packages tab), then run the release again. This can happen if `main` moved while the run was in progress.
 - **You staged a version you do not want.** Reject it the same way. Nothing is public until you approve.
 
-## Why it works this way
+## Related
 
-See [About layered configuration and trust](../explanation/layered-configuration-and-trust.md) for the project's approach to permission. The publishing setup itself is described in the comments at the top of [`.github/workflows/publish.yml`](../../.github/workflows/publish.yml): npm trusted publishing with no stored token, and a trusted publisher that allows only staging, so a person always approves what goes live.
+- The publishing setup and the reasons for it are written down in the comments at the top of [`.github/workflows/publish.yml`](../../.github/workflows/publish.yml).
