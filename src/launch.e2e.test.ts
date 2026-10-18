@@ -1020,3 +1020,150 @@ test("the same chatTemplate path in a global profile is read and launches", { ti
   assert.equal(h.argv().at(-1), "--chat-template={{ outside }}");
   assert.match(startNotes(h.notes)[0].message, /\nprofile: fast \(\/mlx-start\)\nflags: .*--chat-template .*outside\.jinja \(profile fast\)$/);
 });
+
+// ---- phase 4 acceptance (roadmap criteria 1 to 4): one Qwen3-style scenario over the real extension, a real child and the recorded request ----
+
+const ACCEPT_CONFIG = (port: number) => ({
+  server: { port, logLevel: "DEBUG" },
+  models: {
+    qwen3_4b: {
+      defaultProfile: "careful",
+      profiles: {
+        careful: {
+          sampling: { temperature: 0.2, topP: 0.9, topK: 40, minP: 0.05, repetitionPenalty: 1.1, maxTokens: 1024, stop: ["###"], seed: 42 },
+          chatTemplateArgs: { enable_thinking: false },
+        },
+        wild: { sampling: { temperature: 1.1 } },
+      },
+    },
+  },
+});
+
+/** The payload pi builds for the launched model, with both output-limit names and pi's own thinking settings. */
+const acceptPayload = () => ({
+  model: QWEN.modelId,
+  messages: [{ role: "user", content: "hi" }],
+  stream: true,
+  temperature: 0.7,
+  max_completion_tokens: 8192,
+  max_tokens: 4096,
+  reasoning_effort: "high",
+  chat_template_kwargs: { enable_thinking: true, preserve_thinking: true },
+});
+
+test("accept 1 (criteria 1 and 2): a start with no flag uses the default profile for the argv and the start message", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(ACCEPT_CONFIG(port));
+
+  await h.start("qwen3_4b");
+
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  assert.deepEqual(h.argv(), [
+    "--model",
+    QWEN.modelId,
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+    "--log-level=DEBUG",
+    '--chat-template-args={"enable_thinking":false}',
+    "--temp=0.2",
+    "--top-p=0.9",
+    "--top-k=40",
+    "--min-p=0.05",
+    "--max-tokens=1024",
+  ]);
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  assert.equal(
+    starting[0].message,
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\n` +
+      "profile: careful (global file)\n" +
+      `flags: --port ${port} (global file), --log-level DEBUG (global file), --chat-template-args {"enable_thinking":false} (profile careful), --temp 0.2 (profile careful), --top-p 0.9 (profile careful), --top-k 40 (profile careful), --min-p 0.05 (profile careful), --max-tokens 1024 (profile careful)\n` +
+      'request: repetition_penalty 1.1 (profile careful), stop ["###"] (profile careful), seed 42 (profile careful)',
+  );
+});
+
+test("accept 2 (criterion 1): --profile picks another profile, and a missing one lists the available ones and touches nothing", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(ACCEPT_CONFIG(port));
+
+  await h.start("qwen3_4b --profile wild");
+
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--log-level=DEBUG", "--temp=1.1"]);
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  assert.match(starting[0].message, /\nprofile: wild \(\/mlx-start\)\n/);
+
+  const installsBefore = h.installCalls;
+  const argvBefore = readFileSync(h.argvFile, "utf8");
+  const providerCallsBefore = h.providerCalls.length;
+  const notesBefore = h.notes.length;
+
+  await h.start("qwen3_4b --profile nope");
+
+  const added = h.notes.slice(notesBefore);
+  assert.equal(added.length, 1, "exactly one new note");
+  assert.equal(added[0].type, "error");
+  assert.ok(added[0].message.includes("available profiles: careful, wild"), added[0].message);
+  assert.equal(h.installCalls, installsBefore, "no install was attempted");
+  assert.equal(readFileSync(h.argvFile, "utf8"), argvBefore, "nothing was spawned");
+  assert.equal(h.providerCalls.length, providerCallsBefore, "the provider was not re-registered");
+  assert.equal(await connectRefused(port), false, "the running server was not touched");
+});
+
+test("accept 3 (criterion 3): the stand-in server receives the profile's values, and another provider's or model's request is unchanged", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(ACCEPT_CONFIG(port));
+  await h.start("qwen3_4b");
+  const original = acceptPayload();
+
+  const rewritten = await h.runHook(original);
+  assert.equal(await h.postToServer(port, rewritten), 200);
+
+  const received = h.requests().at(-1)?.body as Record<string, unknown>;
+  assert.equal(received.temperature, 0.2);
+  assert.equal(received.top_p, 0.9);
+  assert.equal(received.top_k, 40);
+  assert.equal(received.min_p, 0.05);
+  assert.equal(received.repetition_penalty, 1.1);
+  assert.deepEqual(received.stop, ["###"]);
+  assert.equal(received.seed, 42);
+  assert.equal(received.max_completion_tokens, 1024);
+  assert.equal(received.max_tokens, 1024);
+  assert.equal(received.model, original.model);
+  assert.deepEqual(received.messages, original.messages);
+  assert.equal(received.stream, true);
+
+  assert.equal(await h.runHook(acceptPayload(), "anthropic"), undefined);
+  assert.equal(await h.postToServer(port, acceptPayload()), 200);
+  assert.deepEqual(h.requests().at(-1)?.body, acceptPayload(), "another provider's request is unchanged");
+
+  const otherModel = { ...acceptPayload(), model: "some/other-model" };
+  assert.equal(await h.runHook(otherModel, PROVIDER_ID, "some/other-model"), undefined);
+  assert.equal(await h.postToServer(port, otherModel), 200);
+  assert.deepEqual(h.requests().at(-1)?.body, otherModel, "another model id's request is unchanged");
+});
+
+test("accept 4 (criterion 4): enable_thinking false leaves one source of template arguments and no reasoning_effort", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(ACCEPT_CONFIG(port));
+  await h.start("qwen3_4b");
+
+  assert.equal(await h.postToServer(port, await h.runHook(acceptPayload())), 200);
+  const careful = h.requests().at(-1)?.body as Record<string, unknown>;
+  assert.deepEqual(careful.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(Object.prototype.hasOwnProperty.call(careful, "reasoning_effort"), false);
+
+  await h.start("qwen3_4b --profile wild");
+  assert.equal(await h.postToServer(port, await h.runHook(acceptPayload())), 200);
+  const wild = h.requests().at(-1)?.body as Record<string, unknown>;
+  assert.deepEqual(wild.chat_template_kwargs, { enable_thinking: true, preserve_thinking: true });
+  assert.equal(wild.reasoning_effort, "high");
+  assert.deepEqual(wild, { ...acceptPayload(), temperature: 1.1 }, "only the temperature differs from pi's payload");
+});
