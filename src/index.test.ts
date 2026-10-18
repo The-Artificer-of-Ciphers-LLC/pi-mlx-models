@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { PROVIDER_ID, VENV_PYTHON } from "./config.js";
 import { createExtension } from "./index.js";
 import { parseHelpFlags, type ProbeResult, type VersionResult } from "./flagprobe.js";
+import { lastLaunchPath, writeLastLaunch } from "./laststate.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { ensureInstalled, type RuntimeHost } from "./runtime.js";
 import { SETTINGS, initFlagSpecs } from "./settings.js";
@@ -4325,4 +4326,212 @@ test("active model: when pi refuses, throws or cannot find the model, the start 
       assert.deepEqual(didNotSelect(h.notes), [], c.name);
     }
   }
+});
+
+// ---- /mlx-last: replay of the remembered launch, its refusals and its overrides (plan 06-06: CMD-01, CMD-06, D-06, D-07) ----
+
+type Remembered = { model: string; profile: string | null };
+const recordFileOf = (settings: ReturnType<typeof freshSettings>) => lastLaunchPath(settings.globalConfigPath);
+const startLast = (h: Harness, input = "") => h.commands.get("mlx-last")!(input, h.ctx);
+
+/** A harness whose data directory holds the given record (as the writer would produce it, or raw text) and global file. */
+async function lastSetup(options: { global?: unknown; record?: Remembered | string; setup?: Parameters<typeof setup>[0] } = {}) {
+  const settings = freshSettings({});
+  if (options.global !== undefined) writeGlobal(settings, options.global);
+  if (typeof options.record === "string") writeFileSync(recordFileOf(settings), options.record);
+  else if (options.record !== undefined) assert.deepEqual(writeLastLaunch(recordFileOf(settings), options.record), { ok: true });
+  const h = await setup({ ...options.setup, settings });
+  return { h, settings, recordFile: recordFileOf(settings) };
+}
+
+const FAST_RECORD: Remembered = { model: QWEN_ID, profile: "fast" };
+const FAST_AND_OTHER = {
+  models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } }, other: { sampling: { temperature: 0.9 } } } } },
+};
+
+test("mlx-last with no record says nothing is remembered, points to /mlx-start and starts nothing", async () => {
+  const { h, recordFile } = await lastSetup();
+
+  await startLast(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(h.notes.length, 1);
+  assert.equal(h.notes[0].type, "info");
+  assert.ok(h.notes[0].message.startsWith("mlx-last: nothing is remembered yet."), h.notes[0].message);
+  assert.ok(h.notes[0].message.includes("/mlx-start"), h.notes[0].message);
+  assertNothingHappened(h);
+  assert.equal(existsSync(recordFile), false, "reading creates nothing");
+});
+
+test("mlx-last answers 'nothing remembered' before it reads any configuration, whatever the files hold", async () => {
+  const { h } = await lastSetup({ global: { server: { port: 99999 } } });
+
+  await startLast(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.ok(h.notes[0].message.startsWith("mlx-last: nothing is remembered yet."), h.notes[0].message);
+  assertNothingHappened(h);
+});
+
+const UNREADABLE_RECORDS: Array<[string, string, string]> = [
+  ["text that is not JSON", "this is not json\n", "is not valid JSON"],
+  ["a model id that starts with a dash", '{"version":1,"model":"--trust-remote-code","profile":null}\n', "has an invalid model id"],
+];
+for (const [what, text, reason] of UNREADABLE_RECORDS) {
+  test(`mlx-last with an unreadable record (${what}) says the file is unreadable, starts nothing and leaves the file alone`, async () => {
+    const { h, recordFile } = await lastSetup({ record: text });
+
+    await startLast(h);
+
+    assert.deepEqual(errors(h.notes), [
+      `mlx-last failed: the remembered launch file ${reason}; treating it as nothing remembered. Run /mlx-start to choose a model; a successful start replaces the file.`,
+    ]);
+    assertNothingHappened(h);
+    assert.equal(readFileSync(recordFile, "utf8"), text, "the file is left as it was");
+  });
+}
+
+test("mlx-last starts the recorded model and profile, with the same arguments as /mlx-start of that model and profile", async () => {
+  const { h } = await lastSetup({ global: FAST_AND_OTHER, record: FAST_RECORD });
+  const reference = await lastSetup({ global: FAST_AND_OTHER });
+
+  await startLast(h);
+  await startMlx(reference.h, "qwen3_4b --profile fast");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN_ID]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--temp=0.2"]);
+  assert.deepEqual(h.server.launches[0], reference.h.server.launches[0], "the launch spec is the one /mlx-start gives");
+  assert.deepEqual(startingNotes(h.notes), [
+    `Starting MLX server with ${QWEN_ID} (preset: qwen3_4b)...\nprofile: fast (previous launch)\nflags: --temp 0.2 (profile fast)`,
+  ]);
+});
+
+test("mlx-last with a profile the model no longer defines is refused, with no fallback to another profile or the bare model", async () => {
+  const { h, recordFile } = await lastSetup({
+    global: { models: { qwen3_4b: { profiles: { careful: { sampling: { temperature: 0.1 } } } } } },
+    record: FAST_RECORD,
+  });
+  const before = readFileSync(recordFile, "utf8");
+
+  await startLast(h);
+
+  const [message] = errors(h.notes);
+  assert.equal(errors(h.notes).length, 1);
+  assert.ok(message.startsWith("mlx-last failed: invalid configuration"), message);
+  assert.ok(message.includes("available profiles: careful"), message);
+  assert.ok(message.includes("kept from the previous launch"), message);
+  assertNothingHappened(h);
+  assert.equal(readFileSync(recordFile, "utf8"), before, "the record is unchanged");
+});
+
+test("mlx-last --profile other beats the remembered profile and the start message names /mlx-last", async () => {
+  const { h } = await lastSetup({ global: FAST_AND_OTHER, record: FAST_RECORD });
+
+  await startLast(h, "--profile other");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--temp=0.9"]);
+  assert.equal(startingNotes(h.notes)[0].split("\n")[1], "profile: other (/mlx-last)");
+});
+
+test("mlx-last overrides apply to one launch only: the record keeps only version, model and profile", async () => {
+  const { h, recordFile } = await lastSetup({ global: FAST_AND_OTHER, record: FAST_RECORD });
+
+  await startLast(h, "--log-level DEBUG");
+  assert.deepEqual(errors(h.notes), []);
+  const args = h.server.launches[0]?.extraArgs ?? [];
+  assert.ok(args.includes("--log-level=DEBUG") && args.includes("--temp=0.2"), JSON.stringify(args));
+  assert.equal(args.length, 2);
+  const saved = JSON.parse(readFileSync(recordFile, "utf8")) as Record<string, unknown>;
+  assert.deepEqual(saved, { version: 1, model: QWEN_ID, profile: "fast" });
+
+  await startLast(h);
+  assert.equal(h.server.launches[1]?.extraArgs.some((arg) => arg.startsWith("--log-level")), false, JSON.stringify(h.server.launches[1]?.extraArgs));
+});
+
+test("mlx-last takes no model: a model argument is an error and nothing starts", async () => {
+  const { h } = await lastSetup({ record: { model: QWEN_ID, profile: null } });
+
+  await startLast(h, "qwen3_4b");
+
+  const [message] = errors(h.notes);
+  assert.equal(errors(h.notes).length, 1);
+  assert.ok(/^mlx-last failed: unexpected argument .*\(\/mlx-last takes no model\)/.test(message), message);
+  assertNothingHappened(h);
+});
+
+test("mlx-last with an unknown flag is an error that lists the valid flags", async () => {
+  const { h } = await lastSetup({ record: { model: QWEN_ID, profile: null } });
+
+  await startLast(h, "--bogus 1");
+
+  const [message] = errors(h.notes);
+  assert.equal(errors(h.notes).length, 1);
+  assert.ok(message.startsWith("mlx-last failed: unknown flag --bogus (valid flags: "), message);
+  assert.ok(message.includes("--profile"), message);
+  assertNothingHappened(h);
+});
+
+test("mlx-last with an empty profile flag is refused and nothing starts", async () => {
+  const { h } = await lastSetup({ global: FAST_AND_OTHER, record: FAST_RECORD });
+
+  await startLast(h, "--profile=");
+
+  assert.deepEqual(errors(h.notes), ["mlx-last failed: --profile needs a profile name"]);
+  assertNothingHappened(h);
+});
+
+test("mlx-last refuses a project file that asks for trustRemoteCode, with its own name, before any dialog, install or start", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { trustRemoteCode: true } });
+  const { h, settings } = await lastSetup({ record: { model: QWEN_ID, profile: null }, setup: { ctx: { cwd } } });
+
+  await startLast(h);
+
+  assert.deepEqual(errors(h.notes), [
+    refusalText(settings, ["  server.trustRemoteCode: lets the model repository run Python code"]).replace(/^mlx-start failed:/, "mlx-last failed:"),
+  ]);
+  assertNothingHappened(h);
+  assert.equal(h.confirms.length, 0, "no dialog can override the refusal");
+});
+
+test("mlx-last asks the same trust confirmation as /mlx-start, and declining it prints the /mlx-last cancel line and starts nothing", async () => {
+  const { h } = await lastSetup({ global: { server: { trustRemoteCode: true } }, record: { model: QWEN_ID, profile: null } });
+  scriptConfirms(h, [false]);
+
+  await startLast(h);
+
+  assert.equal(h.confirms.length, 1);
+  assert.equal(h.confirms[0].title, TRUST_TITLE);
+  assert.deepEqual(infos(h.notes), ["mlx-last cancelled: --trust-remote-code was not confirmed."]);
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, []);
+  assert.equal(h.installCalls.length, 0);
+});
+
+test("mlx-last with a confirmed trust dialog starts the remembered model", async () => {
+  const { h } = await lastSetup({ global: { server: { trustRemoteCode: true } }, record: { model: QWEN_ID, profile: null } });
+  scriptConfirms(h, [true]);
+
+  await startLast(h);
+
+  assert.equal(h.confirms.length, 1);
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN_ID]);
+});
+
+test("mlx-last with a trust risk and no UI is refused with the /mlx-last name in the message", async () => {
+  const { h } = await lastSetup({
+    global: { server: { trustRemoteCode: true } },
+    record: { model: QWEN_ID, profile: null },
+    setup: { ctx: { hasUI: false } },
+  });
+
+  await startLast(h);
+
+  assert.deepEqual(errors(h.notes), [
+    "mlx-last failed: --trust-remote-code needs interactive confirmation; run /mlx-last in an interactive pi session",
+  ]);
+  assertNothingHappened(h);
 });
