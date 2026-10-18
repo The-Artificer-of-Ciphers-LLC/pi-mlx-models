@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PROVIDER_ID } from "./config.js";
+import { PROVIDER_ID, VENV_PYTHON } from "./config.js";
 import { createExtension } from "./index.js";
 import { parseHelpFlags, type ProbeResult } from "./flagprobe.js";
 import { MODEL_PRESETS } from "./presets.js";
+import { ensureInstalled, type RuntimeHost } from "./runtime.js";
 import { SETTINGS } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
 import { makeCtx, makeFakePi, type CtxOptions } from "./testkit.js";
@@ -2252,4 +2253,76 @@ test("an install that lists every KV flag passes all three in schema order with 
   assert.deepEqual(h.server.launches[0]?.extraArgs, ["--kv-bits=4", "--kv-group-size=32", "--quantized-kv-start=0"]);
   assert.deepEqual(warningTexts(h.notes), [KV_BATCHING_4]);
   assert.ok(!h.notes.some((n) => n.message.includes("has no effect")));
+});
+
+// ---- the mlx-lm version policy reaches pip through /mlx-init (plan 03-03, RUN-02) ----
+
+const PIP_INDEX_ARG = "--index-url=https://pypi.org/simple/";
+
+/** An extension around the REAL ensureInstalled over a scripted host: no network and no real pip. */
+async function setupRealInstall(globalFile?: unknown) {
+  const settings = freshSettings({});
+  if (globalFile !== undefined) writeGlobal(settings, globalFile);
+  const hostCalls: string[][] = [];
+  const host: RuntimeHost = {
+    findPython: () => "/py3",
+    exists: () => true,
+    run: async (cmd, args, onLine) => {
+      hostCalls.push([cmd, ...args]);
+      if (args[0] === "--version") onLine?.("Python 3.13.1");
+    },
+  };
+  const fakePi = makeFakePi();
+  const fakeCtx = makeCtx();
+  const extension = createExtension({
+    server: makeFakeServer(),
+    ensureInstalled: ((opts?: any) => ensureInstalled({ ...opts, host })) as any,
+    discoverModelIds: async () => [],
+    settings,
+  });
+  await extension(fakePi.pi);
+  return { hostCalls, ...fakePi, ...fakeCtx };
+}
+
+const pipStep = (spec: string) => [VENV_PYTHON, "-m", "pip", "install", "--upgrade", spec, PIP_INDEX_ARG];
+
+test("an exact pin in the global file reaches pip as the single spec mlx-lm==X through mlx-init", async () => {
+  const h = await setupRealInstall({ mlxLm: { version: "0.31.1" } });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.deepEqual(h.hostCalls.filter((call) => call.includes("pip")), [pipStep("pip"), pipStep("mlx-lm==0.31.1")]);
+  assert.ok(h.notes.some((n) => n.type === "info" && n.message === "MLX runtime installed."));
+  assert.deepEqual(errors(h.notes), []);
+});
+
+test("with no mlxLm key mlx-init floats: the mlx-lm step keeps the floor spec", async () => {
+  const h = await setupRealInstall();
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.deepEqual(h.hostCalls.filter((call) => call.includes("pip")), [pipStep("pip"), pipStep("mlx-lm>=0.24.0")]);
+});
+
+test("the word latest floats exactly like no setting", async () => {
+  const h = await setupRealInstall({ mlxLm: { version: "latest" } });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.deepEqual(h.hostCalls.filter((call) => call.includes("pip")), [pipStep("pip"), pipStep("mlx-lm>=0.24.0")]);
+});
+
+test("a bad mlxLm.version refuses mlx-init before any side effect", async () => {
+  const h = await setupRealInstall({ mlxLm: { version: "^0.32" } });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.equal(errors(h.notes).length, 1);
+  assert.ok(errors(h.notes)[0].startsWith("mlx-init failed: invalid configuration"), errors(h.notes)[0]);
+  assert.ok(
+    errors(h.notes)[0].includes('mlxLm.version (global config.json): "^0.32" must be "latest" or an exact version such as 0.32.2'),
+    errors(h.notes)[0],
+  );
+  assert.deepEqual(h.hostCalls, [], "the scripted host was never called");
+  assert.deepEqual(h.widgets, [], "no progress widget was drawn");
 });
