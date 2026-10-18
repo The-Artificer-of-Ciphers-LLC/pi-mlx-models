@@ -158,8 +158,11 @@ export async function ensureInstalled(options: {
   const emit = options.onEvent ?? (() => {});
   const policy = options.policy ?? { version: "latest" };
   // One element each, built from a validated value: a value can never become a second pip argument (D-18).
-  const indexArg = `--index-url=${policy.pipIndex ?? DEFAULT_PIP_INDEX}`;
+  const index = policy.pipIndex ?? DEFAULT_PIP_INDEX;
+  const indexArg = `--index-url=${index}`;
   const mlxLmSpec = policy.version === "latest" ? MLX_LM_FLOOR : `mlx-lm==${policy.version}`;
+  // What events and failures say about the index: already validated, and still cleaned and clipped (T-03-18).
+  const shownIndex = clipDiagnostic(cleanLabel(index), 200, "start");
 
   if (!options.upgrade && host.exists(VENV_PYTHON)) {
     const importable = await host.run(VENV_PYTHON, ["-c", "import mlx_lm"]).then(
@@ -212,11 +215,24 @@ export async function ensureInstalled(options: {
     emit({ phase, state: "active", detail: line.slice(0, 120), progress: m ? Number(m[1]) / 100 : undefined });
   };
 
-  emit({ phase: "pip", state: "active", detail: "Upgrading pip" });
-  await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", "pip", indexArg], pipStep("pip"));
+  // A failure keeps pip's own text whole (already cleaned and clipped to its last 800 characters by `run`), after a
+  // prefix that says which spec and which index were being used, so a mistyped pin or an unreachable mirror reads at once.
+  const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+  emit({ phase: "pip", state: "active", detail: `Upgrading pip (index ${shownIndex})` });
+  try {
+    await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", "pip", indexArg], pipStep("pip"));
+  } catch (error) {
+    if (index === DEFAULT_PIP_INDEX) throw error;
+    throw new Error(`pip could not be upgraded from ${shownIndex}: ${messageOf(error)}`);
+  }
   emit({ phase: "pip", state: "done", detail: "pip upgraded" });
 
-  emit({ phase: "mlx-lm", state: "active", detail: "Installing mlx-lm" });
-  await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", mlxLmSpec, indexArg], pipStep("mlx-lm"));
+  emit({ phase: "mlx-lm", state: "active", detail: `Installing ${mlxLmSpec} (index ${shownIndex})` });
+  try {
+    await host.run(VENV_PYTHON, ["-m", "pip", "install", "--upgrade", mlxLmSpec, indexArg], pipStep("mlx-lm"));
+  } catch (error) {
+    throw new Error(`Installing ${mlxLmSpec} from ${shownIndex} failed: ${messageOf(error)}`);
+  }
   emit({ phase: "mlx-lm", state: "done", detail: "mlx-lm installed" });
 }
