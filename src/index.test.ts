@@ -10,7 +10,8 @@ import { MODEL_PRESETS } from "./presets.js";
 import { ensureInstalled, type RuntimeHost } from "./runtime.js";
 import { SETTINGS, initFlagSpecs } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
-import { makeCtx, makeFakePi, type CtxOptions } from "./testkit.js";
+import type { ReadModelConfig } from "./modelinfo.js";
+import { makeCtx, makeFakeModelConfig, makeFakePi, type CtxOptions } from "./testkit.js";
 
 type ProviderCall = { name: string; config: any };
 type Note = { message: string; type: string };
@@ -63,6 +64,7 @@ test("mlx-start with a preset key starts that preset's model and reports ready",
     server,
     ensureInstalled: async () => {},
     discoverModelIds: async () => [preset.modelId],
+    readModelConfig: makeFakeModelConfig().read,
     settings: freshSettings({}),
   });
   await extension(pi);
@@ -123,8 +125,11 @@ async function setup(
     probe?: () => Promise<ProbeResult>;
     /** What the cheap installed-version query answers; default: mlx-lm 0.32.2. */
     installed?: () => Promise<VersionResult>;
+    /** What reads a model's config.json; default: a stand-in answering a 131072 window, so no test reaches the real cache. */
+    readModelConfig?: ReadModelConfig;
   } = {},
 ) {
+  const fakeModelConfig = makeFakeModelConfig();
   const server = makeFakeServer(options.server);
   const installCalls: any[] = [];
   /** How many times the extension asked which flags the install supports. */
@@ -145,6 +150,7 @@ async function setup(
       discoveryCalls += 1;
       return options.discovered ?? [];
     },
+    readModelConfig: options.readModelConfig ?? fakeModelConfig.read,
     settings: options.settings ?? freshSettings(options.env ?? {}),
     probeFlags: async () => {
       probeCalls += 1;
@@ -171,6 +177,8 @@ async function setup(
     get discoveryCalls() {
       return discoveryCalls;
     },
+    /** The calls the default stand-in reader received: the model id and whether the Hub was allowed. */
+    readCalls: fakeModelConfig.calls,
   };
 }
 
@@ -784,6 +792,7 @@ test("the factory registers the four pi flags as string flags with no default, b
     server: makeFakeServer(),
     ensureInstalled: async () => {},
     discoverModelIds: async () => [],
+    readModelConfig: makeFakeModelConfig().read,
     settings: freshSettings({}),
   });
 
@@ -966,6 +975,7 @@ test("--mlx-model alone never starts anything, not even when pi runs the factory
       installCalls.push(opts);
     }) as any,
     discoverModelIds: async () => [],
+    readModelConfig: makeFakeModelConfig().read,
     settings: freshSettings({}),
   });
 
@@ -2372,6 +2382,7 @@ async function setupRealInstall(
     server,
     ensureInstalled: ((opts?: any) => ensureInstalled({ ...opts, host })) as any,
     discoverModelIds: async () => [],
+    readModelConfig: makeFakeModelConfig().read,
     settings,
     installedVersion: async () => extra.installed ?? { ok: true, version: "0.32.2" },
   });
@@ -3594,4 +3605,105 @@ test("by default a stop and a shutdown register an empty list, a new start repla
   await h.handlers.get("session_shutdown")!();
   assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), []);
   assert.deepEqual(errors(h.notes), []);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The model line and the metadata step (MOD-01, D-03)
+// ---------------------------------------------------------------------------------------------------------------------
+
+const QWEN_ID = MODEL_PRESETS[3].modelId;
+const READY_NOTE = "MLX server is ready for prompts. Use /model and pick pi-mlx-models/...";
+const modelNotes = (notes: Note[]) => notes.filter((n) => n.message.startsWith("model: context "));
+
+test("a completed start shows one model line after the registration and before the unchanged ready message", async () => {
+  const stand = makeFakeModelConfig({ [QWEN_ID]: { max_position_embeddings: 262144 } });
+  const h = await setup({ readModelConfig: stand.read });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  const lines = modelNotes(h.notes);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].type, "info");
+  assert.equal(
+    lines[0].message,
+    "model: context 262144 (config.json), max output 8192 (default), reasoning no (default), input text (default)",
+  );
+  const registered = h.providerCalls.at(-1)?.config.models[0];
+  assert.equal(registered.contextWindow, 262144);
+  assert.equal(registered.maxTokens, 8192);
+  const messages = h.notes.map((n) => n.message);
+  const starting = messages.findIndex((m) => m.startsWith("Starting MLX server with"));
+  assert.ok(starting >= 0);
+  assert.ok(starting < messages.indexOf(lines[0].message));
+  assert.equal(messages.indexOf(lines[0].message) + 1, messages.indexOf(READY_NOTE));
+  assert.equal(messages.at(-1), READY_NOTE);
+  assert.deepEqual(stand.calls, [{ modelId: QWEN_ID, hub: true }]);
+});
+
+test("the reader is asked once per start with the launched id, and not at all for a refused or failed start", async () => {
+  const ok = await setup();
+  await ok.commands.get("mlx-start")!("qwen3_4b", ok.ctx);
+  assert.deepEqual(ok.readCalls, [{ modelId: QWEN_ID, hub: true }]);
+
+  const refused = await setup();
+  await refused.commands.get("mlx-start")!("qwen3_4b --port notanumber", refused.ctx);
+  assert.equal(refused.server.startCalls.length, 0);
+  assert.deepEqual(refused.readCalls, []);
+
+  const failed = await setup({
+    server: {
+      start: async () => {
+        throw new Error("server failed before ready");
+      },
+    },
+  });
+  await failed.commands.get("mlx-start")!("qwen3_4b", failed.ctx);
+  assert.equal(failed.server.startCalls.length, 1);
+  assert.deepEqual(failed.readCalls, []);
+  assert.equal(modelNotes(failed.notes).length, 0);
+});
+
+test("a /mlx-stop that arrives while the model is being read abandons the start", async () => {
+  const gate = deferred<{ ok: true; config: unknown; source: "cache" }>();
+  let reads = 0;
+  const h = await setup({
+    readModelConfig: async () => {
+      reads += 1;
+      return gate.promise;
+    },
+  });
+
+  const started = h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  for (let i = 0; i < 50 && reads === 0; i += 1) await flush();
+  assert.equal(reads, 1, "the start is waiting on the read");
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  const registrations = h.providerCalls.length;
+
+  gate.resolve({ ok: true, config: { max_position_embeddings: 262144 }, source: "cache" });
+  await started;
+  await flush();
+
+  assert.equal(h.providerCalls.length, registrations, "nothing is registered after the stop's own registration");
+  assert.deepEqual(h.providerCalls.at(-1)?.config.models, []);
+  assert.equal(modelNotes(h.notes).length, 0);
+  assert.equal(h.notes.some((n) => n.message === READY_NOTE), false);
+});
+
+test("a reader that rejects, and one that throws, give the fallback window and a start that succeeds", async () => {
+  const rejecting = await setup({ readModelConfig: () => Promise.reject(new Error("reader rejected")) });
+  await rejecting.commands.get("mlx-start")!("qwen3_4b", rejecting.ctx);
+
+  const throwing = await setup({
+    readModelConfig: (() => {
+      throw new Error("reader threw");
+    }) as unknown as ReadModelConfig,
+  });
+  await throwing.commands.get("mlx-start")!("qwen3_4b", throwing.ctx);
+
+  for (const h of [rejecting, throwing]) {
+    assert.deepEqual(errors(h.notes), []);
+    assert.equal(h.notes.at(-1)?.message, READY_NOTE);
+    assert.equal(h.providerCalls.at(-1)?.config.models[0].contextWindow, 32768);
+    assert.ok(modelNotes(h.notes)[0].message.startsWith("model: context 32768 (fallback), "));
+  }
 });

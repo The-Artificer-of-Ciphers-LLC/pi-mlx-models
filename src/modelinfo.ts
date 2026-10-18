@@ -249,3 +249,7 @@ export function deriveModelInfo(input: { id: string; config?: ModelConfigRead })
   }
   return info;
 }
+
+export function describeModel(_info: ModelInfo): string {
+  return "";
+}

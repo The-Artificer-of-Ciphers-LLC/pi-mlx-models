@@ -10,7 +10,9 @@ import {
   createModelConfigReader,
   defaultMaxTokens,
   deriveModelInfo,
+  describeModel,
   resolveCacheRoot,
+  type ModelInfo,
 } from "./modelinfo.js";
 import { hfFixture, writeHfCache } from "./testkit.js";
 
@@ -399,4 +401,46 @@ test("the default output limit is a quarter of the window, capped at 8192 or 327
   for (const [window, reasoning, expected] of table) {
     assert.equal(defaultMaxTokens(window, reasoning), expected, `${window} ${reasoning}`);
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The line shown to the user (D-03, D-07)
+// ---------------------------------------------------------------------------------------------------------------------
+
+test("describeModel states the values and where each came from", () => {
+  const info = deriveModelInfo({
+    id: "org/plain-model",
+    config: { ok: true, config: hfFixture("qwen3-4b-instruct-2507-4bit"), source: "cache" },
+  });
+
+  assert.equal(
+    describeModel(info),
+    "model: context 262144 (config.json), max output 8192 (default), reasoning no (default), input text (default)",
+  );
+});
+
+test("describeModel shows the fallback window as a fallback", () => {
+  const info = deriveModelInfo({ id: "org/plain-model", config: { ok: false, reason: "not in the Hugging Face cache" } });
+
+  assert.ok(describeModel(info).startsWith("model: context 32768 (fallback), "));
+});
+
+test("describeModel cleans, redacts and clips every source text", () => {
+  const base = deriveModelInfo({ id: "org/m" });
+  const info: ModelInfo = {
+    ...base,
+    contextSource: "esc\u001b[31m\nline" + "x".repeat(200),
+    maxTokensSource: "user:pass@host",
+    reasoningSource: "bell\u0007tab\there",
+    inputSource: "https://user:secret@example.com/path",
+  };
+
+  const line = describeModel(info);
+
+  assert.equal(/[\u0000-\u001f\u007f-\u009f]/.test(line), false, "no control character, newline included");
+  assert.equal(line.includes("pass@"), false);
+  assert.equal(line.includes("secret"), false);
+  assert.ok(line.includes("***"));
+  assert.ok(line.includes("x".repeat(60)));
+  assert.equal(line.includes("x".repeat(80)), false, "a long source is clipped to 80 characters");
 });
