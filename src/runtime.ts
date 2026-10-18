@@ -128,8 +128,18 @@ export const systemHost: RuntimeHost = {
   run,
 };
 
-export async function runtimeInstalled(_host: RuntimeHost = systemHost): Promise<boolean> {
-  throw new Error("not implemented");
+/**
+ * True when the venv Python exists and can import mlx_lm: the one answer to "has /mlx-init been run". Runs only the fixed
+ * command the installer already runs (`-c "import mlx_lm"`), with no user text, and never throws: any failure is false.
+ */
+export async function runtimeInstalled(host: RuntimeHost = systemHost): Promise<boolean> {
+  try {
+    if (!host.exists(VENV_PYTHON)) return false;
+    await host.run(VENV_PYTHON, ["-c", "import mlx_lm"]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Minor version of the venv's own interpreter, or null when it cannot be run or its output is not a Python 3 version. */
@@ -168,15 +178,9 @@ export async function ensureInstalled(options: {
   // What events and failures say about the index: already validated, and still cleaned and clipped (T-03-18).
   const shownIndex = clipDiagnostic(cleanLabel(index), 200, "start");
 
-  if (!options.upgrade && host.exists(VENV_PYTHON)) {
-    const importable = await host.run(VENV_PYTHON, ["-c", "import mlx_lm"]).then(
-      () => true,
-      () => false,
-    );
-    if (importable) {
-      emit({ phase: "mlx-lm", state: "done", detail: "mlx-lm already installed" });
-      return;
-    }
+  if (!options.upgrade && (await runtimeInstalled(host))) {
+    emit({ phase: "mlx-lm", state: "done", detail: "mlx-lm already installed" });
+    return;
   }
 
   const py = host.findPython();
