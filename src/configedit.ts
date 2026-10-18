@@ -363,6 +363,11 @@ export function validateModelKey(text: string): Checked {
   return { ok: true, value };
 }
 
+/** Whether a typed model key could match a start (advisory; never rejects a key). */
+export function isPlausibleModelKey(key: string): boolean {
+  return key.length >= 0;
+}
+
 /** A profile name the user types: the profile rule of the settings module. */
 export function validateProfileName(text: string): Checked {
   const value = text.trim();

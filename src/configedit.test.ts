@@ -11,6 +11,7 @@ import {
   editConfig,
   editableKeys,
   getAt,
+  isPlausibleModelKey,
   modelKeys,
   profileNames,
   renderConfig,
@@ -20,6 +21,7 @@ import {
   validateModelKey,
   validateProfileName,
 } from "./configedit.js";
+import { MODEL_PRESETS } from "./presets.js";
 import { MAX_FILE_BYTES, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, prepareSettings, readLayerFile } from "./settings.js";
 
 /** A fresh directory under the system temp directory, removed when the test ends. */
@@ -600,4 +602,14 @@ test("renderConfig unusable: says the file cannot be used, gives the reason and 
   assert.ok(text.includes("is not valid JSON (Unexpected token)"));
   assert.match(text, /\/mlx-config will not change it/);
   assert.equal(existsSync("/cfg"), false);
+});
+
+test("isPlausibleModelKey: a preset key, an id with a slash and a local path can match a start; a bare name or a profile name cannot", () => {
+  for (const preset of MODEL_PRESETS) assert.equal(isPlausibleModelKey(preset.key), true, preset.key);
+  for (const key of ["org/name", "mlx-community/Qwen3-4B-Instruct-2507-4bit", "/abs/path/model", "./rel/model", "../up/model"]) {
+    assert.equal(isPlausibleModelKey(key), true, key);
+  }
+  for (const key of ["careful", "qwen3.4b", "fast", "gpt2", "Qwen3_4B", "__proto__", "toString"]) {
+    assert.equal(isPlausibleModelKey(key), false, key);
+  }
 });

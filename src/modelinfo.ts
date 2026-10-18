@@ -233,7 +233,7 @@ function readFromCache(cacheRoot: string, modelId: string): ModelConfigRead {
 }
 
 /** An id that is an absolute path, or starts with `./` or `../`, names a local model directory. */
-const isLocalPath = (id: string): boolean => isAbsolute(id) || id.startsWith("./") || id.startsWith("../");
+export const isLocalPath = (id: string): boolean => isAbsolute(id) || id.startsWith("./") || id.startsWith("../");
 
 /** Every Hub failure is this prefix and a constant phrase, so a reason never holds a token, a URL or a thrown message. */
 const HUB_MISS_PREFIX = "not in the local cache; ";

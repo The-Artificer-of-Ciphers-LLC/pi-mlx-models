@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { confirmationFor, renderConfig, setAt } from "./configedit.js";
 import { ACTION, type ConfigMenuUi, MENU, NEW_ENTRY, NEW_PROFILE, NO_DEFAULT, PROFILE_ACTION, runConfigMenu } from "./configmenu.js";
+import { MODEL_PRESETS } from "./presets.js";
 import { PROFILE_NAME_SHORT_RULE, SETTINGS, prepareSettings, readLayerFile } from "./settings.js";
 import { makeCtx, scriptInput, scriptSelect } from "./testkit.js";
 
@@ -251,6 +252,40 @@ test("configmenu new model entry: NEW_ENTRY asks for a key, an existing entry do
   bad.assertScriptsUsed();
 });
 
+test("configmenu typed model key that cannot match asks Add anyway and a no writes nothing", async (t) => {
+  const s = session(t, { confirm: false, select: [MENU.profiles, NEW_ENTRY, MENU.done], input: ["careful"] });
+  await s.run();
+  assert.equal(s.confirms.length, 1, JSON.stringify(s.prompts));
+  assert.match(s.confirms[0].title, /careful/);
+  assert.match(s.confirms[0].title, /anyway\?/);
+  for (const preset of MODEL_PRESETS) assert.ok(s.confirms[0].message.includes(preset.key), preset.key);
+  assert.match(s.confirms[0].message, /no start will use settings stored under/);
+  assert.equal(existsSync(s.path), false);
+  assert.ok(s.notes.some((note) => note.type === "info" && /nothing was added/i.test(note.message)), JSON.stringify(s.notes));
+  s.assertScriptsUsed();
+});
+
+test("configmenu typed model key that cannot match: a yes adds the entry and a profile can be created under it", async (t) => {
+  const s = session(t, { confirm: true, select: [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: ["careful", "fast"] });
+  await s.run();
+  assert.deepEqual(s.json(), { models: { careful: { profiles: { fast: {} } } } });
+  const file = readLayerFile(s.path);
+  assert.equal(file.state, "ok");
+  assert.equal(prepareSettings({ global: file, env: {} }).ok, true);
+  assert.equal(s.confirms.length, 1);
+  s.assertScriptsUsed();
+});
+
+test("configmenu typed model key that can match asks nothing: a preset key, org/name and local paths are added directly", async (t) => {
+  for (const key of ["qwen3_4b", "org/name", "/abs/path/model", "./rel/model", "../up/model"]) {
+    const s = session(t, { confirm: true, select: [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: [key, "fast"] });
+    await s.run();
+    assert.deepEqual(s.json(), { models: { [key]: { profiles: { fast: {} } } } }, key);
+    assert.equal(s.confirms.length, 0, key);
+    s.assertScriptsUsed();
+  }
+});
+
 test("configmenu add a profile: an empty profile is created, then its keys land in sampling and limits objects, and the file validates", async (t) => {
   const start = { models: { qwen3_4b: {} } };
   const created = session(t, { file: start, select: [MENU.profiles, "qwen3_4b", NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: ["fast"] });
@@ -349,8 +384,9 @@ test("configmenu offers only per-model keys in a profile: limits and sampling ro
 });
 
 test("configmenu hostile names: __proto__ is a plain key, and a listed key with an escape sequence is shown cleaned but still edited exactly", async (t) => {
-  const proto = session(t, { select: [MENU.modelEntry, NEW_ENTRY, "numDraftTokens", ACTION.set, MENU.done], input: ["__proto__", "2"] });
+  const proto = session(t, { confirm: true, select: [MENU.modelEntry, NEW_ENTRY, "numDraftTokens", ACTION.set, MENU.done], input: ["__proto__", "2"] });
   await proto.run();
+  assert.equal(proto.confirms.length, 1, "a key that can never match a start is asked about");
   const models = (proto.json() as { models: object }).models;
   assert.equal(Object.hasOwn(models, "__proto__"), true);
   assert.equal(Object.getPrototypeOf(models), Object.prototype);
