@@ -1018,6 +1018,43 @@ test("configmenu WR-02b: the delete-profile confirm and notices give the model e
   withDefault.assertScriptsUsed();
 });
 
+test("configmenu WR-02c: a notice that names a model adds the entry's place only when another key looks the same", async (t) => {
+  const cases: Array<[string[], number]> = [
+    [LOOK_ALIKE_PATHS, 1],
+    [LOOK_ALIKE_CONTROL, 0],
+  ];
+  for (const [keys, index] of cases) {
+    const file = { models: Object.fromEntries(keys.map((key) => [key, {}])) };
+    const s = session(t, { file, select: [MENU.modelEntry, index, "numDraftTokens", ACTION.set, MENU.done], input: ["2"] });
+    await s.run();
+    const saved = s.notes.filter((note) => note.message.startsWith("Saved numDraftTokens of model "));
+    assert.equal(saved.length, 1, JSON.stringify(s.notes));
+    assert.ok(saved[0].message.includes(`(entry ${index + 1} of 2)`), saved[0].message);
+    assert.equal(CONTROL_CHARACTER.test(saved[0].message), false, saved[0].message);
+    assert.deepEqual(Object.keys((s.json() as { models: Record<string, object> }).models), keys);
+    assert.deepEqual((s.json() as { models: Record<string, object> }).models[keys[index]], { numDraftTokens: 2 });
+    s.assertScriptsUsed();
+  }
+
+  const unique = session(t, { file: { models: { qwen3_4b: {}, other: {} } }, select: [MENU.modelEntry, "qwen3_4b", "numDraftTokens", ACTION.set, MENU.done], input: ["2"] });
+  await unique.run();
+  assert.equal(unique.notes.length, 1, JSON.stringify(unique.notes));
+  assert.equal(unique.notes[0].message, "Saved numDraftTokens of model qwen3_4b. The change takes effect on the next /mlx-start.");
+  assert.equal(unique.notes[0].message.includes("(entry"), false);
+  unique.assertScriptsUsed();
+});
+
+test("configmenu IN-04: deleting an entry whose value is not an object says so and removes it as it is", async (t) => {
+  const s = session(t, { file: '{"models": {"five": 5, "ok": {}}}', confirm: true, select: [MENU.deleteEntry, "five", MENU.done] });
+  await s.run();
+  assert.equal(s.confirms.length, 1, JSON.stringify(s.prompts));
+  assert.match(s.confirms[0].message, /not an object/);
+  assert.match(s.confirms[0].message, /removed as it is/);
+  assert.doesNotMatch(s.confirms[0].message, /holds nothing/);
+  assert.deepEqual(s.json(), { models: { ok: {} } });
+  s.assertScriptsUsed();
+});
+
 test("configmenu every notice goes through report: a new direct dialogs.notify call must be added to the known sites on purpose", () => {
   const source = readFileSync(fileURLToPath(new URL("../src/configmenu.ts", import.meta.url)), "utf8");
   const code = source

@@ -659,14 +659,15 @@ test("configedit IN-03: the settings layer accepts any text as a models key, so 
   }
 });
 
-test("modelEntrySummary: the sorted profile names, option keys and default profile of one entry; anything else is the empty summary", () => {
+test("modelEntrySummary IN-04: the sorted profile names, option keys and default profile of one entry; anything else is the empty summary, and notAnObject tells a value that is not an object from one that holds nothing", () => {
   const tree: ConfigTree = {
-    models: { m: { numDraftTokens: 2, sampling: { temperature: 0.2 }, defaultProfile: "fast", profiles: { slow: {}, fast: {} } }, shell: { profiles: {} }, five: 5 },
+    models: { m: { numDraftTokens: 2, sampling: { temperature: 0.2 }, defaultProfile: "fast", profiles: { slow: {}, fast: {} } }, shell: { profiles: {} }, five: 5, none: null, list: [1, 2] },
   };
-  assert.deepEqual(modelEntrySummary(tree, "m"), { profiles: ["fast", "slow"], options: ["numDraftTokens", "sampling"], defaultProfile: "fast" });
-  const empty = { profiles: [], options: [], defaultProfile: undefined };
+  assert.deepEqual(modelEntrySummary(tree, "m"), { profiles: ["fast", "slow"], options: ["numDraftTokens", "sampling"], defaultProfile: "fast", notAnObject: false });
+  const empty = { profiles: [], options: [], defaultProfile: undefined, notAnObject: false };
   assert.deepEqual(modelEntrySummary(tree, "shell"), empty);
-  for (const key of ["missing", "toString", "__proto__", "five"]) assert.deepEqual(modelEntrySummary(tree, key), empty, key);
+  for (const key of ["missing", "toString", "__proto__"]) assert.deepEqual(modelEntrySummary(tree, key), empty, key);
+  for (const key of ["five", "none", "list"]) assert.deepEqual(modelEntrySummary(tree, key), { ...empty, notAnObject: true }, key);
 });
 
 // The editing core builds objects without a prototype; JSON turns them into plain objects for the comparison.

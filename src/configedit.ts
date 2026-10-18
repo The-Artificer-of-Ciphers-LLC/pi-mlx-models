@@ -351,16 +351,19 @@ export interface ModelEntrySummary {
   profiles: string[];
   options: string[];
   defaultProfile: string | undefined;
+  /** The value at models.KEY exists and is not an object (a number, text, an array, null, a boolean); only a hand edit makes one. */
+  notAnObject: boolean;
 }
 
 export function modelEntrySummary(tree: ConfigTree, model: string): ModelEntrySummary {
   const entry = getAt(tree, ["models", model]);
-  if (!isObject(entry)) return { profiles: [], options: [], defaultProfile: undefined };
+  if (!isObject(entry)) return { profiles: [], options: [], defaultProfile: undefined, notAnObject: false };
   const chosen = getAt(tree, ["models", model, "defaultProfile"]);
   return {
     profiles: profileNames(tree, model),
     options: sortedKeys(entry).filter((key) => key !== "profiles" && key !== "defaultProfile"),
     defaultProfile: typeof chosen === "string" ? chosen : undefined,
+    notAnObject: false,
   };
 }
 
