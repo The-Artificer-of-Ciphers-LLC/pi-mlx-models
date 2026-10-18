@@ -356,13 +356,17 @@ export function createModelConfigReader(options: ModelConfigReaderOptions = {}):
   };
 }
 
-/** The whole name tokens that mark a model as a reasoning model (D-04). */
-export const REASONING_NAME_TOKENS: readonly string[] = [];
+/** The whole name tokens that mark a model as a reasoning model (D-04). `kat-coder` is deliberately not one. */
+export const REASONING_NAME_TOKENS: readonly string[] = ["r1", "qwq", "thinking", "reasoning", "reasoner", "magistral"];
 
-/** Whether the last segment of `id` holds one of `REASONING_NAME_TOKENS` as a whole token (D-04). */
+/**
+ * Whether the last segment of `id` (after the final `/` or `\`), lower-cased and split on every run of characters that is
+ * not a letter or digit, holds one of `REASONING_NAME_TOKENS` as a whole token (D-04). An organisation or directory name
+ * never counts, and neither does a token inside a longer word.
+ */
 export function isReasoningModelId(id: string): boolean {
-  void id;
-  return false;
+  const last = id.slice(Math.max(id.lastIndexOf("/"), id.lastIndexOf("\\")) + 1).toLowerCase();
+  return last.split(/[^a-z0-9]+/).some((token) => REASONING_NAME_TOKENS.includes(token));
 }
 
 /**
@@ -375,22 +379,24 @@ export function defaultMaxTokens(contextWindow: number, reasoning: boolean): num
 
 /**
  * Everything pi is told about one model, and where each value came from. Pure: the same read always gives the same
- * record. The reasoning flag is the preset's when the id is a preset's model id (D-04); input is text for every model
- * (D-05). Later plans add the id rule and let the profile override both.
+ * record. The reasoning flag is the preset's when the id is a preset's model id, else the curated name rule's (D-04);
+ * input is text for every model (D-05). A later plan lets the profile override both.
  */
 export function deriveModelInfo(input: { id: string; config?: ModelConfigRead }): ModelInfo {
   const { config } = input;
   const declared = config?.ok ? contextWindowOf(config.config) : undefined;
   const contextWindow = declared ?? FALLBACK_CONTEXT_WINDOW;
   const preset = MODEL_PRESETS.find((p) => p.modelId === input.id);
-  const reasoning: boolean = preset?.reasoning ?? false;
+  // Only the preset and the id decide. The chat template is deliberately not consulted: a template can mention thinking
+  // for a model that does not think (Qwen3 Instruct 2507), so as a hint it could never change a correct outcome (D-04).
+  const reasoning: boolean = preset ? preset.reasoning : isReasoningModelId(input.id);
   const info: ModelInfo = {
     contextWindow,
     contextSource: declared === undefined ? "fallback" : "config.json",
     maxTokens: defaultMaxTokens(contextWindow, reasoning),
     maxTokensSource: "default",
     reasoning,
-    reasoningSource: preset ? "preset" : "default",
+    reasoningSource: preset ? "preset" : reasoning ? "model name" : "default",
     input: ["text"],
     inputSource: "default",
   };
