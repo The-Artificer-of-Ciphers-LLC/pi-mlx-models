@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { confirmationFor, renderConfig, setAt } from "./configedit.js";
-import { ACTION, CARRY_MAX_CHARS, CARRY_MAX_LINES, type ConfigMenuUi, MENU, MENU_TITLE, NEW_ENTRY, NEW_PROFILE, NO_DEFAULT, PROFILE_ACTION, runConfigMenu } from "./configmenu.js";
+import { ACTION, CARRY_MAX_CHARS, CARRY_MAX_LINES, type ConfigMenuUi, MENU, MENU_TITLE, NEW_ENTRY, NEW_PROFILE, NO_DEFAULT, PROFILE_ACTION, carriedCopy, runConfigMenu } from "./configmenu.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { PROFILE_NAME_SHORT_RULE, SETTINGS, prepareSettings, readLayerFile } from "./settings.js";
 import { makeCtx, scriptInput, scriptSelect } from "./testkit.js";
@@ -1053,6 +1053,73 @@ test("configmenu IN-04: deleting an entry whose value is not an object says so a
   assert.doesNotMatch(s.confirms[0].message, /holds nothing/);
   assert.deepEqual(s.json(), { models: { ok: {} } });
   s.assertScriptsUsed();
+});
+
+test("configmenu IN-01: the carried copy masks only the credential span of a URL and keeps the status word", () => {
+  const masked = carriedCopy("Not saved: mlxLm.pipIndex https://alice:hunter2@pypi.example.org/simple is refused");
+  assert.equal(masked, "Not saved: mlxLm.pipIndex https://***@pypi.example.org/simple is refused");
+  assert.equal(masked.includes("alice") || masked.includes("hunter2"), false);
+
+  assert.equal(carriedCopy("Saved defaultModel from https://bob:pa/ss@host/x done"), "Saved defaultModel from https://***@host/x done");
+
+  assert.equal(
+    carriedCopy("Not saved: first line\nthe index https://u:p@host/simple is refused\nthird line stays"),
+    "Not saved: first line\nthe index https://***@host/simple is refused\nthird line stays",
+  );
+
+  const six = ["one", "two", "three", "four", "see https://carol:s3cret@host/x here", "six"].join("\n");
+  assert.equal(carriedCopy(six), "one\ntwo\nthree\nfour\nsee https://***@host/x here\nsix");
+
+  assert.equal(carriedCopy("http://tok@host"), "http://***@host");
+});
+
+test("configmenu IN-01: text with an at sign that is not a URL credential is carried untouched (@scope/pkg, model@rev, an email-like string)", () => {
+  for (const text of [
+    "Not saved: package @scope/pkg is not valid",
+    "Pinned org/name@rev for this start",
+    "Mail a@b.com or c@d.org about it",
+    "Nothing was added: the model key ***@host was not confirmed.",
+    "see https://host/x for @scope/pkg",
+    "Saved server.port. The change takes effect on the next /mlx-start.",
+  ]) {
+    assert.equal(carriedCopy(text), text);
+  }
+
+  const seven = Array.from({ length: 7 }, (_, index) => `plain line ${index + 1}`).join("\n");
+  const cutLines = carriedCopy(seven);
+  assert.equal(cutLines.split("\n").length, CARRY_MAX_LINES);
+  assert.ok(cutLines.endsWith("..."), cutLines);
+  assert.equal(cutLines.includes("plain line 7"), false);
+
+  const cutChars = carriedCopy("x".repeat(CARRY_MAX_CHARS + 50));
+  assert.equal(cutChars.length, CARRY_MAX_CHARS + 3);
+  assert.ok(cutChars.endsWith("..."));
+});
+
+test("configmenu IN-01: ctx.ui.notify receives the notice exactly as built, and the next title shows it with the status word kept and only the credential span masked", async (t) => {
+  const created = session(t, {
+    select: [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done],
+    input: ["https://u:p@host/x", "fast"],
+  });
+  await created.run();
+  assert.equal(created.notes.length, 1, JSON.stringify(created.notes));
+  assert.ok(created.notes[0].message.startsWith("Created profile fast of model https://***@host/x. The change takes effect on the next /mlx-start."), created.notes[0].message);
+  const submenu = created.prompts.find((prompt) => prompt.kind === "select" && prompt.options?.includes(PROFILE_ACTION.edit) === true);
+  assert.ok(submenu, JSON.stringify(created.prompts));
+  assert.ok(submenu.title.includes(created.notes[0].message), submenu.title);
+  assert.ok(submenu.title.startsWith("Last result: Created profile"), submenu.title);
+  assert.equal(submenu.title.includes("u:p"), false, submenu.title);
+  created.assertScriptsUsed();
+
+  const declined = session(t, { confirm: false, select: [MENU.profiles, NEW_ENTRY, MENU.done], input: ["user:secret@host"] });
+  await declined.run();
+  assert.equal(declined.notes.length, 1, JSON.stringify(declined.notes));
+  assert.equal(declined.notes[0].message, "Nothing was added: the model key ***@host was not confirmed.");
+  const tops = topMenus(declined.prompts);
+  assert.equal(tops.length, 2);
+  assert.ok(tops[1].title.includes(declined.notes[0].message), tops[1].title);
+  assert.equal(tops[1].title.includes("secret"), false, tops[1].title);
+  declined.assertScriptsUsed();
 });
 
 test("configmenu every notice goes through report: a new direct dialogs.notify call must be added to the known sites on purpose", () => {

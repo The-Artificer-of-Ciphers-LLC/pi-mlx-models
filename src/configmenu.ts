@@ -111,7 +111,7 @@ export const CARRY_MAX_CHARS = 500;
  * out. The message was built from `shown(...)` parts, so it is already cleaned and has credentials hidden; it is not
  * redacted again, because redaction works by position over a whole text. clipDiagnostic still replaces control characters.
  */
-function carriedCopy(message: string): string {
+export function carriedCopy(message: string): string {
   const lines = message.split("\n");
   const kept = lines.slice(0, CARRY_MAX_LINES).join("\n");
   const clipped = clipDiagnostic(kept, CARRY_MAX_CHARS, "start");
