@@ -96,7 +96,7 @@ type CheckResult = { ok: true; value: SettingValue } | { ok: false; problem?: (s
 export interface SettingDef {
   /** Dotted key in the config file: "server.port" is the `port` key of the `server` block; a top-level key has no dot (D-01). */
   path: string;
-  kind: "string" | "integer" | "enum" | "list" | "bool" | "path" | "jsonObject";
+  kind: "string" | "integer" | "number" | "enum" | "list" | "bool" | "path" | "jsonObject";
   /** A model option: decided per model in `buildLaunch` (the `model` block and the `models` entries), not once per start. */
   perModel?: boolean;
   /** A path row whose file is read at launch time; the file's text is the value that is emitted (D-23). */
@@ -129,6 +129,8 @@ export interface SettingDef {
   userLevelOnly?: boolean;
   /** The mlx_lm.server flag this row becomes. */
   mlxFlag?: string;
+  /** The OpenAI request field this setting is sent as (a sampling row); named in every error line about the row (D-09). */
+  requestField?: string;
   /** The `/mlx-start` flag takes no value: writing it turns the setting on. */
   bare?: boolean;
   /** Host and port become the address and are never optional argv. */
@@ -235,6 +237,23 @@ const parseDigits =
   (raw: string): CheckResult => {
     const trimmed = raw.trim();
     return /^\d+$/.test(trimmed) ? check(Number(trimmed)) : bad;
+  };
+
+/** A JSON number that is finite and at least `min`: no text, no coercion, and not the Infinity that `1e999` parses to (D-09). */
+const checkNumberAtLeast =
+  (min: number) =>
+  (value: unknown): CheckResult =>
+    typeof value === "number" && Number.isFinite(value) && value >= min ? ok(value) : bad;
+
+/** Plain decimal or exponent syntax: no hex, no `Infinity`, no empty text, which `Number()` would read as 0. */
+const NUMBER_TEXT = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
+/** Text that is a plain number (after trimming), then the same check as a value read from a file. */
+const parseNumberText =
+  (check: (value: unknown) => CheckResult) =>
+  (raw: string): CheckResult => {
+    const trimmed = raw.trim();
+    return NUMBER_TEXT.test(trimmed) ? check(Number(trimmed)) : bad;
   };
 
 /** A JSON number that is a safe integer from `min` to `max` inclusive: no text, no fraction, no coercion (D-11). */
@@ -381,6 +400,7 @@ const emitJson = (flag: string) => (value: SettingValue) => [`${flag}=${JSON.str
 const PHRASES = {
   integerRange: (min: number, max: number) => (shown: string) => `${shown} is not an integer from ${min} to ${max}`,
   integerAtLeast: (min: number) => (shown: string) => `${shown} is not an integer of at least ${min}`,
+  numberAtLeast: (min: number) => (shown: string) => `${shown} is not a number of at least ${min}`,
   oneOf: (members: readonly string[]) => (shown: string) => `${shown} must be one of ${members.join(", ")}`,
   boolean: (shown: string) => `${shown} must be true or false`,
   string: (shown: string) => `${shown} must be a non-empty string`,
@@ -608,6 +628,20 @@ export const SETTINGS: readonly SettingDef[] = [
     emit: emitJson("--chat-template-args"),
   },
   {
+    // Sampling is a per-model option written in a nested `sampling` object (D-08). The row has no default, cli, env or
+    // pi flag: a value equal to mlx-lm's own default is still passed and shown, and nothing is typed on /mlx-start.
+    path: "model.sampling.temperature",
+    kind: "number",
+    perModel: true,
+    expected: "a number of at least 0",
+    check: checkNumberAtLeast(0),
+    problem: PHRASES.numberAtLeast(0),
+    parseText: parseNumberText(checkNumberAtLeast(0)),
+    requestField: "temperature",
+    mlxFlag: "--temp",
+    emit: valued("--temp"),
+  },
+  {
     path: "baseUrl",
     kind: "string",
     expected: "an http or https URL",
@@ -694,6 +728,14 @@ const MODEL_BLOCK = "model";
 const INSTALL_BLOCK = "mlxLm";
 /** True for the install rows, so the extension-load resolution can leave them out (`PrepareInput.ignoreInstall`). */
 const isInstallRow = (row: SettingDef): boolean => row.path.startsWith(`${INSTALL_BLOCK}.`);
+/** The key of the nested sampling object, inside the `model` block and inside each `models` entry (D-08). */
+const SAMPLING_KEY = "sampling";
+/** The rows of the sampling object by the key they are written as inside it, in schema order. */
+const SAMPLING_ROWS: ReadonlyMap<string, SettingDef> = new Map(
+  SETTINGS.filter((row) => row.path.startsWith(`${MODEL_BLOCK}.${SAMPLING_KEY}.`)).map((row) => [row.path.slice(`${MODEL_BLOCK}.${SAMPLING_KEY}.`.length), row]),
+);
+/** The keys valid inside the sampling object, for the "did you mean" of a mistyped one. */
+const SAMPLING_CANDIDATES: readonly Candidate[] = [...SAMPLING_ROWS.keys()].map((name) => ({ path: name, name }));
 /** The block names of nested keys, e.g. "server". */
 const BLOCKS = new Set(SETTINGS.filter((row) => row.path.includes(".")).map((row) => row.path.split(".")[0]));
 
@@ -925,10 +967,44 @@ export type PrepareResult =
   | { ok: true; prepared: Prepared; warnings: string[] }
   | { ok: false; errors: string[]; warnings: string[] };
 
-const flagSuffix = (row: SettingDef): string => (row.mlxFlag === undefined ? "" : ` (flag ${row.mlxFlag})`);
+/**
+ * The tail of a problem line about a row: the OpenAI request field first, then the mlx-lm flag, in one pair of
+ * parentheses. A row with neither adds nothing; a row with only a flag keeps the earlier ` (flag --x)` wording.
+ */
+function flagSuffix(row: SettingDef): string {
+  const parts: string[] = [];
+  if (row.requestField !== undefined) parts.push(`OpenAI field ${row.requestField}`);
+  if (row.mlxFlag !== undefined) parts.push(`flag ${row.mlxFlag}`);
+  return parts.length === 0 ? "" : ` (${parts.join(", ")})`;
+}
 
 /** A key as echoed in a message: cleaned and at most 80 characters. */
 const showKey = (path: string): string => clipDiagnostic(cleanLabel(path), 80, "start");
+
+/**
+ * Read one `sampling` object (D-08). `prefix` is where the object sits, `model` for the model block or the path of a
+ * `models` entry; each valid key lands in `target` under its row's path, and everything else is a line in `problems`.
+ * Keys are matched with a Map lookup only and never assigned onto another object, so a key such as `__proto__` is just
+ * an unknown key (T-04-05); every echoed key and value is cleaned and clipped (T-04-02).
+ */
+function readSampling(target: Map<string, SettingValue>, prefix: string, label: string, value: unknown, problems: string[]): void {
+  const where = `${prefix}.${SAMPLING_KEY}`;
+  if (!isPlainObject(value)) {
+    problems.push(`${where} (${label}): ${PHRASES.object(showValue(value))}`);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    const row = SAMPLING_ROWS.get(key);
+    if (row === undefined) {
+      const meant = nearest(key, SAMPLING_CANDIDATES);
+      problems.push(`${where}.${showKey(key)} (${label}): unknown key${meant === undefined ? "" : ` (did you mean ${meant}?)`}`);
+      continue;
+    }
+    const result = row.check(child);
+    if (result.ok) target.set(row.path, result.value);
+    else problems.push(`${where}.${key} (${label}): ${(result.problem ?? row.problem)(showValue(child))}${flagSuffix(row)}`);
+  }
+}
 
 /**
  * The valid values of one config file, plus a line in `problems` for everything wrong with it (D-06, D-07).
@@ -945,8 +1021,9 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
   }
   const consider = (block: string | undefined, key: string, value: unknown) => {
     const path = block === undefined ? key : `${block}.${key}`;
-    // A top-level key that happens to contain a dot is not the nested key it resembles.
-    const row = block === undefined && key.includes(".") ? undefined : ROWS_BY_PATH.get(path);
+    // A key that happens to contain a dot is not the nested key it resembles: `sampling.temperature` is not a key of
+    // the model block, the `sampling` object is.
+    const row = key.includes(".") ? undefined : ROWS_BY_PATH.get(path);
     if (row === undefined) {
       problems.push(`${showKey(path)} (${label}): unknown key${unknownKeyHint(key, block, `"${block}"`)}`);
       return;
@@ -989,7 +1066,10 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
     } else if (!isPlainObject(value)) {
       problems.push(`${key} (${label}): ${PHRASES.object(showValue(value))}`);
     } else {
-      for (const [child, childValue] of Object.entries(value)) consider(key, child, childValue);
+      for (const [child, childValue] of Object.entries(value)) {
+        if (key === MODEL_BLOCK && child === SAMPLING_KEY) readSampling(data.values, MODEL_BLOCK, label, childValue, problems);
+        else consider(key, child, childValue);
+      }
     }
   }
   return data;
