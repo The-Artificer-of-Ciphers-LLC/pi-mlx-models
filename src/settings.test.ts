@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX } from "./config.js";
+import * as settingsModule from "./settings.js";
 import {
   PI_FLAGS,
   PROFILE_FLAG_SPEC,
@@ -4329,4 +4330,109 @@ test("autoStart in a project file, true or false, is one autoStart-only violatio
 
 test("autoStart in a project file that fails the boolean check is an ordinary project file error, not a violation", () => {
   assert.deepEqual(refused({ project: ok({ autoStart: "yes" }) }), [`autoStart (${PROJECT}): "yes" must be true or false`]);
+});
+
+// ---- the autoStart refusal wording, the command and origin of a profile selection, the shared exports (plan 06-01) ----
+
+const AUTO_START_LINE = "  autoStart: starts a model when pi opens; only your own config file or PI_MLX_MODELS_AUTO_START may turn it on";
+const AUTO_START_SENTENCE = "autoStart never asks for confirmation; it applies only from that file or PI_MLX_MODELS_AUTO_START.";
+
+test("formatProjectRefusal autoStart alone names the option, the global file and the variable, and does not promise a confirmation", () => {
+  const text = formatProjectRefusal(violationsOf(ok({ autoStart: true })), "/home/u/config.json");
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot set autoStart, which starts a model when pi opens:",
+      AUTO_START_LINE,
+      "Move it to /home/u/config.json or set PI_MLX_MODELS_AUTO_START; auto-start applies only from those sources and never asks for confirmation.",
+    ].join("\n"),
+  );
+  assert.ok(!text.includes("starting then asks for confirmation"));
+  assert.equal(text, formatProjectRefusal(violationsOf(ok({ autoStart: false })), "/home/u/config.json"), "false is refused the same way");
+});
+
+test("formatProjectRefusal autoStart with trustRemoteCode keeps the existing header and lines and adds the autoStart sentence to the footer", () => {
+  const text = formatProjectRefusal(violationsOf(ok({ autoStart: true, server: { trustRemoteCode: true } })), "/home/u/config.json");
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+      "  server.trustRemoteCode: lets the model repository run Python code",
+      AUTO_START_LINE,
+      `Move them to /home/u/config.json; starting then asks for confirmation. ${AUTO_START_SENTENCE}`,
+    ].join("\n"),
+  );
+});
+
+test("formatProjectRefusal autoStart with a pip index keeps the install header and footer and adds the autoStart sentence", () => {
+  const text = formatProjectRefusal(
+    violationsOf(ok({ autoStart: false, mlxLm: { pipIndex: "https://mirror.example/simple/" } })),
+    "/home/u/config.json",
+  );
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:",
+      "  mlxLm.pipIndex (https://mirror.example/simple/): chooses where mlx-lm is installed from",
+      AUTO_START_LINE,
+      `Move them to /home/u/config.json. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking. ${AUTO_START_SENTENCE}`,
+    ].join("\n"),
+  );
+});
+
+test("buildLaunch command typed: the profile source and the unknown-profile line name /mlx-restart", () => {
+  const launch = launchWith({ global: FAST_FILE() }, { profile: "fast", command: "/mlx-restart" });
+  assert.deepEqual(launch.profile, { name: "fast", source: "/mlx-restart" });
+  assert.equal(describeProfile(launch), "profile: fast (/mlx-restart)");
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "nope", command: "/mlx-restart" }), [
+    `profile "nope" (/mlx-restart --profile): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "nope", command: "/mlx-last", origin: "typed" }), [
+    `profile "nope" (/mlx-last --profile): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+});
+
+test("buildLaunch command kept: the profile source is the previous launch and the unknown-profile line says it was kept", () => {
+  const launch = launchWith({ global: FAST_FILE() }, { profile: "fast", command: "/mlx-last", origin: "kept" });
+  assert.deepEqual(launch.profile, { name: "fast", source: "previous launch" });
+  assert.equal(describeProfile(launch), "profile: fast (previous launch)");
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "gone", command: "/mlx-last", origin: "kept" }), [
+    `profile "gone" (kept from the previous launch): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+  assert.deepEqual(errorsWith({}, { profile: "gone", command: "/mlx-restart", origin: "kept" }), [
+    `profile "gone" (kept from the previous launch): not defined for ${QWEN.modelId}; no profiles are defined for this model`,
+  ]);
+});
+
+test("buildLaunch command default: no command, no origin and no options give the /mlx-start text", () => {
+  const withFlag = launchWith({ global: FAST_FILE() }, FAST);
+  assert.deepEqual(withFlag.profile, { name: "fast", source: "/mlx-start" });
+  assert.deepEqual(launchWith({ global: FAST_FILE() }, { profile: "fast", command: "/mlx-start", origin: "typed" }).profile, withFlag.profile);
+  assert.equal(describeProfile(withFlag), "profile: fast (/mlx-start)");
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "nope" }), [MISSING_PROFILE("nope", "available profiles: fast")]);
+  const built = buildLaunch(resolved({ global: FAST_FILE() }).prepared, QWEN, LAUNCH_CTX);
+  assert.ok(built.ok);
+  assert.equal(built.launch.profile, undefined);
+});
+
+test("buildLaunch command does not reword a profile that came from defaultProfile", () => {
+  const file = ok({ models: { qwen3_4b: { defaultProfile: "fast", profiles: { fast: FAST_PROFILE } } } });
+  const launch = launchWith({ global: file }, { command: "/mlx-restart", origin: "kept" });
+  assert.deepEqual(launch.profile, { name: "fast", source: "global file" });
+  const dangling = ok({ models: { qwen3_4b: { defaultProfile: "gone", profiles: { fast: FAST_PROFILE } } } });
+  assert.deepEqual(errorsWith({ global: dangling }, { command: "/mlx-last" }), [
+    `defaultProfile "gone" (global file): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+});
+
+test("exports: PROFILE_NAME, PROFILE_NAME_SHORT_RULE and MAX_FILE_BYTES are shared with the state file reader and the config editor", () => {
+  const shared = settingsModule as unknown as Record<string, unknown>;
+  const name = shared.PROFILE_NAME;
+  assert.ok(name instanceof RegExp, "PROFILE_NAME is exported");
+  for (const accepted of ["fast", "a.b_c-1", "0", "A"]) assert.ok(name.test(accepted), accepted);
+  for (const rejected of ["", "-x", ".x", "a b", "a".repeat(65)]) assert.ok(!name.test(rejected), JSON.stringify(rejected));
+  assert.ok(name.test("a".repeat(64)));
+  assert.equal(typeof shared.PROFILE_NAME_SHORT_RULE, "string");
+  assert.ok((shared.PROFILE_NAME_SHORT_RULE as string).length > 0);
+  assert.equal(shared.MAX_FILE_BYTES, 262144);
 });

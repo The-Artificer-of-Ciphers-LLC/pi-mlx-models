@@ -1678,6 +1678,10 @@ export interface ResolvedLaunch {
 /** What `/mlx-start` typed that is not a setting: today the name of the profile to apply to this launch (D-02). */
 export interface BuildOptions {
   profile?: string;
+  /** The command that chose the launch; it words the profile source and the unknown-profile line. Default `/mlx-start`. */
+  command?: "/mlx-start" | "/mlx-last" | "/mlx-restart";
+  /** Whether `profile` was typed on that command or kept from an earlier launch (`/mlx-last`, `/mlx-restart`). Default `typed`. */
+  origin?: "typed" | "kept";
 }
 
 export type BuildResult = { ok: true; launch: ResolvedLaunch } | { ok: false; errors: string[] };
