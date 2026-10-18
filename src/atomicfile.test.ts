@@ -89,6 +89,42 @@ test("writeFileAtomic without followSymlink replaces the link with a regular fil
   assert.equal(readFileSync(real, "utf8"), "behind the link");
 });
 
+test("writeFileAtomic with followSymlink and a link to nothing creates the file behind the link and keeps the link", { skip: SYMLINKS }, (t) => {
+  const dir = tempDir(t);
+  const real = join(dir, "dotfiles", "config.json");
+  mkdirSync(join(dir, "dotfiles"));
+  const link = join(dir, "config.json");
+  symlinkSync(real, link);
+  assert.deepEqual(writeFileAtomic(link, "through the dangling link", { followSymlink: true }), { ok: true });
+  assert.ok(lstatSync(link).isSymbolicLink(), "the link is still a link");
+  assert.equal(readFileSync(real, "utf8"), "through the dangling link");
+  assert.deepEqual(readdirSync(join(dir, "dotfiles")), ["config.json"]);
+});
+
+test("writeFileAtomic with followSymlink follows a relative link and a chain of links to nothing, creating the missing directory", { skip: SYMLINKS }, (t) => {
+  const dir = tempDir(t);
+  const first = join(dir, "first.json");
+  const second = join(dir, "second.json");
+  symlinkSync("second.json", first);
+  symlinkSync(join("managed", "config.json"), second);
+  assert.deepEqual(writeFileAtomic(first, "end of the chain", { followSymlink: true }), { ok: true });
+  assert.ok(lstatSync(first).isSymbolicLink());
+  assert.ok(lstatSync(second).isSymbolicLink());
+  assert.equal(readFileSync(join(dir, "managed", "config.json"), "utf8"), "end of the chain");
+});
+
+test("writeFileAtomic with followSymlink and a loop of links gives up with a reason and leaves the links alone", { skip: SYMLINKS }, (t) => {
+  const dir = tempDir(t);
+  const a = join(dir, "a.json");
+  const b = join(dir, "b.json");
+  symlinkSync("b.json", a);
+  symlinkSync("a.json", b);
+  const outcome = writeFileAtomic(a, "never", { followSymlink: true });
+  assert.equal(outcome.ok, false);
+  assert.ok(lstatSync(a).isSymbolicLink());
+  assert.ok(lstatSync(b).isSymbolicLink());
+});
+
 test("writeFileAtomic with followSymlink writes a plain path that does not exist yet", (t) => {
   const dir = tempDir(t);
   const target = join(dir, "missing", "config.json");
