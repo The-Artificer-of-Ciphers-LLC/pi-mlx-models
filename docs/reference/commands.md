@@ -44,7 +44,7 @@ The flags, their syntax and their precedence are in the [configuration reference
 
 Before it starts anything, `/mlx-start` checks the arguments and the configuration. A problem is reported in one message and nothing is installed or started. It may then ask for confirmation of settings that [run code or open the network](configuration.md#settings-that-ask-for-permission).
 
-It can also show these warnings, described in the [configuration reference](configuration.md#what-a-start-shows): the installed mlx-lm is not the pinned version, a flag is skipped because the install does not support it, and, after the start message, quantized KV cache turns batching off.
+It can also show these warnings, described in the [configuration reference](configuration.md#what-a-start-shows): the installed mlx-lm is not the pinned version, the installed version could not be read to compare it with the pin, a flag is skipped because the install does not support it, and, after the start message, quantized KV cache turns batching off.
 
 Starting a model while another is running replaces the running server.
 

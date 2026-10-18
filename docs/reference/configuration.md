@@ -101,7 +101,7 @@ The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and po
 | `mlxLm.version` | the word `latest` or an exact version such as `0.32.2` | `latest` | | | | `PI_MLX_MODELS_MLX_LM_VERSION` |
 | `mlxLm.pipIndex` | `https` URL without credentials, spaces, a query string or a fragment (`http` only for a loopback host) | `https://pypi.org/simple/` | | | | `PI_MLX_MODELS_PIP_INDEX` |
 
-The two `mlxLm` rows are settings of `/mlx-init`, not of the server. Their command-line forms are the `/mlx-init` flags `--mlx-lm-version` and `--pip-index`, not `/mlx-start` flags. They have no pi flag.
+The two `mlxLm` rows are settings of `/mlx-init`, not of the server. Their command-line forms are the `/mlx-init` flags `--mlx-lm-version` and `--pip-index`, not `/mlx-start` flags. They have no pi flag. When pi loads the extension these two settings are not looked at: a bad value does not change the provider URL or the default model, and only `/mlx-init` and `/mlx-start` report it.
 
 A valued flag is passed to the server as one argument, `--flag=value`. The `--host` and `--port` pair keeps its two-argument form, so a launch that sets nothing has the same arguments as before configuration files existed.
 
@@ -118,11 +118,11 @@ A valued flag is passed to the server as one argument, `--flag=value`. The `--ho
 | `PI_MLX_MODELS_BASE_URL` | An empty value counts as unset. |
 | `PI_MLX_MODELS_DEFAULT_MODEL` | |
 | `PI_MLX_MODELS_MLX_LM_VERSION` | `latest` or an exact version. An invalid value is ignored with a warning. An empty value counts as unset. |
-| `PI_MLX_MODELS_PIP_INDEX` | The pip index URL. An invalid value refuses `/mlx-init` and `/mlx-start` with an error, so an install never silently falls back to another index. An empty value counts as unset. |
+| `PI_MLX_MODELS_PIP_INDEX` | The pip index URL. An invalid value refuses `/mlx-init` and `/mlx-start` with an error, so an install never silently falls back to another index. When pi loads the extension this variable is not looked at, so a bad value does not change the provider URL or the default model. An empty value counts as unset. |
 | `PI_MLX_MODELS_PYTHON` | Path to the Python interpreter used to build the virtual environment. Must be Python 3.11 or newer. If it is set but unusable, `/mlx-init` fails and names it instead of choosing another Python. |
 | `PI_CODING_AGENT_DIR` | pi's agent directory. Sets where `pi-mlx-models` keeps its files. |
 
-A bad value in a file, a pi flag or a `/mlx-start` flag stops the start. A bad value in an environment variable is ignored with a warning and the next source down is used.
+A bad value in a file, a pi flag or a `/mlx-start` flag stops the start. A bad value in an environment variable is ignored with a warning and the next source down is used. The exception is `PI_MLX_MODELS_PIP_INDEX`: a bad value refuses `/mlx-init` and `/mlx-start` instead.
 
 ## Performance and KV cache options
 
@@ -193,7 +193,12 @@ A yanked release such as 0.31.0 can still be pinned: pip installs an exact pin t
   ```
 
   The part in parentheses names the source of the pin and is left out when none is known. `0.32` and `0.32.0` count as the same version. With `latest` the installed version is not queried and nothing is shown.
-- If the installed version cannot be read, no warning is shown and the start goes on.
+- If an exact pin is set and the installed version cannot be read, a warning names the pin and the reason, and the start goes on with what is installed:
+
+  ```
+  mlx-lm pinned 0.31.1 (project file) was not compared with the installed version: REASON
+  ```
+
 - A flag that is newer than a pinned version is skipped by the usual check. The notice then names the pin: `mlx-lm is pinned to 0.31.1 by project file; raise or remove the pin, then run /mlx-init`.
 
 ## Model options
@@ -286,7 +291,7 @@ flags: --log-level INFO (global file), --num-draft-tokens 4 (project file)
 
 Sources are named `global file`, `project file`, `/mlx-start`, `pi flag --mlx-port` and `env PI_MLX_MODELS_PORT`. A skipped flag is marked `skipped`.
 
-Before the start message, a start can show a [pin warning](#when-the-pin-and-the-install-differ) and the [skipped-flag warning](#flags-the-installed-mlx-lm-does-not-support). After it, a launch with `kvBits` shows the [batching warning](#quantized-kv-cache), and a launch with `kvGroupSize` or `quantizedKvStart` but no `kvBits` shows the no-effect note. These are shown on every start, not once.
+Before the start message, a start can show a [pin warning](#when-the-pin-and-the-install-differ) (the pin differs from the install, or the installed version could not be read) and the [skipped-flag warning](#flags-the-installed-mlx-lm-does-not-support). After it, a launch with `kvBits` shows the [batching warning](#quantized-kv-cache), and a launch with `kvGroupSize` or `quantizedKvStart` but no `kvBits` shows the no-effect note. These are shown on every start, not once.
 
 A configuration problem is reported once, as one message that names every offending key, its source and what is allowed. Nothing is installed or started when that happens.
 
