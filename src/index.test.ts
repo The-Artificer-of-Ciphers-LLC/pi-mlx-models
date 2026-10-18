@@ -6158,3 +6158,23 @@ test("auto-start never prompts: across a start and every skip, no select, input 
     assert.deepEqual(h.confirms, [], label);
   }
 });
+
+test("auto-start ignores the project settings file while /mlx-last still honors it (WR-03)", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { server: { port: 9301, logLevel: "DEBUG" } });
+  const { h, settings } = await autoSetup({ setup: { ctx: { cwd } } });
+
+  await sessionStart(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN_ID]);
+  assert.notEqual(h.server.launches[0]?.address.port, 9301, "the repository's port did not steer the unattended launch");
+  assert.deepEqual(h.server.launches[0]?.extraArgs, [], "no flag came from the project file");
+
+  const last = await setup({ settings, ctx: { cwd } });
+  await last.commands.get("mlx-last")!("", last.ctx);
+
+  assert.deepEqual(errors(last.notes), []);
+  assert.equal(last.server.launches[0]?.address.port, 9301, "an interactive /mlx-last reads the project file");
+  assert.deepEqual(last.server.launches[0]?.extraArgs, ["--log-level=DEBUG"]);
+});
