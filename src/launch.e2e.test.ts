@@ -615,3 +615,17 @@ test("a negative temperature in the global file stops the start before any side 
   assert.equal(h.installCalls, 0);
   assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
 });
+
+test("a project file's max tokens beats a global models entry, and the flags line says so", { timeout: 30_000 }, async (t) => {
+  const { env, port } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeConfig({ models: { qwen3_4b: { sampling: { maxTokens: 256 } } } });
+  h.writeProject({ model: { sampling: { maxTokens: 512 } } });
+
+  await h.start();
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--max-tokens=512"]);
+  assert.match(startNotes(h.notes)[0].message, /\nflags: --port \d+ \(env PI_MLX_MODELS_PORT\), --max-tokens 512 \(project file\)$/);
+  assert.equal(h.confirms.length, 0, "sampling in a project file needs no confirmation (D-04)");
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+});

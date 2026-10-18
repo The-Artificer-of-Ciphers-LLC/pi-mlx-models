@@ -3218,3 +3218,69 @@ test("the eight sampling rows follow model.chatTemplateArgs in key order, and th
   const sampling = { maxTokens: 2048, minP: 0.05, topK: 40, topP: 0.9, temperature: 0.2 };
   assert.deepEqual(extraOf({ global: ok({ model: { sampling } }) }), ["--temp=0.2", "--top-p=0.9", "--top-k=40", "--min-p=0.05", "--max-tokens=2048"]);
 });
+
+// -- merge order, the project file and the absence of a typed spelling (D-04, D-08) --
+
+test("within one file the sampling order is the model block, then the preset-key entry, then the model-id entry", () => {
+  const model = { sampling: { temperature: 0.7 } };
+  const byKey = { qwen3_4b: { sampling: { temperature: 0.5 } } };
+  const byId = { [QWEN.modelId]: { sampling: { temperature: 0.2 } } };
+  assert.deepEqual(extraOf({ global: ok({ model, models: { ...byKey, ...byId } }) }), ["--temp=0.2"]);
+  assert.deepEqual(extraOf({ global: ok({ model, models: byKey }) }), ["--temp=0.5"]);
+  assert.deepEqual(extraOf({ global: ok({ model }) }), ["--temp=0.7"]);
+});
+
+test("each sampling key merges on its own: an entry that does not set a key keeps the lower value", () => {
+  const global = ok({
+    model: { sampling: { temperature: 0.7, topP: 0.9 } },
+    models: { qwen3_4b: { sampling: { temperature: 0.5 } } },
+  });
+  assert.deepEqual(extraOf({ global }), ["--temp=0.5", "--top-p=0.9"]);
+  const other = ok({ model: { sampling: { topP: 0.9 } }, models: { qwen3_4b: { sampling: { temperature: 0.5 } } } });
+  assert.deepEqual(extraOf({ global: other }), ["--temp=0.5", "--top-p=0.9"], "an entry key and a model-block key both reach the launch");
+});
+
+test("the project file beats the global file per key, and a project model block beats a global models entry", () => {
+  const launch = launchOf({
+    global: ok({ models: { qwen3_4b: { sampling: { temperature: 0.5, topK: 20 } } } }),
+    project: ok({ model: { sampling: { temperature: 0.1 } } }),
+  });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.1", "--top-k=20"]);
+  assert.equal(describeFlags(launch), "flags: --temp 0.1 (project file), --top-k 20 (global file)");
+});
+
+test("a stop list replaces the lower layer's list whole instead of being joined to it", () => {
+  const { prepared } = resolved({
+    global: ok({ model: { sampling: { stop: ["a", "b"] } } }),
+    project: ok({ model: { sampling: { stop: ["c"] } } }),
+  });
+  const [global, project] = prepared.modelSettings.layers;
+  assert.deepEqual(global.model.get("model.sampling.stop"), ["a", "b"]);
+  assert.deepEqual(project.model.get("model.sampling.stop"), ["c"]);
+  assert.equal(project.layer, "project");
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, []);
+});
+
+test("a project file may set every sampling key with no project violation and no flag of its own (D-04)", () => {
+  const sampling = { temperature: 0.2, topP: 0.9, topK: 40, minP: 0.05, repetitionPenalty: 1.1, maxTokens: 2048, stop: ["END"], seed: 7 };
+  const { prepared } = resolved({ project: ok({ model: { sampling } }) });
+  assert.deepEqual(prepared.projectViolations, []);
+  assert.deepEqual(prepared.flags, []);
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--temp=0.2", "--top-p=0.9", "--top-k=40", "--min-p=0.05", "--max-tokens=2048"]);
+});
+
+test("no sampling key can be typed on /mlx-start, set by an environment variable or set by a pi flag (D-02)", () => {
+  const typed = cliFlagSpecs().map((spec) => spec.flag);
+  for (const flag of ["--temp", "--top-p", "--top-k", "--min-p", "--max-tokens", "--repetition-penalty", "--stop", "--seed"]) {
+    assert.equal(typed.includes(flag), false, flag);
+  }
+  assert.deepEqual(
+    PI_FLAGS.map((flag) => flag.name),
+    ["mlx-model", "mlx-port", "mlx-host", "mlx-log-level"],
+  );
+  for (const row of SETTINGS.filter((setting) => setting.path.startsWith("model.sampling."))) {
+    assert.equal(row.cli, undefined, row.path);
+    assert.equal(row.env, undefined, row.path);
+    assert.equal(row.piFlag, undefined, row.path);
+  }
+});

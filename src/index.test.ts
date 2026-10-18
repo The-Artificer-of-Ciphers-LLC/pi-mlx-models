@@ -2127,6 +2127,62 @@ test("mlx-lm 0.24.0 skips all five performance flags with one warning naming the
   assert.deepEqual(h.server.launches[0]?.extraArgs, []);
 });
 
+// ---- sampling flags and the probe (plan 04-01: SRV-03, D-09) ----
+
+const SAMPLING_FILE = {
+  model: {
+    sampling: {
+      temperature: 0.2,
+      topP: 0.9,
+      topK: 40,
+      minP: 0.05,
+      maxTokens: 2048,
+      repetitionPenalty: 1.1,
+      stop: ["END"],
+      seed: 7,
+    },
+  },
+};
+
+test("mlx-lm 0.24.0 skips all five sampling flags with one warning, the request-only keys add nothing, and the server still starts", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, SAMPLING_FILE);
+  const h = await setup({ settings, probe: async () => probeFromHelp("0.24.0", "mlx-server-help-0.24.0.txt") });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), [
+    "Skipped --temp, --top-p, --top-k, --min-p, --max-tokens: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)",
+  ]);
+  assert.equal(h.server.startCalls.length, 1);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, []);
+  assert.equal(
+    startingNotes(h.notes)[0].split("\n")[1],
+    "flags: --temp 0.2 (global file, skipped), --top-p 0.9 (global file, skipped), --top-k 40 (global file, skipped), --min-p 0.05 (global file, skipped), --max-tokens 2048 (global file, skipped)",
+  );
+});
+
+test("mlx-lm 0.28.1 passes all five sampling flags in schema order with no warning", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, SAMPLING_FILE);
+  const h = await setup({ settings, probe: async () => probeFromHelp("0.28.1", "mlx-server-help-0.28.1.txt") });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--temp=0.2", "--top-p=0.9", "--top-k=40", "--min-p=0.05", "--max-tokens=2048"]);
+});
+
+test("a sampling flag typed on /mlx-start is refused: the decisions add no typed flag", async () => {
+  const h = await setup();
+
+  await startMlx(h, "qwen3_4b --temp 0.2");
+
+  assert.equal(errors(h.notes).length, 1, errors(h.notes).join("|"));
+  assert.ok(errors(h.notes)[0].startsWith("mlx-start failed: unknown flag --temp"), errors(h.notes)[0]);
+  assertNothingHappened(h);
+});
+
 test("a failed probe warns, passes every configured flag, and the start goes on", async () => {
   const settings = freshSettings({});
   writeGlobal(settings, { server: { allowedOrigins: ["http://a.test"], logLevel: "DEBUG" } });
