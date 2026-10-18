@@ -3812,3 +3812,202 @@ test("entries: a profile defined only in the preset-key entry is selectable for 
   assert.deepEqual(argvWith({ global }, { profile: "fromKey" }), ["--temp=0.1"]);
   assert.deepEqual(argvWith({ global }, { profile: "fromId" }), ["--temp=0.2"]);
 });
+
+// ---- the profile validation matrix (plan 04-05: CFG-04, D-03, D-05, D-17, T-04-13, T-04-15, T-04-18) ----
+
+/** One profile `fast` of `models.qwen3_4b` holding `body`, as the parsed text of a file would. */
+const withProfile = (body: unknown) => ok({ models: { qwen3_4b: { profiles: { fast: body } } } });
+const PROFILE_PATH = 'models["qwen3_4b"].profiles["fast"]';
+
+/** The refusal lines of a file that must be refused as invalid. */
+function refusedLines(input: Partial<PrepareInput>): string[] {
+  const result = resolve(input);
+  assert.ok(!result.ok, "expected the configuration to be refused");
+  return result.errors;
+}
+
+const SERVER_ROWS = [
+  "host",
+  "port",
+  "allowedOrigins",
+  "logLevel",
+  "trustRemoteCode",
+  "decodeConcurrency",
+  "promptConcurrency",
+  "prefillStepSize",
+  "promptCacheSize",
+  "promptCacheBytes",
+  "kvBits",
+  "kvGroupSize",
+  "quantizedKvStart",
+];
+
+test("the thirteen server rows pinned here are exactly the server rows of the schema", () => {
+  assert.deepEqual(
+    SETTINGS.filter((row) => row.path.startsWith("server.")).map((row) => row.path.slice("server.".length)),
+    SERVER_ROWS,
+  );
+});
+
+for (const key of SERVER_ROWS) {
+  test(`the server row ${key} inside a profile is refused, naming the key, the profile and the file`, () => {
+    assert.deepEqual(refusedLines({ global: withProfile({ [key]: 1 }) }), [
+      `${PROFILE_PATH}.${key} (${GLOBAL}): unknown key (${key} is a "server" key, not part of a profile)`,
+    ]);
+  });
+}
+
+test("a server row inside a project profile names the project file", () => {
+  assert.deepEqual(refusedLines({ project: withProfile({ port: 9100, trustRemoteCode: true }) }), [
+    `${PROFILE_PATH}.port (${PROJECT}): unknown key (port is a "server" key, not part of a profile)`,
+    `${PROFILE_PATH}.trustRemoteCode (${PROJECT}): unknown key (trustRemoteCode is a "server" key, not part of a profile)`,
+  ]);
+});
+
+test("a project profile with a server row is an invalid configuration and not a project violation", () => {
+  const result = resolve({ project: withProfile({ trustRemoteCode: true }) });
+  assert.ok(!result.ok);
+  assert.equal("prepared" in result, false, "no preparation exists, so no project violation list does either");
+  assert.ok(result.errors.every((line) => !line.includes("lets the model repository run Python code")), result.errors.join("|"));
+  const clean = resolved({ project: withProfile({ sampling: { temperature: 0.3 } }) });
+  assert.deepEqual(clean.prepared.projectViolations, []);
+});
+
+for (const key of ["profiles", "extends", "defaultProfile"]) {
+  test(`${key} inside a profile is an unknown key of that profile (no nesting, no inheritance)`, () => {
+    const lines = refusedLines({ global: withProfile({ [key]: key === "profiles" ? { inner: {} } : "base" }) });
+    assert.equal(lines.length, 1, lines.join("|"));
+    assert.ok(lines[0].startsWith(`${PROFILE_PATH}.${key} (${GLOBAL}): unknown key`), lines[0]);
+  });
+}
+
+test("a key inside the reserved limits object of a project profile is refused with the reserved wording", () => {
+  assert.deepEqual(refusedLines({ project: withProfile({ limits: { contextWindow: 1 } }) }), [
+    `${PROFILE_PATH}.limits.contextWindow (${PROJECT}): unknown key (limits is reserved and accepts no keys yet)`,
+  ]);
+});
+
+test("a nested object inside limits names only its key and never echoes the value", () => {
+  const lines = refusedLines({ global: withProfile({ limits: { a: { secret: "ZZZ-NESTED-VALUE" } } }) });
+  assert.deepEqual(lines, [`${PROFILE_PATH}.limits.a (${GLOBAL}): unknown key (limits is reserved and accepts no keys yet)`]);
+  assert.ok(!lines[0].includes("ZZZ-NESTED-VALUE"));
+});
+
+const NAME_LINE = (shown: string, label = GLOBAL) => `models["qwen3_4b"].profiles[${shown}] (${label}): the profile name must be 1 to 64 characters`;
+for (const [name, shown] of [
+  ["", '""'],
+  ["-x", '"-x"'],
+  [".x", '".x"'],
+  ["a b", '"a b"'],
+  ["a/b", '"a/b"'],
+  ["a".repeat(65), `"${"a".repeat(65)}"`],
+  ["é", '"é"'],
+] as const) {
+  test(`the profile name ${JSON.stringify(name.length > 20 ? `${name.slice(0, 8)}... (${name.length} characters)` : name)} is refused`, () => {
+    const lines = refusedLines({ global: ok({ models: { qwen3_4b: { profiles: { [name]: {} } } } }) });
+    assert.equal(lines.length, 1, lines.join("|"));
+    assert.ok(lines[0].startsWith(NAME_LINE(shown)), lines[0]);
+  });
+}
+
+test("the name __proto__ is refused as an invalid name and nothing reaches Object.prototype", () => {
+  const data = JSON.parse('{"models":{"qwen3_4b":{"profiles":{"__proto__":{"polluted":true,"sampling":{"temperature":0.2}}}}}}');
+  const lines = refusedLines({ global: ok(data) });
+  assert.equal(lines.length, 1, lines.join("|"));
+  assert.ok(lines[0].startsWith(NAME_LINE('"__proto__"')), lines[0]);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "polluted"), false);
+});
+
+test("a profile called constructor is an ordinary name and selectable", () => {
+  const input = { global: withProfile({}) };
+  const named = { global: ok({ models: { qwen3_4b: { profiles: { constructor: { sampling: { temperature: 0.2 } } } } } }) };
+  assert.deepEqual(argvWith(named, { profile: "constructor" }), ["--temp=0.2"]);
+  assert.deepEqual(launchWith(named, { profile: "constructor" }).profile, { name: "constructor", source: "/mlx-start" });
+  assert.deepEqual(errorsWith(input, { profile: "constructor" }), [MISSING_PROFILE("constructor", "available profiles: fast")]);
+});
+
+test("fast, a, Fast_2.0-x and a 64 character name are all accepted", () => {
+  for (const name of ["fast", "a", "Fast_2.0-x", "a".repeat(64), "9lives"]) {
+    const input = { global: ok({ models: { qwen3_4b: { profiles: { [name]: { sampling: { temperature: 0.2 } } } } } }) };
+    assert.deepEqual(argvWith(input, { profile: name }), ["--temp=0.2"], name);
+  }
+});
+
+for (const [body, shown] of [
+  [5, "5"],
+  ["x", '"x"'],
+  [null, "null"],
+  [[], "[]"],
+  [true, "true"],
+] as const) {
+  test(`a profile body that is ${shown} is refused with the object line`, () => {
+    assert.deepEqual(refusedLines({ global: withProfile(body) }), [`${PROFILE_PATH} (${GLOBAL}): ${shown} must be a JSON object`]);
+  });
+}
+
+for (const [value, shown] of [
+  [[], "[]"],
+  ["x", '"x"'],
+] as const) {
+  test(`a profiles value that is ${shown} is refused with the object line`, () => {
+    assert.deepEqual(refusedLines({ global: ok({ models: { qwen3_4b: { profiles: value } } }) }), [
+      `models["qwen3_4b"].profiles (${GLOBAL}): ${shown} must be a JSON object`,
+    ]);
+  });
+}
+
+test("a bad sampling value inside a profile is reported with the full path, the file and the request field", () => {
+  assert.deepEqual(refusedLines({ global: withProfile({ sampling: { temperature: -1 } }) }), [
+    `${PROFILE_PATH}.sampling.temperature (${GLOBAL}): -1 is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+  ]);
+});
+
+test("a bad numDraftTokens in a project profile names the project file and its flag", () => {
+  const lines = refusedLines({ project: withProfile({ numDraftTokens: 0 }) });
+  assert.equal(lines.length, 1, lines.join("|"));
+  assert.ok(lines[0].startsWith(`${PROFILE_PATH}.numDraftTokens (${PROJECT}): `), lines[0]);
+  assert.ok(lines[0].endsWith("(flag --num-draft-tokens)"), lines[0]);
+});
+
+test("a mistyped model key inside a profile gets the did-you-mean hint", () => {
+  assert.deepEqual(refusedLines({ global: withProfile({ draftModle: "x" }) }), [
+    `${PROFILE_PATH}.draftModle (${GLOBAL}): unknown key (did you mean model.draftModel?)`,
+  ]);
+});
+
+test("a sampling key written directly in a profile is told to go inside sampling", () => {
+  assert.deepEqual(refusedLines({ global: withProfile({ temperature: 0.2 }) }), [
+    `${PROFILE_PATH}.temperature (${GLOBAL}): unknown key (temperature is a "sampling" key; write it inside "sampling")`,
+  ]);
+});
+
+test("there is no other way to pick a profile: no flag spec, no pi flag and no environment variable", () => {
+  assert.ok(!cliFlagSpecs().some((spec) => /profile/i.test(spec.flag) || /profile/i.test(spec.path)));
+  assert.ok(!initFlagSpecs().some((spec) => /profile/i.test(spec.flag) || /profile/i.test(spec.path)));
+  assert.deepEqual(
+    PI_FLAGS.map((flag) => flag.name),
+    ["mlx-model", "mlx-port", "mlx-host", "mlx-log-level"],
+  );
+  for (const row of SETTINGS) {
+    assert.ok(!/profile/i.test(`${row.path} ${row.env ?? ""} ${row.piFlag ?? ""}`), row.path);
+  }
+});
+
+test("an unknown-profile line lists at most ten names, sorted, and counts the rest", () => {
+  const profiles = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`p${String(i + 1).padStart(2, "0")}`, {}]));
+  const [line] = errorsWith({ global: ok({ models: { qwen3_4b: { profiles } } }) }, { profile: "nope" });
+  assert.equal(
+    line,
+    MISSING_PROFILE("nope", "available profiles: p01, p02, p03, p04, p05, p06, p07, p08, p09, p10, ...and 2 more"),
+  );
+});
+
+test("a typed profile name of 200 characters is shown clipped", () => {
+  const typed = `${"y".repeat(100)}${"z".repeat(100)}`;
+  const [line] = errorsWith({ global: FAST_FILE() }, { profile: typed });
+  assert.ok(line.startsWith('profile "yyyy'), line);
+  assert.ok(!line.includes("y".repeat(100)), "the name is cut at the display bound");
+  assert.ok(!line.includes("z"), "the tail is dropped");
+  assert.ok(line.length < 200, `${line.length} characters`);
+});
