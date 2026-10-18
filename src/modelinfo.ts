@@ -266,3 +266,8 @@ export function describeModel(info: ModelInfo): string {
     `input ${info.input.join(" and ")} (${shownSource(info.inputSource)})`
   );
 }
+
+/** The warning shown when a model's context window could not be read (D-03). */
+export function fallbackNotice(_id: string, _reason: string): string {
+  return "";
+}

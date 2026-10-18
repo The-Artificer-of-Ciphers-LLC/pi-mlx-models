@@ -10,7 +10,7 @@ import { MODEL_PRESETS } from "./presets.js";
 import { ensureInstalled, type RuntimeHost } from "./runtime.js";
 import { SETTINGS, initFlagSpecs } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
-import type { ReadModelConfig } from "./modelinfo.js";
+import type { ModelConfigRead, ReadModelConfig } from "./modelinfo.js";
 import { makeCtx, makeFakeModelConfig, makeFakePi, type CtxOptions } from "./testkit.js";
 
 type ProviderCall = { name: string; config: any };
@@ -3706,4 +3706,82 @@ test("a reader that rejects, and one that throws, give the fallback window and a
     assert.equal(h.providerCalls.at(-1)?.config.models[0].contextWindow, 32768);
     assert.ok(modelNotes(h.notes)[0].message.startsWith("model: context 32768 (fallback), "));
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The fallback warning (MOD-01, D-03)
+// ---------------------------------------------------------------------------------------------------------------------
+
+const HTTP_401: ModelConfigRead = { ok: false, reason: "the Hugging Face Hub answered HTTP 401" };
+const fallbackWarnings = (notes: Note[]) =>
+  notes.filter((n) => n.type === "warning" && n.message.startsWith("context window unavailable for ")).map((n) => n.message);
+
+test("a model whose config.json cannot be read still starts, with the fallback window and exactly one warning naming the reason", async () => {
+  const h = await setup({ readModelConfig: makeFakeModelConfig({}, HTTP_401).read });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(h.notes.at(-1)?.message, READY_NOTE);
+  assert.equal(h.providerCalls.at(-1)?.config.models[0].contextWindow, 32768);
+  assert.ok(modelNotes(h.notes)[0].message.startsWith("model: context 32768 (fallback), "));
+  assert.deepEqual(warnings(h.notes), [
+    `context window unavailable for ${QWEN_ID} (the Hugging Face Hub answered HTTP 401); using 32768`,
+  ]);
+});
+
+test("the fallback warning is shown once per model id and reason: the same pair again is silent, another model or reason is not", async () => {
+  let reason = "the Hugging Face Hub answered HTTP 401";
+  const h = await setup({ readModelConfig: async () => ({ ok: false, reason }) });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  assert.equal(fallbackWarnings(h.notes).length, 1, "the same model and reason twice");
+
+  await h.commands.get("mlx-start")!(OTHER_PRESET.key, h.ctx);
+  assert.equal(fallbackWarnings(h.notes).length, 2, "another model, the same reason");
+
+  reason = "the Hugging Face Hub did not answer within 3000 ms";
+  await h.commands.get("mlx-start")!(OTHER_PRESET.key, h.ctx);
+  assert.equal(fallbackWarnings(h.notes).length, 3, "the same model, another reason");
+  assert.match(fallbackWarnings(h.notes)[2], /did not answer within 3000 ms/);
+});
+
+test("the fallback warning comes before the model line and both come before the ready message", async () => {
+  const h = await setup({ readModelConfig: makeFakeModelConfig({}, HTTP_401).read });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  const messages = h.notes.map((n) => n.message);
+  const warning = messages.findIndex((m) => m.startsWith("context window unavailable for "));
+  const line = messages.findIndex((m) => m.startsWith("model: context "));
+  assert.ok(warning >= 0 && line >= 0);
+  assert.ok(warning < line, "the warning precedes the model line");
+  assert.equal(line + 1, messages.indexOf(READY_NOTE), "the ready message follows the model line");
+});
+
+test("the fallback warning is one clean line: control characters and credentials are gone and both parts are clipped", async () => {
+  const hostileId = "org/model\u001b]0;pwned\u0007\u009b31m";
+  const hostileReason = `failed via https://user:secret@host/path ${"x".repeat(500)}`;
+  const h = await setup({ readModelConfig: makeFakeModelConfig({}, { ok: false, reason: hostileReason }).read });
+
+  await h.commands.get("mlx-start")!(hostileId, h.ctx);
+
+  assert.equal(h.server.startCalls.length, 1, "premise: the start went ahead");
+  const [message] = fallbackWarnings(h.notes);
+  assert.ok(message !== undefined, "a fallback warning was shown");
+  assert.doesNotMatch(message, /[\u0000-\u001f\u007f-\u009f]/);
+  assert.doesNotMatch(message, /secret/);
+  const parts = /^context window unavailable for ([^()]*) \((.*)\); using 32768$/.exec(message);
+  assert.ok(parts, `unexpected shape: ${message}`);
+  assert.ok(parts[1].length > 0 && parts[1].length <= 80, "the id part is at most 80 characters");
+  assert.ok(parts[2].length > 0 && parts[2].length <= 160, "the reason part is at most 160 characters");
+});
+
+test("a readable config.json produces no warning at all", async () => {
+  const h = await setup({ readModelConfig: makeFakeModelConfig({ [QWEN_ID]: { max_position_embeddings: 262144 } }).read });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(warnings(h.notes), []);
 });

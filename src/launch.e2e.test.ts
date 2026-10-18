@@ -177,7 +177,29 @@ test("a model with no config.json in the cache still starts, registered with the
   await h.stop();
 });
 
-test("a port and log level in the global file reach the process, the provider and the start message", { timeout: 30_000 }, async (t) => {
+test("an unreadable config.json through the real reader gives the fallback window and exactly one warning, and the start succeeds", { timeout: 30_000 }, async (t) => {
+  const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
+  t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
+  // An empty cache and a fetch that rejects: nothing can answer, whatever the reader tries.
+  const refusing = (async () => {
+    throw new Error("network down");
+  }) as unknown as typeof fetch;
+  const h = await harness(t, {}, {}, ALL_SUPPORTED, {
+    readModelConfig: createModelConfigReader({ cacheRoot, fetch: refusing, env: {} }),
+  });
+
+  await h.start();
+
+  assert.equal(h.notes.filter((n) => n.type === "error").length, 0);
+  assert.ok(h.notes.some((n) => n.message.startsWith("MLX server is ready for prompts. Use /model and pick pi-mlx-models/")));
+  assert.equal(h.providerCalls.at(-1)?.config.models[0].contextWindow, 32768);
+  const warned = h.notes.filter((n) => n.type === "warning" && n.message.startsWith("context window unavailable for "));
+  assert.equal(warned.length, 1);
+  assert.match(warned[0].message, /^context window unavailable for \S+ \(.+\); using 32768$/);
+  await h.stop();
+});
+
+test("a port and log level in the global file reach the process, the provider and the start message",{ timeout: 30_000 }, async (t) => {
   const port = await freePort();
   const h = await harness(t);
   h.writeConfig({ server: { port, logLevel: "DEBUG" } });
