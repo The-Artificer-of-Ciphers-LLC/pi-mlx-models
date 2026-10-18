@@ -961,3 +961,62 @@ test("a project profile that asks for trustRemoteCode is refused with one error:
   assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
   assert.equal(h.providerCalls.length, 1, "only the initial provider registration");
 });
+
+// ---- a project profile through a real child process (plan 04-05: CFG-04, D-04, T-04-14) ----
+
+test("a project file profile picked with --profile spawns the stub with its value, labelled as the profile", { timeout: 30_000 }, async (t) => {
+  const { env, port } = await onFreePort();
+  const h = await harness(t, env);
+  h.writeProject({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.4 } } } } } });
+
+  await h.start("qwen3_4b --profile fast");
+
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--temp=0.4"]);
+  assert.equal(
+    startNotes(h.notes)[0].message,
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nprofile: fast (/mlx-start)\nflags: --port ${port} (env PI_MLX_MODELS_PORT), --temp 0.4 (profile fast)`,
+  );
+  assert.equal(h.confirms.length, 0);
+});
+
+/** A project directory with a template one level above it, as the profile's relative path points. */
+function projectWithOutsideTemplate() {
+  const base = mkdtempSync(join(tmpdir(), "pi-mlx-e2e-tpl-"));
+  const cwd = join(base, "project");
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(join(base, "outside.jinja"), "{{ outside }}");
+  return { base, cwd };
+}
+
+test("a project profile whose chatTemplate points outside the project is refused and spawns nothing", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const { cwd } = projectWithOutsideTemplate();
+  const h = await harness(t, env, { cwd });
+  h.writeProject({ models: { qwen3_4b: { profiles: { fast: { chatTemplate: "../outside.jinja" } } } } });
+
+  await h.start("qwen3_4b --profile fast");
+
+  const failures = h.notes.filter((n) => n.type === "error");
+  assert.equal(failures.length, 1);
+  assert.ok(
+    failures[0].message.startsWith("mlx-start failed: invalid configuration\n  model.chatTemplate (project .pi/pi-mlx-models.json): "),
+    failures[0].message,
+  );
+  assert.ok(failures[0].message.endsWith("outside.jinja is outside the project directory"), failures[0].message);
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+});
+
+test("the same chatTemplate path in a global profile is read and launches", { timeout: 30_000 }, async (t) => {
+  const { env } = await onFreePort();
+  const { cwd } = projectWithOutsideTemplate();
+  const h = await harness(t, env, { cwd });
+  h.writeConfig({ models: { qwen3_4b: { profiles: { fast: { chatTemplate: "../outside.jinja" } } } } });
+
+  await h.start("qwen3_4b --profile fast");
+
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  assert.equal(h.argv().at(-1), "--chat-template={{ outside }}");
+  assert.match(startNotes(h.notes)[0].message, /\nprofile: fast \(\/mlx-start\)\nflags: .*--chat-template .*outside\.jinja \(profile fast\)$/);
+});

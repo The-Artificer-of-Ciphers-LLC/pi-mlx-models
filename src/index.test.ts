@@ -8,7 +8,7 @@ import { createExtension } from "./index.js";
 import { parseHelpFlags, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { ensureInstalled, type RuntimeHost } from "./runtime.js";
-import { SETTINGS } from "./settings.js";
+import { SETTINGS, initFlagSpecs } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
 import { makeCtx, makeFakePi, type CtxOptions } from "./testkit.js";
 
@@ -3284,4 +3284,139 @@ test("a profile adds no trust dialog and removes none: the dialogs of a start ar
   assert.ok(without.length > 0, "premise: a global trustRemoteCode asks");
   assert.deepEqual(withProfile, without);
   assert.deepEqual(h.server.startCalls, [QWEN.modelId, QWEN.modelId], "both starts went through");
+});
+
+// ---- --profile through every start path, and the refusals before any side effect (plan 04-05: CFG-04, D-02, D-06) ----
+
+const FAST_GLOBAL = { models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } } };
+const FAST_START = `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nprofile: fast (/mlx-start)\nflags: --temp 0.2 (profile fast)`;
+
+/** A harness whose global file holds the `fast` profile of qwen3_4b. */
+async function profileHarness(options: Parameters<typeof setup>[0] = {}) {
+  const settings = freshSettings({});
+  writeGlobal(settings, FAST_GLOBAL);
+  return setup({ settings, ...options });
+}
+
+test("--profile NAME after a typed model starts it with the profile: the profile line and the profile-labelled flag", async () => {
+  const h = await profileHarness();
+
+  await startMlx(h, "qwen3_4b --profile fast");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--temp=0.2"]);
+  assert.deepEqual(startingNotes(h.notes), [FAST_START]);
+});
+
+test("--profile=NAME, the attached form, gives the same start", async () => {
+  const h = await profileHarness();
+
+  await startMlx(h, "qwen3_4b --profile=fast");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(startingNotes(h.notes), [FAST_START]);
+});
+
+test("--profile works through the picker: the chosen preset starts with the profile applied", async () => {
+  const h = await profileHarness({ select: (options) => options[3] });
+
+  await startMlx(h, "--profile fast");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--temp=0.2"]);
+  assert.deepEqual(startingNotes(h.notes), [FAST_START]);
+});
+
+test("--profile works with the mlx-model pi flag naming the model", async () => {
+  const h = await profileHarness();
+  h.setFlag("mlx-model", "qwen3_4b");
+
+  await startMlx(h, "--profile fast");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN.modelId]);
+  assert.deepEqual(startingNotes(h.notes), [FAST_START]);
+});
+
+test("--profile with no value is refused by the parser before anything happens", async () => {
+  const h = await profileHarness();
+
+  await startMlx(h, "qwen3_4b --profile");
+
+  assert.deepEqual(errors(h.notes), ["mlx-start failed: --profile needs a value"]);
+  assertNothingHappened(h);
+});
+
+for (const [shape, input] of [
+  ["--profile=", "qwen3_4b --profile="],
+  ["--profile with an empty quoted value", 'qwen3_4b --profile ""'],
+] as const) {
+  test(`${shape} is refused for its empty name before any file is read`, async () => {
+    // The global path is a directory, so reading it would add an invalid-configuration error to the one expected here.
+    const dir = mkdtempSync(join(tmpdir(), "pi-mlx-unreadable-"));
+    const h = await setup({ settings: { env: {}, globalConfigPath: dir, home: dir } });
+
+    await startMlx(h, input);
+
+    assert.deepEqual(errors(h.notes), ["mlx-start failed: --profile needs a profile name"]);
+    assertNothingHappened(h);
+  });
+}
+
+test("--profile given twice is refused", async () => {
+  const h = await profileHarness();
+
+  await startMlx(h, "qwen3_4b --profile fast --profile careful");
+
+  assert.deepEqual(errors(h.notes), ["mlx-start failed: --profile was given twice"]);
+  assertNothingHappened(h);
+});
+
+test("an unknown profile ends with one error naming the available profiles, before any install, probe, provider refresh or spawn", async () => {
+  const h = await profileHarness();
+
+  await startMlx(h, "qwen3_4b --profile nope");
+
+  assert.deepEqual(errors(h.notes), [
+    `mlx-start failed: invalid configuration\n  profile "nope" (/mlx-start --profile): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+  assertNothingHappened(h);
+  assert.equal(h.probeCalls, 0);
+});
+
+test("/mlx-init refuses --profile as an unknown flag and lists only its own flags", async () => {
+  const h = await profileHarness();
+
+  await h.commands.get("mlx-init")!("--profile fast", h.ctx);
+
+  const list = initFlagSpecs().map((spec) => spec.flag);
+  assert.ok(!list.includes("--profile"));
+  assert.deepEqual(errors(h.notes), [`mlx-init failed: unknown flag --profile (valid flags: ${list.join(", ")})`]);
+  assert.equal(h.installCalls.length, 0);
+});
+
+test("nothing is remembered: the next start of the same model without --profile has no profile line and no profile flag", async () => {
+  const h = await profileHarness();
+  await startMlx(h, "qwen3_4b --profile fast");
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(startingNotes(h.notes)[0], FAST_START);
+  assert.equal(startingNotes(h.notes)[1], `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...`);
+  assert.deepEqual(h.server.launches[1]?.extraArgs, []);
+});
+
+test("a hostile profile name is shown without control characters", async () => {
+  const h = await profileHarness();
+
+  await startMlx(h, `qwen3_4b --profile "fast\u001b]0;pwned\u0007"`);
+
+  const [message] = errors(h.notes);
+  assert.equal(errors(h.notes).length, 1);
+  assert.ok(message.startsWith("mlx-start failed: invalid configuration\n  profile "), message);
+  assert.ok(!/[\u0000-\u0009\u000b-\u001f\u007f]/.test(message), JSON.stringify(message));
+  assertNothingHappened(h);
 });
