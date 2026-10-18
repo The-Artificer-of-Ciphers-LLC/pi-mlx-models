@@ -486,3 +486,58 @@ test("an older mlx-lm skips the flags it cannot do, says so once, and the stub s
   await h.stop();
   assert.equal(await connectRefused(port), true);
 });
+
+// ---- performance flags (SRV-04): a decode concurrency reaches the spawned argv ----
+
+test("a decode concurrency in the global file reaches the process and the flags line", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port, decodeConcurrency: 4 } });
+
+  await h.start();
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--decode-concurrency=4"]);
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  assert.equal(
+    starting[0].message,
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --port ${port} (global file), --decode-concurrency 4 (global file)`,
+  );
+
+  await h.stop();
+  assert.equal(await connectRefused(port), true, "stop must wait on the launch's own port");
+});
+
+test("a decode concurrency typed on /mlx-start is for that launch only", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port, decodeConcurrency: 4 } });
+
+  await h.start("qwen3_4b --decode-concurrency 2");
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--decode-concurrency=2"]);
+  assert.match(startNotes(h.notes)[0].message, /--decode-concurrency 2 \(\/mlx-start\)$/);
+
+  await h.stop();
+  await h.start("qwen3_4b");
+
+  assert.equal(h.argv().at(-1), "--decode-concurrency=4");
+  assert.match(startNotes(h.notes).at(-1)!.message, /--decode-concurrency 4 \(global file\)$/);
+});
+
+test("a decode concurrency of 0 in the global file stops the start before any side effect", { timeout: 30_000 }, async (t) => {
+  const h = await harness(t);
+  h.writeConfig({ server: { decodeConcurrency: 0 } });
+
+  await h.start();
+
+  const errors = h.notes.filter((n) => n.type === "error");
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0].message.startsWith("mlx-start failed: invalid configuration"), errors[0].message);
+  assert.ok(
+    errors[0].message.includes(`server.decodeConcurrency (global config.json): 0 is not an integer of at least 1 (flag --decode-concurrency)`),
+    errors[0].message,
+  );
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+});

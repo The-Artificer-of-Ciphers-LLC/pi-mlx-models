@@ -2227,3 +2227,49 @@ test("a model flag can be skipped as well", () => {
   assert.equal(describeFlags(launch, new Set(["--num-draft-tokens"])), "flags: --num-draft-tokens 4 (global file, skipped)");
   assert.deepEqual(toLaunchSpec(launch, new Set(["--num-draft-tokens"])).extraArgs, []);
 });
+
+// ---- performance flags (SRV-04) ----
+
+test("server.decodeConcurrency: a global value becomes one --decode-concurrency=N element with its layer", () => {
+  const { prepared } = resolved({ global: ok({ server: { decodeConcurrency: 4 } }) });
+  assert.equal(prepared.flags.length, 1);
+  const [flag] = prepared.flags;
+  assert.equal(flag.flag, "--decode-concurrency");
+  assert.deepEqual(flag.args, ["--decode-concurrency=4"]);
+  assert.equal(flag.display, "4");
+  assert.equal(flag.label, "global file");
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--decode-concurrency=4"]);
+});
+
+const BAD_DECODE_CONCURRENCY: ReadonlyArray<[unknown, string]> = [
+  [0, "0"],
+  [-1, "-1"],
+  [1.5, "1.5"],
+  ["4", '"4"'],
+  [true, "true"],
+  [null, "null"],
+];
+
+for (const [value, shown] of BAD_DECODE_CONCURRENCY) {
+  test(`server.decodeConcurrency: ${shown} in the global file is refused with one line`, () => {
+    assert.deepEqual(refused({ global: ok({ server: { decodeConcurrency: value } }) }), [
+      `server.decodeConcurrency (${GLOBAL}): ${shown} is not an integer of at least 1 (flag --decode-concurrency)`,
+    ]);
+  });
+}
+
+test("server.decodeConcurrency: a value typed on /mlx-start beats the global file and is labelled with the command", () => {
+  const { prepared } = resolved({
+    global: ok({ server: { decodeConcurrency: 4 } }),
+    args: { "server.decodeConcurrency": "2" },
+  });
+  assert.equal(prepared.flags.length, 1);
+  assert.deepEqual(prepared.flags[0].args, ["--decode-concurrency=2"]);
+  assert.equal(prepared.flags[0].label, "/mlx-start");
+});
+
+test("server.decodeConcurrency: PI_MLX_MODELS_DECODE_CONCURRENCY has no effect and draws no warning", () => {
+  const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_DECODE_CONCURRENCY: "4" } });
+  assert.deepEqual(prepared.flags, []);
+  assert.deepEqual(warnings, []);
+});
