@@ -49,6 +49,14 @@ It can also show these warnings, described in the [configuration reference](conf
 
 Once the server is ready, pi lists only that model, unless `provider.listAllModels` is `true`. A `model:` line shows the context window, output limit, reasoning flag and input kinds pi was told about it, each with its source. The rules and the warnings that can come with it are in [Model metadata and the model list](configuration.md#model-metadata-and-the-model-list).
 
+When the start has finished and pi lists the model, `/mlx-start` selects it for the current pi session, and the ready message reads "MLX server is ready for prompts. pi-mlx-models/MODEL is now the selected model." (MODEL is the model id). The model is not selected, and the ready message instead reads "MLX server is ready for prompts. Use /model and pick pi-mlx-models/...", when:
+
+- the start was stopped, replaced or lost its server;
+- a model was picked in pi (with `/model`, a cycle or a session restore) while the start was running;
+- pi does not list the model, or the lookup or the switch fails.
+
+When pi refuses the switch because it has no authentication for the provider, one warning line says so before that hint. The start succeeds in all of these cases.
+
 Starting a model while another is running replaces the running server.
 
 ## `/mlx-stop`

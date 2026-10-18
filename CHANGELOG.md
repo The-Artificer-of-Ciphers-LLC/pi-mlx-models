@@ -21,6 +21,7 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 - **Output limit.** The output limit pi is told about is a quarter of the context window, at most 8192, or 32768 for a reasoning model, and `limits.maxTokens` sets it. A `sampling.maxTokens` above that limit shows a warning on every start.
 - **Model list.** `provider.listAllModels` (global or project file) lists every model the server reports, each with its own metadata read from the local cache.
 - **Start message.** A `model:` line shows the context window, output limit, reasoning flag and input kinds pi was told, each with its source.
+- **Model selection after a start.** When `/mlx-start` finishes, pi selects the started model for the session and the ready message says so. It does not switch when the start was stopped or replaced, when a model was picked in pi during the start, or when pi does not list or refuses the model; the ready message then still says to use `/model`.
 
 ### Changed
 
