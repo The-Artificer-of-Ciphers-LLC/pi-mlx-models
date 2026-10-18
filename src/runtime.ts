@@ -106,12 +106,32 @@ export function findPython(options: { candidates?: string[]; env?: NodeJS.Proces
 /** The most stderr kept for a failure message; the message shows the last 800 characters, so older output is dropped. */
 const MAX_STDERR_KEPT = 4096;
 
+/** What `run` rejects with when its `timeoutMs` ran out, so a caller can tell a slow command from a failed one. */
+export class RunTimeoutError extends Error {
+  constructor(cmd: string, timeoutMs: number) {
+    // Whole seconds read well; a bound under one second would round to "0 s", so it is given in milliseconds.
+    const bound = timeoutMs < 1000 ? `${Math.round(timeoutMs)} ms` : `${Math.round(timeoutMs / 1000)} s`;
+    super(`${cmd} timed out after ${bound}`);
+    this.name = "RunTimeoutError";
+  }
+}
+
 export function run(cmd: string, args: string[], onLine?: (line: string) => void, options: RunOptions = {}): Promise<void> {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    // A bounded run gets its own process group (POSIX), so the timeout can end the child and anything it started. An
+    // unbounded run (the installer) stays in the caller's group, where a Ctrl-C still reaches pip.
+    const bounded = options.timeoutMs !== undefined;
+    const ownGroup = bounded && process.platform !== "win32";
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env, detached: ownGroup });
     let err = "";
     let timer: NodeJS.Timeout | undefined;
-    let timedOut = false;
+    let settled = false;
+    const settle = (finish: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      finish();
+    };
     const handle = (chunk: Buffer) => {
       if (!onLine) return;
       for (const line of chunk.toString().split(/\r?\n/)) {
@@ -126,21 +146,32 @@ export function run(cmd: string, args: string[], onLine?: (line: string) => void
       handle(d);
     });
     if (options.timeoutMs !== undefined) {
+      const timeoutMs = options.timeoutMs;
       timer = setTimeout(() => {
-        timedOut = true;
-        p.kill("SIGKILL");
-      }, options.timeoutMs);
+        // The group first (the child leads it, so its id is the group id), the child alone when that is not possible.
+        try {
+          if (ownGroup && p.pid !== undefined) process.kill(-p.pid, "SIGKILL");
+          else p.kill("SIGKILL");
+        } catch {
+          p.kill("SIGKILL");
+        }
+        // Settled here, not on `close`: a process that left the group could still hold the pipes open.
+        settle(() => {
+          p.stdout?.destroy();
+          p.stderr?.destroy();
+          reject(new RunTimeoutError(cmd, timeoutMs));
+        });
+      }, timeoutMs);
     }
     // `close`, not `exit`: exit can fire before the last stderr chunk has been read.
     p.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) reject(new Error(`${cmd} timed out after ${Math.round((options.timeoutMs ?? 0) / 1000)} s`));
-      else if (code === 0) resolve();
-      else reject(new Error(clipDiagnostic(err, 800) || `${cmd} failed with exit ${code}`));
+      settle(() => {
+        if (code === 0) resolve();
+        else reject(new Error(clipDiagnostic(err, 800) || `${cmd} failed with exit ${code}`));
+      });
     });
     p.on("error", (e) => {
-      clearTimeout(timer);
-      reject(e);
+      settle(() => reject(e));
     });
   });
 }
