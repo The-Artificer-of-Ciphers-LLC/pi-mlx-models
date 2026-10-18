@@ -350,8 +350,10 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
     try {
       activate(0, "Checking runtime");
+      // The first-run install honours the same index and pin as /mlx-init; an importable venv still returns before any pip call (D-07).
       await install({
         upgrade: false,
+        policy: { version: installSettings.version, pipIndex: installSettings.pipIndex },
         onEvent: (e) => {
           if (!isStale()) progress.update(0, { state: "active", detail: e.detail });
         },
@@ -382,7 +384,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         if (!probe.ok) {
           ctx.ui.notify(`Could not check which flags mlx-lm supports (${probe.reason}); passing every configured flag.`, "warning");
         } else if (split.skipped.length > 0) {
-          ctx.ui.notify(skippedNotice(split.skipped.map((flag) => flag.flag), probe.version), "warning");
+          const pin =
+            installSettings.version === "latest"
+              ? undefined
+              : { version: installSettings.version, ...(installSettings.versionSource !== undefined ? { source: installSettings.versionSource } : {}) };
+          ctx.ui.notify(skippedNotice(split.skipped.map((flag) => flag.flag), probe.version, pin), "warning");
         }
       }
       progress.done(0, "Runtime ready");

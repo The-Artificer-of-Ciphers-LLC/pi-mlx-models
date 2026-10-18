@@ -228,7 +228,13 @@ export function partitionFlags<T extends { flag: string; core: boolean }>(
   return { passed, skipped };
 }
 
-/** The one warning a launch shows for everything it skipped (D-19). */
-export function skippedNotice(flags: readonly string[], version: string): string {
-  return `Skipped ${flags.join(", ")}: not supported by mlx-lm ${version} (run /mlx-init to upgrade)`;
+/**
+ * The one warning a launch shows for everything it skipped (D-19). Under an exact pin, upgrading is not what the user
+ * should do, so the advice names the pin instead (D-08).
+ */
+export function skippedNotice(flags: readonly string[], version: string, pin?: { version: string; source?: string }): string {
+  const head = `Skipped ${flags.join(", ")}: not supported by mlx-lm ${version}`;
+  if (pin === undefined) return `${head} (run /mlx-init to upgrade)`;
+  const by = pin.source === undefined ? "" : ` by ${reasonText(pin.source)}`;
+  return `${head} (mlx-lm is pinned to ${reasonText(pin.version)}${by}; raise or remove the pin, then run /mlx-init)`;
 }
