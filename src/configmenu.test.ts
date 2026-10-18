@@ -856,6 +856,50 @@ test("configmenu carries a result into the profile action menu: a created profil
   existing.assertScriptsUsed();
 });
 
+test("configmenu WR-03: a result is not lost when the profile action menu is dismissed or fails: the next top menu shows it once", async (t) => {
+  const file = { models: { qwen3_4b: {} } };
+  const created = (messages: Array<{ message: string }>) => messages.filter((note) => note.message.startsWith("Created profile"));
+
+  // Dismissed: the action menu is shown and answered with nothing.
+  const dismissed = session(t, { file, select: [MENU.profiles, "qwen3_4b", NEW_PROFILE, undefined, MENU.view, MENU.done], input: ["fast"] });
+  await dismissed.run();
+  const shownAction = dismissed.prompts.find((prompt) => prompt.kind === "select" && prompt.options?.includes(PROFILE_ACTION.edit) === true);
+  assert.ok(shownAction, JSON.stringify(dismissed.prompts));
+  assert.ok(shownAction.title.includes("Created profile"), shownAction.title);
+  const dismissedTops = topMenus(dismissed.prompts);
+  assert.equal(dismissedTops.length, 3, JSON.stringify(dismissedTops.map((menu) => menu.title)));
+  assert.equal(dismissedTops[0].title, MENU_TITLE);
+  assert.ok(dismissedTops[1].title.startsWith("Last result: Created profile"), dismissedTops[1].title);
+  assert.ok(dismissedTops[1].title.endsWith(MENU_TITLE), dismissedTops[1].title);
+  assert.equal(dismissedTops[2].title, MENU_TITLE);
+  assert.equal(created(dismissed.notes).length, 1, JSON.stringify(dismissed.notes));
+  assert.equal(dismissed.notes.length, 2, "the created notice and the view text, as before");
+  dismissed.assertScriptsUsed();
+
+  // Fails: the dialog of the action menu throws, which dialogs.select turns into undefined.
+  let failing: ReturnType<typeof session> | undefined;
+  failing = session(t, {
+    file,
+    select: [MENU.profiles, "qwen3_4b", NEW_PROFILE, MENU.view, MENU.done],
+    input: ["fast"],
+    ui: {
+      select: async (title, options) => {
+        if (options.includes(PROFILE_ACTION.edit)) throw new Error("dialog failed");
+        return failing?.ctx.ui.select(title, options);
+      },
+    },
+  });
+  await failing.run();
+  const failedTops = topMenus(failing.prompts);
+  assert.equal(failedTops.length, 3, JSON.stringify(failedTops.map((menu) => menu.title)));
+  assert.equal(failedTops[0].title, MENU_TITLE);
+  assert.ok(failedTops[1].title.startsWith("Last result: Created profile"), failedTops[1].title);
+  assert.ok(failedTops[1].title.endsWith(MENU_TITLE), failedTops[1].title);
+  assert.equal(failedTops[2].title, MENU_TITLE);
+  assert.equal(created(failing.notes).length, 1, JSON.stringify(failing.notes));
+  failing.assertScriptsUsed();
+});
+
 test("configmenu shows the result once and does not carry View: the menu after a View has the plain title, and a dismissed edit leaves nothing to carry", async (t) => {
   const viewed = session(t, { file: {}, select: [MENU.general, "server.port", ACTION.set, MENU.view, MENU.done], input: ["8081"] });
   await viewed.run();
