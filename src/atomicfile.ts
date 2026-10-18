@@ -53,7 +53,16 @@ function resolveTarget(path: string, followSymlink: boolean): string {
       // Not resolvable as it stands: a path that does not exist yet, or a link to nothing.
     }
     try {
-      current = resolve(dirname(current), readlinkSync(current));
+      const target = readlinkSync(current);
+      // A relative link is read against the real directory that holds it: when a parent is a link too, the lexical
+      // directory may be somewhere else, and a `..` in the target would land beside the wrong one.
+      let base = dirname(current);
+      try {
+        base = realpathSync(base);
+      } catch {
+        // The directory is not resolvable either: the lexical one is the best there is.
+      }
+      current = resolve(base, target);
     } catch {
       // Not a link (or not readable as one): written as given.
       return current;
