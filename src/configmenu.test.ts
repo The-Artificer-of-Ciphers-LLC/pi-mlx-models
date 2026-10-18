@@ -941,6 +941,83 @@ test("configmenu bounds the carried text: a long refusal is notified in full and
   s.assertScriptsUsed();
 });
 
+/** Two model keys that show the same text once cleaned and clipped: a shared 100-character prefix, and a control character. */
+const LOOK_ALIKE_PATHS = [`/Users/x/models/${"a".repeat(100)}-one`, `/Users/x/models/${"a".repeat(100)}-two`];
+const LOOK_ALIKE_CONTROL = ["ab\u0007c", "ab c"];
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
+
+test("configmenu WR-02: the delete-entry confirm and notices give the entry's place in the list, so look-alike keys are told apart", async (t) => {
+  for (const keys of [LOOK_ALIKE_PATHS, LOOK_ALIKE_CONTROL]) {
+    const file = { models: Object.fromEntries(keys.map((key) => [key, {}])) };
+    const titles: string[] = [];
+    const notices: string[] = [];
+    for (const index of [0, 1]) {
+      const s = session(t, { file, confirm: true, select: [MENU.deleteEntry, index, MENU.done] });
+      await s.run();
+      assert.equal(s.confirms.length, 1, JSON.stringify(s.prompts));
+      const { title, message } = s.confirms[0];
+      assert.ok(title.includes(`${index + 1} of 2`), title);
+      const deleted = s.notes.filter((note) => note.message.startsWith("Deleted model entry"));
+      assert.equal(deleted.length, 1, JSON.stringify(s.notes));
+      assert.ok(deleted[0].message.includes(`${index + 1} of 2`), deleted[0].message);
+      assert.deepEqual(Object.keys((s.json() as { models: object }).models), [keys[1 - index]]);
+      for (const text of [title, message, deleted[0].message]) assert.equal(CONTROL_CHARACTER.test(text), false, text);
+      titles.push(title);
+      notices.push(deleted[0].message);
+      s.assertScriptsUsed();
+    }
+    assert.notEqual(titles[0], titles[1]);
+    assert.notEqual(notices[0], notices[1]);
+  }
+
+  const declined = session(t, { file: { models: { careful: {} } }, confirm: false, select: [MENU.deleteEntry, "careful", MENU.done] });
+  await declined.run();
+  assert.equal(declined.notes.length, 1, JSON.stringify(declined.notes));
+  assert.ok(declined.notes[0].message.startsWith("Nothing was deleted: model entry 1 of 1"), declined.notes[0].message);
+  declined.assertScriptsUsed();
+});
+
+test("configmenu WR-02b: the delete-profile confirm and notices give the model entry's place, so the same profile name under look-alike model keys is told apart", async (t) => {
+  for (const keys of [LOOK_ALIKE_PATHS, LOOK_ALIKE_CONTROL]) {
+    const file = { models: Object.fromEntries(keys.map((key) => [key, { profiles: { fast: {}, slow: {} } }])) };
+    const titles: string[] = [];
+    const notices: string[] = [];
+    for (const index of [0, 1]) {
+      const s = session(t, { file, confirm: true, select: [MENU.profiles, index, "fast", PROFILE_ACTION.delete, MENU.done] });
+      await s.run();
+      assert.equal(s.confirms.length, 1, JSON.stringify(s.prompts));
+      const { title, message } = s.confirms[0];
+      assert.ok(title.includes(`${index + 1} of 2`), title);
+      const deleted = s.notes.filter((note) => note.message.startsWith("Deleted profile"));
+      assert.equal(deleted.length, 1, JSON.stringify(s.notes));
+      assert.ok(deleted[0].message.includes(`${index + 1} of 2`), deleted[0].message);
+      const models = (s.json() as { models: Record<string, { profiles: object }> }).models;
+      assert.deepEqual(Object.keys(models[keys[index]].profiles), ["slow"]);
+      assert.deepEqual(Object.keys(models[keys[1 - index]].profiles), ["fast", "slow"]);
+      for (const text of [title, message, deleted[0].message]) assert.equal(CONTROL_CHARACTER.test(text), false, text);
+      titles.push(title);
+      notices.push(deleted[0].message);
+      s.assertScriptsUsed();
+    }
+    assert.notEqual(titles[0], titles[1]);
+    assert.notEqual(notices[0], notices[1]);
+  }
+
+  const declined = session(t, { file: { models: { qwen3_4b: { profiles: { fast: {} } } } }, confirm: false, select: [MENU.profiles, "qwen3_4b", "fast", PROFILE_ACTION.delete, MENU.done] });
+  await declined.run();
+  assert.equal(declined.notes.length, 1, JSON.stringify(declined.notes));
+  assert.ok(declined.notes[0].message.startsWith("Nothing was deleted: profile fast of model entry 1 of 1"), declined.notes[0].message);
+  declined.assertScriptsUsed();
+
+  const withDefault = session(t, { file: { models: { qwen3_4b: { defaultProfile: "fast", profiles: { fast: {}, slow: {} } } } }, confirm: true, select: [MENU.profiles, "qwen3_4b", "fast", PROFILE_ACTION.delete, MENU.done] });
+  await withDefault.run();
+  const cleared = withDefault.notes.find((note) => note.message.startsWith("Deleted profile"));
+  assert.ok(cleared, JSON.stringify(withDefault.notes));
+  assert.ok(cleared.message.startsWith("Deleted profile fast of model entry 1 of 1"), cleared.message);
+  assert.match(cleared.message, /defaultProfile was cleared too/);
+  withDefault.assertScriptsUsed();
+});
+
 test("configmenu every notice goes through report: a new direct dialogs.notify call must be added to the known sites on purpose", () => {
   const source = readFileSync(fileURLToPath(new URL("../src/configmenu.ts", import.meta.url)), "utf8");
   const code = source
