@@ -44,6 +44,8 @@ const ALL_SUPPORTED: ProbeResult = {
 interface HarnessExtras {
   /** What reads a model's config.json; default is a stand-in, so no test reaches the network or the real cache. */
   readModelConfig?: ReadModelConfig;
+  /** The model ids the stand-in discovery reports for the provider's base URL; default is none. */
+  discovered?: readonly string[];
 }
 
 async function harness(
@@ -86,7 +88,7 @@ async function harness(
     ensureInstalled: async () => {
       installCalls += 1;
     },
-    discoverModelIds: async () => [],
+    discoverModelIds: async () => [...(extras.discovered ?? [])],
     readModelConfig: extras.readModelConfig ?? makeFakeModelConfig().read,
     settings: { env, globalConfigPath, home: dir },
     probeFlags: async () => probe,
@@ -1345,4 +1347,176 @@ test("accept 4 (criterion 4): enable_thinking false leaves one source of templat
   assert.deepEqual(wild.chat_template_kwargs, { enable_thinking: true, preserve_thinking: true });
   assert.equal(wild.reasoning_effort, "high");
   assert.deepEqual(wild, { ...acceptPayload(), temperature: 1.1 }, "only the temperature differs from pi's payload");
+});
+
+// ---- phase 5 acceptance: the five roadmap criteria over the real extension, a real child process and the real reader ----
+
+const SMOLLM3 = MODEL_PRESETS[4];
+const GEMMA4 = MODEL_PRESETS[1];
+const COMPAT = { supportsDeveloperRole: false, supportsReasoningEffort: false };
+const OTHER_ID = "org/other";
+
+/** A harness over the real reader on a temporary Hugging Face cache holding the given fixtures; no host can be reached. */
+async function cachedHarness(
+  t: TestContext,
+  fixtures: ReadonlyArray<readonly [id: string, fixture: string]>,
+  discovered: readonly string[] = [],
+) {
+  const cacheRoot = mkdtempSync(join(tmpdir(), "pi-mlx-hf-"));
+  t.after(() => rmSync(cacheRoot, { recursive: true, force: true }));
+  for (const [id, fixture] of fixtures) writeHfCache(cacheRoot, id, hfFixture(fixture));
+  const { env } = await onFreePort();
+  return harness(t, env, {}, ALL_SUPPORTED, {
+    readModelConfig: createModelConfigReader({ cacheRoot, fetch: noNetwork, env: {} }),
+    discovered,
+  });
+}
+
+const registered = (h: { providerCalls: Array<{ config: any }> }) => h.providerCalls.at(-1)?.config.models as any[];
+const warningsOf = (notes: Array<{ message: string; type: string }>) => notes.filter((n) => n.type === "warning");
+
+test("phase 5 criterion 1: the Qwen3, SmolLM3 and gemma-4 presets register the window of their own config.json", { timeout: 60_000 }, async (t) => {
+  const h = await cachedHarness(t, [
+    [QWEN.modelId, "qwen3-4b-instruct-2507-4bit"],
+    [SMOLLM3.modelId, "smollm3-3b-4bit"],
+    [GEMMA4.modelId, "gemma-4-e2b-it-4bit"],
+  ]);
+
+  const expected = [
+    { key: "qwen3_4b", id: QWEN.modelId, window: 262144 },
+    { key: "smollm3_3b", id: SMOLLM3.modelId, window: 65536 },
+    { key: "gemma4_e2b", id: GEMMA4.modelId, window: 131072 },
+  ];
+  for (const { key, id, window } of expected) {
+    await h.start(key);
+    const models = registered(h);
+    assert.equal(models.length, 1, key);
+    assert.equal(models[0].id, id, key);
+    assert.equal(models[0].contextWindow, window, key);
+    assert.equal(models[0].reasoning, false, key);
+    assert.deepEqual(models[0].input, ["text"], key);
+    assert.equal(models[0].maxTokens, 8192, key);
+    assert.equal("compat" in models[0], false, key);
+  }
+  assert.deepEqual(warningsOf(h.notes), [], "a cached config.json needs no warning");
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  await h.stop();
+});
+
+test("phase 5 criterion 2: the R1 distill is a reasoning model, text-only models take no images, and a profile wins in both directions", { timeout: 60_000 }, async (t) => {
+  const h = await cachedHarness(t, [
+    [R1_DISTILL.modelId, "deepseek-r1-distill-qwen-1.5b-4bit"],
+    [QWEN.modelId, "qwen3-4b-instruct-2507-4bit"],
+  ]);
+  h.writeConfig({
+    models: {
+      deepseek_r1_1_5b: { profiles: { plain: { limits: { reasoning: false, input: ["text", "image"] } } } },
+      qwen3_4b: { profiles: { think: { limits: { reasoning: true } } } },
+    },
+  });
+
+  await h.start("deepseek_r1_1_5b");
+  let models = registered(h);
+  assert.equal(models.length, 1);
+  assert.equal(models[0].reasoning, true);
+  assert.deepEqual(models[0].compat, COMPAT);
+  assert.deepEqual(models[0].input, ["text"]);
+
+  await h.start("deepseek_r1_1_5b --profile plain");
+  models = registered(h);
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, R1_DISTILL.modelId);
+  assert.equal(models[0].reasoning, false, "the profile switches reasoning off over the preset");
+  assert.equal("compat" in models[0], false);
+  assert.deepEqual(models[0].input, ["text", "image"], "the profile opts in to images");
+  assert.equal(models[0].maxTokens, 8192, "the default output limit follows the final reasoning flag");
+
+  await h.start("qwen3_4b --profile think");
+  models = registered(h);
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, QWEN.modelId);
+  assert.equal(models[0].reasoning, true, "the profile switches reasoning on over the preset");
+  assert.deepEqual(models[0].compat, COMPAT);
+  assert.deepEqual(models[0].input, ["text"]);
+
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  await h.stop();
+});
+
+test("phase 5 criterion 3: the output limit has a documented default and a profile sets it", { timeout: 60_000 }, async (t) => {
+  const h = await cachedHarness(t, [
+    [QWEN.modelId, "qwen3-4b-instruct-2507-4bit"],
+    [R1_DISTILL.modelId, "deepseek-r1-distill-qwen-1.5b-4bit"],
+  ]);
+  h.writeConfig({ models: { qwen3_4b: { profiles: { short: { limits: { maxTokens: 2048 } } } } } });
+
+  await h.start("qwen3_4b");
+  assert.equal(registered(h)[0].maxTokens, 8192);
+  assert.ok(h.argv().every((arg) => !arg.startsWith("--max-tokens")), JSON.stringify(h.argv()));
+
+  await h.start("deepseek_r1_1_5b");
+  assert.equal(registered(h)[0].maxTokens, 32768);
+  assert.ok(h.argv().every((arg) => !arg.startsWith("--max-tokens")), JSON.stringify(h.argv()));
+
+  await h.start("qwen3_4b --profile short");
+  assert.equal(registered(h)[0].maxTokens, 2048);
+  const line = h.notes.filter((n) => n.message.startsWith("model: ")).at(-1);
+  assert.ok(line, "the start shows a model line");
+  assert.ok(line.message.includes("max output 2048 (profile short)"), line.message);
+  assert.ok(h.argv().every((arg) => !arg.startsWith("--max-tokens")), `limits.maxTokens is not a server flag: ${JSON.stringify(h.argv())}`);
+
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  await h.stop();
+});
+
+test("phase 5 criterion 4: pi lists only the loaded model by default, and provider.listAllModels lists every model the server reports", { timeout: 60_000 }, async (t) => {
+  const reported = [QWEN.modelId, R1_DISTILL.modelId, OTHER_ID];
+  const fixtures = [
+    [QWEN.modelId, "qwen3-4b-instruct-2507-4bit"],
+    [R1_DISTILL.modelId, "deepseek-r1-distill-qwen-1.5b-4bit"],
+  ] as const;
+
+  const byDefault = await cachedHarness(t, fixtures, reported);
+  await byDefault.start("qwen3_4b");
+  assert.deepEqual(registered(byDefault).map((m) => m.id), [QWEN.modelId], "only the loaded model is listed");
+  await byDefault.stop();
+  assert.deepEqual(registered(byDefault), [], "after /mlx-stop the list is empty again");
+
+  const everything = await cachedHarness(t, fixtures, reported);
+  everything.writeConfig({ provider: { listAllModels: true } });
+  await everything.start("qwen3_4b");
+  const models = registered(everything);
+  assert.deepEqual(models.map((m) => m.id), reported);
+  assert.deepEqual(models.map((m) => m.contextWindow), [262144, 131072, 32768]);
+  assert.equal(models[1].reasoning, true, "the R1 distill is flagged by its name");
+  assert.deepEqual(models[1].compat, COMPAT);
+  assert.equal(models[0].reasoning, false);
+  assert.deepEqual(models.map((m) => m.input), [["text"], ["text"], ["text"]]);
+  assert.deepEqual(everything.notes.filter((n) => n.type === "error"), []);
+  await everything.stop();
+});
+
+test("phase 5 criterion 5: an unreadable config.json still starts with the documented window and one notice", { timeout: 60_000 }, async (t) => {
+  const h = await cachedHarness(t, []);
+
+  await h.start("smollm3_3b");
+
+  assert.deepEqual(h.notes.filter((n) => n.type === "error"), []);
+  assert.ok(h.notes.some((n) => n.message.startsWith("MLX server is ready for prompts. Use /model and pick pi-mlx-models/")));
+  assert.equal(registered(h)[0].id, SMOLLM3.modelId);
+  assert.equal(registered(h)[0].contextWindow, 32768);
+  const fallback = /^context window unavailable for \S+ \(.+\); using 32768$/;
+  assert.equal(h.notes.filter((n) => n.type === "warning" && fallback.test(n.message)).length, 1);
+
+  await h.start("smollm3_3b");
+  assert.equal(registered(h)[0].contextWindow, 32768);
+  assert.equal(h.notes.filter((n) => n.type === "warning" && fallback.test(n.message)).length, 1, "the same notice is not shown twice");
+  await h.stop();
+
+  const manual = await cachedHarness(t, []);
+  manual.writeConfig({ models: { smollm3_3b: { profiles: { fixed: { limits: { contextWindow: 50000 } } } } } });
+  await manual.start("smollm3_3b --profile fixed");
+  assert.equal(registered(manual)[0].contextWindow, 50000);
+  assert.deepEqual(warningsOf(manual.notes), [], "a window set by hand skips the read, so there is nothing to warn about");
+  await manual.stop();
 });
