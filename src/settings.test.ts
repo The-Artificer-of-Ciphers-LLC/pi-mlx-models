@@ -3284,3 +3284,48 @@ test("no sampling key can be typed on /mlx-start, set by an environment variable
     assert.equal(row.piFlag, undefined, row.path);
   }
 });
+
+// ---- the request record (GEN-01, GEN-02) ----
+
+test("all eight sampling keys of the model block appear in launch.request.sampling with exactly those values", () => {
+  const sampling = { temperature: 0.2, topP: 0.9, topK: 40, minP: 0.05, repetitionPenalty: 1.1, maxTokens: 2048, stop: ["END", "STOP"], seed: 7 };
+  const launch = launchOf({ global: ok({ model: { sampling } }) });
+  assert.deepEqual(launch.request.sampling, sampling);
+  assert.equal(launch.request.chatTemplateArgs, undefined);
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.2", "--top-p=0.9", "--top-k=40", "--min-p=0.05", "--max-tokens=2048"]);
+});
+
+test("launch.request.chatTemplateArgs is the merged object of the model block, a models entry and a typed --chat-template-args", () => {
+  const launch = launchOf({
+    global: ok({
+      model: { chatTemplateArgs: { a: 1, shared: "model" } },
+      models: { qwen3_4b: { chatTemplateArgs: { b: 2, shared: "entry" } } },
+    }),
+    args: { "model.chatTemplateArgs": '{"c":3}' },
+  });
+  assert.deepEqual(launch.request.chatTemplateArgs, { a: 1, b: 2, c: 3, shared: "entry" });
+  assert.deepEqual(Object.getPrototypeOf(launch.request.chatTemplateArgs), Object.prototype, "a plain object, not the prototype-less merge result");
+});
+
+test("a configured empty chatTemplateArgs object leaves request.chatTemplateArgs absent", () => {
+  const launch = launchOf({ global: ok({ model: { chatTemplateArgs: {} } }) });
+  assert.equal("chatTemplateArgs" in launch.request, false);
+});
+
+test("with no sampling and no template arguments launch.request is an empty sampling record", () => {
+  assert.deepEqual(launchOf({}).request, { sampling: {} });
+});
+
+test("a stop list in launch.request is a copy: changing it does not change what a second build produces", () => {
+  const { prepared } = resolved({ global: ok({ model: { sampling: { stop: ["a", "b"] } } }) });
+  const first = buildOk(prepared);
+  (first.request.sampling.stop as string[]).push("mutated");
+  assert.deepEqual(buildOk(prepared).request.sampling.stop, ["a", "b"]);
+});
+
+test("request.chatTemplateArgs does not depend on the server flag: a skipped --chat-template-args still leaves the request its object (D-15)", () => {
+  const launch = launchOf({ global: ok({ model: { chatTemplateArgs: { enable_thinking: false } } }) });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ['--chat-template-args={"enable_thinking":false}']);
+  assert.deepEqual(toLaunchSpec(launch, new Set(["--chat-template-args"])).extraArgs, []);
+  assert.deepEqual(launch.request.chatTemplateArgs, { enable_thinking: false });
+});
