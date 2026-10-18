@@ -594,6 +594,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
           ctx.ui.notify(`mlx-start failed: ${parsed.error}`, "error");
           return;
         }
+        // An empty profile name (`--profile=` or `--profile ""`) names nothing: it is refused here, before any file is read,
+        // and never falls back to the model's defaultProfile (D-02).
+        const profileFlag = parsed.flags.find((flag) => flag.path === PROFILE_FLAG_SPEC.path);
+        if (profileFlag !== undefined && (typeof profileFlag.raw !== "string" || profileFlag.raw.trim() === "")) {
+          ctx.ui.notify("mlx-start failed: --profile needs a profile name", "error");
+          return;
+        }
         // Everything below is read from this call alone and kept nowhere: overrides apply to this launch only (D-10).
         // The pi flags are read here and not in the factory, because pi fills their values in after it ran (D-09).
         const piFlags: Record<string, string> = {};
@@ -644,7 +651,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             ctx.ui.notify("Preset selection cancelled.", "info");
             return;
           }
-          await startModelFromInput(pi, ctx, preset.key, prepared);
+          await startModelFromInput(pi, ctx, preset.key, prepared, profile);
           return;
         }
 
