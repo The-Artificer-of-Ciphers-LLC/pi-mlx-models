@@ -2,6 +2,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { DEFAULT_HOST, DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX, DEFAULT_PORT, baseUrlWarning, deriveBaseUrl, envText, isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import type { RequestOverrides, SamplingValues } from "./request.js";
 import type { LaunchSpec, ServerAddress } from "./server.js";
 import type { CliFlagSpec } from "./startargs.js";
 
@@ -1423,6 +1424,8 @@ export interface ResolvedLaunch {
   address: ServerAddress;
   baseUrl: string;
   flags: LaunchFlag[];
+  /** What the request hook writes into this model's requests; independent of the flags, so a skipped flag still reaches them (D-15). */
+  request: RequestOverrides;
 }
 
 export type BuildResult = { ok: true; launch: ResolvedLaunch } | { ok: false; errors: string[] };
@@ -1562,9 +1565,23 @@ export function buildLaunch(prepared: Prepared, model: { modelId: string; preset
     modelFlags.push({ path: row.path, flag: row.mlxFlag, args: row.emit(value), display, label: displayLabel(hit.layer, row), core: false });
   }
   if (errors.length > 0) return { ok: false, errors };
+
+  // The request record is built from the folded values and not from the flags: keys with no server flag, and a flag the
+  // probe later skips, still reach the requests (D-15). Lists and objects are copied so the record shares nothing.
+  const samplingPrefix = `${MODEL_BLOCK}.${SAMPLING_KEY}.`;
+  const sampling: Record<string, SettingValue> = {};
+  for (const row of SETTINGS) {
+    const hit = row.path.startsWith(samplingPrefix) ? folded.get(row.path) : undefined;
+    if (hit !== undefined) sampling[row.path.slice(samplingPrefix.length)] = Array.isArray(hit.value) ? [...hit.value] : hit.value;
+  }
+  const templateArgs = folded.get("model.chatTemplateArgs")?.value;
+  const request: RequestOverrides = { sampling: sampling as SamplingValues };
+  if (isSettingObject(templateArgs) && Object.keys(templateArgs).length > 0) {
+    request.chatTemplateArgs = JSON.parse(JSON.stringify(templateArgs)) as SettingObject;
+  }
   return {
     ok: true,
-    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: [...prepared.flags, ...modelFlags] },
+    launch: { model, address: prepared.address, baseUrl: prepared.baseUrl, flags: [...prepared.flags, ...modelFlags], request },
   };
 }
 

@@ -17,6 +17,7 @@ import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
 import { createProgress, type Progress } from "./progress.js";
+import { applyRequestOverrides, type ActiveLaunch } from "./request.js";
 import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
 import { createMlxServer, type MlxServer } from "./server.js";
 import {
@@ -44,6 +45,12 @@ import { parseStartArgs } from "./startargs.js";
 
 const PROGRESS_WIDGET = "mlx-progress";
 
+/** What a pi hook receives next to its event; only the model of the request is used. */
+export interface HookContext {
+  model?: { provider?: string; id?: string };
+  ui?: { notify(message: string, type?: "info" | "warning" | "error"): void };
+}
+
 /** The part of pi's ExtensionAPI this extension uses; tests supply a fake. */
 export interface PiHost {
   registerCommand(
@@ -56,6 +63,8 @@ export interface PiHost {
   /** The value of a registered flag; read it inside handlers, not while the factory runs. */
   getFlag(name: string): boolean | string | undefined;
   on(event: "session_shutdown", handler: () => Promise<void> | void): void;
+  /** Called with the payload pi is about to send; a returned value replaces it, undefined leaves it. */
+  on(event: "before_provider_request", handler: (event: { payload: unknown }, ctx: HookContext) => unknown): void;
 }
 
 /** Everything the extension reaches outside itself for, injectable so tests need no process, network or port. */
@@ -148,6 +157,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   /** The base URL the provider is registered with and discovery polls: the latest launch's, or the ambient one before any. */
   let activeBaseUrl = deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT);
   let activeProgress: Progress | null = null;
+  /** The launch made in this session and what to write into its requests; null before any start and while a start is under way (D-12). */
+  let active: ActiveLaunch | null = null;
   /** Config warnings already shown, so each distinct text appears once per extension instance. */
   const shownWarnings = new Set<string>();
 
@@ -330,6 +341,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
   async function runStart(pi: PiHost, ctx: any, launch: ResolvedLaunch, installSettings: InstallSettings, mine: number) {
     const isStale = () => startEpoch !== mine;
+    active = null;
     const { modelId: model, presetKey } = launch.model;
     currentModel = model;
     activeBaseUrl = launch.baseUrl;
@@ -455,6 +467,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       }, toLaunchSpec(launch, skipped));
 
       if (isStale()) return;
+      active = { modelId: model, request: launch.request };
       activate(5, "Refreshing provider model list");
       await registerProvider(pi, { includeFallback: true });
       if (isStale()) return;
@@ -633,6 +646,18 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.
       await Promise.race([server.stop().catch(() => {}), deps.sleep(deps.shutdownWaitMs)]);
       await registerProvider(pi, { includeFallback: false });
+    });
+
+    // The payload of every request pi sends goes through here, other providers' included. Only a request for this provider's
+    // launched model is rewritten, from values held in memory: no file is read (D-12). It never throws and never mutates (D-11).
+    pi.on("before_provider_request", (event, ctx) => {
+      try {
+        if (active === null || ctx?.model?.provider !== PROVIDER_ID) return undefined;
+        const rewrite = applyRequestOverrides(event?.payload, active);
+        return rewrite.kind === "rewritten" ? rewrite.payload : undefined;
+      } catch {
+        return undefined;
+      }
     });
   };
 }
