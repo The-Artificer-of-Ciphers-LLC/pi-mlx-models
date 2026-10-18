@@ -156,35 +156,55 @@ export interface CtxOptions {
   cwd?: string;
   /** Whether an interactive UI is attached; default true. */
   hasUI?: boolean;
-  /** The answer ui.confirm gives; default true. */
-  confirm?: boolean;
+  /** The answer ui.confirm gives, or a function of the dialog's title and message; default true. */
+  confirm?: boolean | ((title: string, message: string) => boolean);
+  /** The text ui.input gives for a dialog title and placeholder; undefined (a dismissal) when absent or when it returns undefined. */
+  input?: (title: string, placeholder?: string) => string | undefined;
   /** What `ctx.modelRegistry` is; default: none, like a host that does not expose one. */
   modelRegistry?: { find(provider: string, modelId: string): unknown };
 }
 
-/** A fake ctx.ui; `select` decides what the picker returns (default: the first option). */
+/** One dialog `makeCtx` showed: which method, its title, and the options (select) or message (confirm). */
+export interface Prompt {
+  kind: "select" | "input" | "confirm";
+  title: string;
+  options?: string[];
+  message?: string;
+}
+
+/**
+ * A fake ctx.ui; `select` decides what the picker returns (default: the first option) and receives the dialog title as its
+ * second argument. Every select, input and confirm is recorded in `prompts`, in call order.
+ */
 export function makeCtx(
-  select: (options: string[]) => string | undefined = (options) => options[0],
+  select: (options: string[], title: string) => string | undefined = (options) => options[0],
   options: CtxOptions = {},
 ) {
   const notes: Note[] = [];
   const statuses: Array<{ key: string; text: string | undefined }> = [];
   const widgets: Array<{ id: string; lines: string[] | undefined }> = [];
   const confirms: Array<{ title: string; message: string }> = [];
+  const prompts: Prompt[] = [];
   const ctx = {
     cwd: options.cwd ?? mkdtempSync(join(tmpdir(), "pi-mlx-ctx-")),
     hasUI: options.hasUI ?? true,
     ...(options.modelRegistry !== undefined ? { modelRegistry: options.modelRegistry } : {}),
     ui: {
-      notify(message: string, type: string) {
+      notify(message: string, type = "info") {
         notes.push({ message, type });
       },
-      async select(_title: string, choices: string[]) {
-        return select(choices);
+      async select(title: string, choices: string[]) {
+        prompts.push({ kind: "select", title, options: [...choices] });
+        return select(choices, title);
+      },
+      async input(title: string, placeholder?: string) {
+        prompts.push({ kind: "input", title });
+        return options.input?.(title, placeholder);
       },
       async confirm(title: string, message: string) {
         confirms.push({ title, message });
-        return options.confirm ?? true;
+        prompts.push({ kind: "confirm", title, message });
+        return typeof options.confirm === "function" ? options.confirm(title, message) : (options.confirm ?? true);
       },
       setStatus(key: string, text: string | undefined) {
         statuses.push({ key, text });
@@ -194,7 +214,42 @@ export function makeCtx(
       },
     },
   };
-  return { ctx, notes, statuses, widgets, confirms };
+  return { ctx, notes, statuses, widgets, confirms, prompts };
+}
+
+/**
+ * A select callback that answers from a script, one step per call. A string picks the first option that contains that text
+ * (case-sensitive), a number picks the option at that index, and undefined answers undefined (a dismissal). An exhausted
+ * script answers undefined. A string or number that matches no option answers undefined and records a message that lists the
+ * options in `errors`, so a test can assert the script and the menu agree. `remaining()` counts the unused steps.
+ */
+export function scriptSelect(...steps: Array<string | number | undefined>) {
+  let next = 0;
+  const errors: string[] = [];
+  const answer = (options: string[], title?: string): string | undefined => {
+    if (next >= steps.length) return undefined;
+    const step = steps[next];
+    next += 1;
+    if (step === undefined) return undefined;
+    const found = typeof step === "number" ? options[step] : options.find((option) => option.includes(step));
+    if (found === undefined) {
+      errors.push(`step ${next} (${JSON.stringify(step)}) matched none of the options of ${JSON.stringify(title ?? "")}: ${JSON.stringify(options)}`);
+    }
+    return found;
+  };
+  return Object.assign(answer, { errors, remaining: (): number => steps.length - next });
+}
+
+/** An input callback that answers from a script, one text per call; undefined is a dismissal and an exhausted script answers undefined. */
+export function scriptInput(...texts: Array<string | undefined>) {
+  let next = 0;
+  const answer = (_title: string, _placeholder?: string): string | undefined => {
+    if (next >= texts.length) return undefined;
+    const text = texts[next];
+    next += 1;
+    return text;
+  };
+  return Object.assign(answer, { remaining: (): number => texts.length - next });
 }
 
 export interface SpawnStubOptions {
