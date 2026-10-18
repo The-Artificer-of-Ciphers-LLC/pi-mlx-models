@@ -335,9 +335,12 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     }
     // Only a key that would create a new entry is asked about: a key already in the file adds nothing.
     if (!keys.includes(checked.value) && !isPlausibleModelKey(checked.value)) {
+      // A number typed to /mlx-start is read as a preset number before any settings are matched, so a digit key can only be
+      // reached through a model id that is a number by other means (such as defaultModel).
+      const numberNote = /^\d+$/.test(checked.value) ? ` A number given to /mlx-start is read as a preset number, so a start does not use ${shown(checked.value)} as a model id.` : "";
       const confirmed = await dialogs.confirm(
         `Add ${shown(checked.value)} anyway?`,
-        `${shown(checked.value)} is not a preset key (${presets}) and has no slash, as in org/name or in a path such as ./model. A start applies the settings stored under a key only when the preset key or the model id it starts is exactly this text, so settings stored under ${shown(checked.value)} are unlikely to be used unless you start a model by exactly this name. A common cause is typing a profile name where the model key belongs: choose the model first, then add the profile. Yes adds it anyway. No or Esc cancels.`,
+        `${shown(checked.value)} is not a preset key (${presets}) and has no slash, as in org/name or in a path such as ./model. A start applies the settings stored under a key only when the preset key or the model id it starts is exactly this text, so settings stored under ${shown(checked.value)} are unlikely to be used unless you start a model by exactly this name.${numberNote} A common cause is typing a profile name where the model key belongs: choose the model first, then add the profile. Yes adds it anyway. No or Esc cancels.`,
       );
       if (!confirmed) {
         report(`Nothing was added: the model key ${shown(checked.value)} was not confirmed.`, "info");
