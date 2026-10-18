@@ -885,6 +885,24 @@ export const SETTINGS: readonly SettingDef[] = [
     initCli: "--pip-index",
     emit: () => [],
   },
+  {
+    // Starting a model when pi opens is the user's own decision, so a project file may never make it (D-24): the project
+    // layer is skipped for this row and a project value is a project violation. It has no flag of any kind and never
+    // reaches argv; the extension reads it at session start through `isAutoStartRequested` (D-26).
+    path: "autoStart",
+    kind: "bool",
+    userLevelOnly: true,
+    expected: "true or false",
+    check: checkBoolean,
+    problem: PHRASES.boolean,
+    parseText: (raw) => {
+      const text = raw.trim();
+      return text === "true" ? ok(true) : text === "false" ? ok(false) : bad;
+    },
+    env: "PI_MLX_MODELS_AUTO_START",
+    emit: () => [],
+    default: false,
+  },
 ];
 
 /** A pi flag: its name without dashes, what it does, and the setting it sets (none for `mlx-model`). */
@@ -1221,6 +1239,8 @@ export interface ProjectViolation {
   reason: string;
   /** Chooses where mlx-lm is installed from rather than what runs or listens; the refusal then words its header for it. */
   installOnly?: true;
+  /** Starts a model when pi opens rather than what runs or listens; the refusal then words its header for that option (D-24). */
+  autoStartOnly?: true;
 }
 
 export type PrepareResult =
@@ -1465,6 +1485,16 @@ function projectViolationsOf(project: ReadonlyMap<string, SettingValue>): Projec
   const pipIndex = project.get("mlxLm.pipIndex");
   if (typeof pipIndex === "string") {
     violations.push({ path: "mlxLm.pipIndex", shown: show(pipIndex), reason: "chooses where mlx-lm is installed from", installOnly: true });
+  }
+  // Starting a model unprompted when pi opens is the user's decision (D-24). Assumption A3, resolved as the literal
+  // reading: either valid value is refused, as for the pip index, so a project file cannot even say `false` here.
+  if (typeof project.get("autoStart") === "boolean") {
+    violations.push({
+      path: "autoStart",
+      shown: "",
+      reason: "starts a model when pi opens; only your own config file or PI_MLX_MODELS_AUTO_START may turn it on",
+      autoStartOnly: true,
+    });
   }
   return violations;
 }
@@ -2131,9 +2161,22 @@ export function formatProjectRefusal(violations: readonly ProjectViolation[], gl
   ].join("\n");
 }
 
-/** Placeholder for the test-first step of plan 06-01; the real body follows in the next commit. */
+/**
+ * Whether the user asked for the last model to start when pi opens (D-24, D-26). It reads the `autoStart` key and nothing
+ * else: the environment variable when it holds a valid true or false text (blank counts as unset, anything else is ignored),
+ * otherwise the global file's own value, which counts only when it is the boolean true. It takes no project file and does
+ * not validate the rest of the configuration, so a user who never turned the option on is never shown a configuration
+ * problem by it, and with the option off the extension does nothing at all at session start (research Pitfall 4).
+ */
 export function isAutoStartRequested(global: LayerFile, env: Record<string, string | undefined>): boolean {
-  void global;
-  void env;
-  throw new Error("not implemented");
+  const row = ROWS_BY_PATH.get("autoStart") as SettingDef;
+  const raw = row.env === undefined ? undefined : envText(env[row.env]);
+  if (raw !== undefined) {
+    const typed = row.parseText(raw);
+    if (typed.ok) return typed.value === true;
+  }
+  if (global.state !== "ok") return false;
+  const stored = global.data.autoStart;
+  const checked = row.check(stored);
+  return checked.ok && checked.value === true;
 }
