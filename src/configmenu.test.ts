@@ -407,6 +407,28 @@ test("configmenu delete a profile: a confirm removes it, the default profile tha
   declined.assertScriptsUsed();
 });
 
+test("configmenu delete a model entry: the empty entry left by deleting its last profile is removed and is gone from the file and from every model list", async (t) => {
+  const s = session(t, {
+    file: { models: { careful: { profiles: { fast: {} } } } },
+    confirm: true,
+    select: [MENU.profiles, "careful", "fast", PROFILE_ACTION.delete, MENU.deleteEntry, "careful", MENU.modelEntry, undefined, MENU.done],
+  });
+  await s.run();
+  assert.deepEqual(s.json(), { models: {} });
+  const file = readLayerFile(s.path);
+  assert.equal(file.state, "ok");
+  assert.equal(prepareSettings({ global: file, env: {} }).ok, true);
+  assert.equal(s.confirms.length, 2);
+  assert.ok(s.confirms[1].title.includes("careful"), s.confirms[1].title);
+  const saved = s.notes.filter((note) => note.message.startsWith("Deleted model entry"));
+  assert.equal(saved.length, 1, JSON.stringify(s.notes));
+  assert.match(saved[0].message, /next \/mlx-start/);
+  const list = s.prompts.find((prompt) => prompt.kind === "select" && prompt.options?.includes(NEW_ENTRY));
+  assert.ok(list?.options, "the model list was shown");
+  assert.deepEqual(list.options, [NEW_ENTRY]);
+  s.assertScriptsUsed();
+});
+
 test("configmenu default profile: a profile name sets it, NO_DEFAULT removes it, and a model without profiles gets a notice and no write", async (t) => {
   const profiles = { fast: {}, slow: {} };
   const set = session(t, { file: { models: { qwen3_4b: { profiles } } }, select: [MENU.defaultProfile, "qwen3_4b", "slow", MENU.done] });

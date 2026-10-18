@@ -36,6 +36,7 @@ export const MENU = {
   modelEntry: "Edit options of one model",
   profiles: "Add, edit or delete a profile",
   defaultProfile: "Choose a model's default profile",
+  deleteEntry: "Delete a model entry",
   done: "Done",
 } as const;
 
