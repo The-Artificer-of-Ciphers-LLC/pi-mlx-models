@@ -155,6 +155,8 @@ function asProviderModels(ids: string[], infoOf: (id: string) => ModelInfo) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: info.contextWindow,
       maxTokens: info.maxTokens,
+      // A reasoning model gets neither the `developer` role nor `reasoning_effort` from pi: mlx-lm templates reject both (D-06).
+      ...(info.reasoning ? { compat: { supportsDeveloperRole: false, supportsReasoningEffort: false } } : {}),
     };
   });
 }

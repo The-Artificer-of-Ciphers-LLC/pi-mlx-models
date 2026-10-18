@@ -3,7 +3,7 @@ export const MODEL_PRESETS = [
     key: "deepseek_r1_1_5b",
     modelId: "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B-4bit",
     tags: ["reasoning", "math", "debugging", "planning"],
-    reasoning: false,
+    reasoning: true,
   },
   {
     key: "gemma4_e2b",

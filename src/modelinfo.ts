@@ -6,6 +6,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { HF_HOME } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import { MODEL_PRESETS } from "./presets.js";
 
 /** The context window registered for a model whose `config.json` cannot be read or holds no usable value (D-03). */
 export const FALLBACK_CONTEXT_WINDOW = 32768;
@@ -365,20 +366,22 @@ export function defaultMaxTokens(contextWindow: number, reasoning: boolean): num
 
 /**
  * Everything pi is told about one model, and where each value came from. Pure: the same read always gives the same
- * record. Reasoning and input are the defaults here; later plans detect them and let the profile override them.
+ * record. The reasoning flag is the preset's when the id is a preset's model id (D-04); input is text for every model
+ * (D-05). Later plans add the id rule and let the profile override both.
  */
 export function deriveModelInfo(input: { id: string; config?: ModelConfigRead }): ModelInfo {
   const { config } = input;
   const declared = config?.ok ? contextWindowOf(config.config) : undefined;
   const contextWindow = declared ?? FALLBACK_CONTEXT_WINDOW;
-  const reasoning = false;
+  const preset = MODEL_PRESETS.find((p) => p.modelId === input.id);
+  const reasoning: boolean = preset?.reasoning ?? false;
   const info: ModelInfo = {
     contextWindow,
     contextSource: declared === undefined ? "fallback" : "config.json",
     maxTokens: defaultMaxTokens(contextWindow, reasoning),
     maxTokensSource: "default",
     reasoning,
-    reasoningSource: "default",
+    reasoningSource: preset ? "preset" : "default",
     input: ["text"],
     inputSource: "default",
   };
