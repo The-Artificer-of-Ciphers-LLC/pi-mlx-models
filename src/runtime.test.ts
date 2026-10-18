@@ -118,6 +118,99 @@ test("a first install with a pin also uses the pinned spec", async () => {
   assert.deepEqual(mlxLmStep(calls), [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "mlx-lm==0.31.1", PIP_INDEX]);
 });
 
+// ---- progress and failures that name the spec and the index (plan 03-04, RUN-04) ----
+
+const MIRROR = "https://mirror.example/simple/";
+const DEFAULT_INDEX = "https://pypi.org/simple/";
+/** The first active event of a phase: the one the step announces itself with, before any pip output. */
+const announcement = (events: RuntimeEvent[], phase: RuntimeEvent["phase"]) => events.find((e) => e.phase === phase && e.state === "active")?.detail;
+const isPipUpgrade = (args: string[]) => args.includes("install") && args.includes("pip");
+const isMlxLmInstall = (args: string[]) => args.includes("install") && args.some((arg) => arg.startsWith("mlx-lm"));
+
+test("the pip step announces the index it upgrades from", async () => {
+  const { host } = fakeHost({ venv: true });
+  const events: RuntimeEvent[] = [];
+  await ensureInstalled({ host, upgrade: true, policy: { version: "latest", pipIndex: MIRROR }, onEvent: (e) => events.push(e) });
+  assert.equal(announcement(events, "pip"), `Upgrading pip (index ${MIRROR})`);
+
+  const long = fakeHost({ venv: true });
+  const longEvents: RuntimeEvent[] = [];
+  const pipIndex = `https://mirror.example/${"a".repeat(500)}`;
+  await ensureInstalled({ host: long.host, upgrade: true, policy: { version: "latest", pipIndex }, onEvent: (e) => longEvents.push(e) });
+  const detail = announcement(longEvents, "pip") ?? "";
+  assert.ok(detail.startsWith("Upgrading pip (index https://mirror.example/aaa"), detail);
+  assert.ok(detail.length <= "Upgrading pip (index )".length + 200, `${detail.length}`);
+});
+
+test("the mlx-lm step announces the exact spec and the index", async () => {
+  const { host } = fakeHost({ venv: true });
+  const events: RuntimeEvent[] = [];
+  await ensureInstalled({ host, upgrade: true, policy: { version: "0.31.1", pipIndex: MIRROR }, onEvent: (e) => events.push(e) });
+  assert.equal(announcement(events, "mlx-lm"), `Installing mlx-lm==0.31.1 (index ${MIRROR})`);
+  assert.equal(events.find((e) => e.phase === "mlx-lm" && e.state === "done")?.detail, "mlx-lm installed");
+  assert.equal(events.find((e) => e.phase === "pip" && e.state === "done")?.detail, "pip upgraded");
+});
+
+test("a failing mlx-lm step names the spec and the index before pip's own text", async () => {
+  const { host } = fakeHost({
+    venv: true,
+    run: async (_cmd, args) => {
+      if (isMlxLmInstall(args)) throw new Error("ERROR: No matching distribution found");
+    },
+  });
+  await assert.rejects(
+    ensureInstalled({ host, upgrade: true, policy: { version: "0.99.0" } }),
+    (error: Error) => {
+      assert.ok(error.message.startsWith(`Installing mlx-lm==0.99.0 from ${DEFAULT_INDEX} failed: `), error.message);
+      assert.ok(error.message.endsWith("ERROR: No matching distribution found"), error.message);
+      return true;
+    },
+  );
+});
+
+test("pip's last sentence stays at the end of a long failure message", async () => {
+  const versions = Array.from({ length: 250 }, (_, i) => `0.${i}.0`).join(", ").slice(0, 1500);
+  const tail = "No matching distribution found for mlx-lm==0.99.0";
+  const { host } = fakeHost({
+    venv: true,
+    run: async (_cmd, args) => {
+      if (isMlxLmInstall(args)) throw new Error(`${versions}\n${tail}`);
+    },
+  });
+  await assert.rejects(ensureInstalled({ host, upgrade: true, policy: { version: "0.99.0" } }), (error: Error) => {
+    assert.ok(error.message.startsWith("Installing mlx-lm==0.99.0 from"), error.message);
+    assert.ok(error.message.endsWith(tail), error.message.slice(-120));
+    return true;
+  });
+});
+
+test("a failing pip upgrade on a non-default index names the index and keeps the original text", async () => {
+  const { host } = fakeHost({
+    venv: true,
+    run: async (_cmd, args) => {
+      if (isPipUpgrade(args)) throw new Error("Connection refused");
+    },
+  });
+  await assert.rejects(ensureInstalled({ host, upgrade: true, policy: { version: "latest", pipIndex: MIRROR } }), {
+    message: `pip could not be upgraded from ${MIRROR}: Connection refused`,
+  });
+});
+
+test("a failing pip upgrade on the default index is rethrown unchanged", async () => {
+  const original = new Error("Connection refused");
+  const { host } = fakeHost({
+    venv: true,
+    run: async (_cmd, args) => {
+      if (isPipUpgrade(args)) throw original;
+    },
+  });
+  await assert.rejects(ensureInstalled({ host, upgrade: true }), (error: Error) => {
+    assert.equal(error.message, "Connection refused");
+    assert.equal(error, original);
+    return true;
+  });
+});
+
 /** A temp directory removed when the test ends. */
 async function tempDir(t: TestContext): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "pi-mlx-py-"));

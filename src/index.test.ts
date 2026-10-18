@@ -2260,7 +2260,15 @@ test("an install that lists every KV flag passes all three in schema order with 
 const PIP_INDEX_ARG = "--index-url=https://pypi.org/simple/";
 
 /** An extension around the REAL ensureInstalled over a scripted host: no network and no real pip. */
-async function setupRealInstall(globalFile?: unknown, extra: { env?: Record<string, string | undefined>; cwd?: string } = {}) {
+async function setupRealInstall(
+  globalFile?: unknown,
+  extra: {
+    env?: Record<string, string | undefined>;
+    cwd?: string;
+    /** The text a pip step fails with, for the step whose argv this returns text for. */
+    failWith?: (args: string[]) => string | undefined;
+  } = {},
+) {
   const settings = freshSettings(extra.env ?? {});
   if (globalFile !== undefined) writeGlobal(settings, globalFile);
   const hostCalls: string[][] = [];
@@ -2270,6 +2278,8 @@ async function setupRealInstall(globalFile?: unknown, extra: { env?: Record<stri
     run: async (cmd, args, onLine) => {
       hostCalls.push([cmd, ...args]);
       if (args[0] === "--version") onLine?.("Python 3.13.1");
+      const failure = extra.failWith?.(args);
+      if (failure !== undefined) throw new Error(failure);
     },
   };
   const fakePi = makeFakePi();
@@ -2484,6 +2494,15 @@ test("mlx-init shows the configured index and where it came from in its progress
   await h.commands.get("mlx-init")!("", h.ctx);
 
   assert.ok(infos(h.notes).includes(`Installing mlx-lm latest (default) from ${MIRROR} (global file)`), infos(h.notes).join("|"));
+});
+
+test("a failing mlx-lm step ends mlx-init with one error that names the spec and the index before pip's text", async () => {
+  const original = "ERROR: Could not find a version that satisfies the requirement mlx-lm>=0.24.0";
+  const h = await setupRealInstall(undefined, { failWith: (args) => (args.includes("install") && args.includes("mlx-lm>=0.24.0") ? original : undefined) });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [`mlx-init failed: Installing mlx-lm>=0.24.0 from https://pypi.org/simple/ failed: ${original}`]);
 });
 
 // ---- the pip index is user-level: a project file may not choose it (plan 03-04, D-01, D-02, D-18) ----
