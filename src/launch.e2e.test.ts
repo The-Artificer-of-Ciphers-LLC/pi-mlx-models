@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
+import { ACTION, MENU, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION } from "./configmenu.js";
 import type { ProbeResult } from "./flagprobe.js";
 import { createExtension } from "./index.js";
 import { createModelConfigReader, type ReadModelConfig } from "./modelinfo.js";
@@ -19,6 +20,8 @@ import {
   makeFakePi,
   makeFakeModelConfig,
   readRequests,
+  scriptInput,
+  scriptSelect,
   stubArgs,
   writeHfCache,
   type CtxOptions,
@@ -48,6 +51,8 @@ interface HarnessExtras {
   discovered?: readonly string[];
   /** A directory to use instead of a new temporary one, so a second instance sees the files of the first (pi closed and reopened). */
   dir?: string;
+  /** What the ctx's select dialog answers, so a menu can be scripted (see `scriptSelect`); default is the first option. */
+  select?: (options: string[], title: string) => string | undefined;
 }
 
 async function harness(
@@ -97,7 +102,7 @@ async function harness(
     shutdownWaitMs: 1000,
   });
   const fakePi = makeFakePi();
-  const fakeCtx = makeCtx(undefined, ctxOptions);
+  const fakeCtx = makeCtx(extras.select, ctxOptions);
   await extension(fakePi.pi);
 
   return {
@@ -145,6 +150,7 @@ async function harness(
     last: (input = "") => fakePi.commands.get("mlx-last")!(input, fakeCtx.ctx),
     status: (input = "") => fakePi.commands.get("mlx-status")!(input, fakeCtx.ctx),
     restart: (input = "") => fakePi.commands.get("mlx-restart")!(input, fakeCtx.ctx),
+    config: (input = "") => fakePi.commands.get("mlx-config")!(input, fakeCtx.ctx),
     stop: () => fakePi.commands.get("mlx-stop")!("", fakeCtx.ctx),
   };
 }
@@ -1800,4 +1806,67 @@ test("mlx-restart e2e: with nothing running a fresh instance starts the remember
   assert.ok(said[0].message.includes(QWEN.modelId), said[0].message);
   assert.ok(startNotes(second.notes)[0].message.includes("\nprofile: fast (previous launch)"), startNotes(second.notes)[0].message);
   await second.stop();
+});
+
+// ---- /mlx-config: an edit made in the menu is the configuration the next start uses (plan 06-10: CMD-02) ----
+
+test("mlx-config e2e: a setting edited through the menu is what the next /mlx-start sends to a real server", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const select = scriptSelect(MENU.modelBlock, "model.sampling.temperature", ACTION.set, MENU.done);
+  const input = scriptInput("0.3");
+  const h = await harness(t, {}, { input }, ALL_SUPPORTED, { select });
+  h.writeConfig({ server: { port } });
+
+  await h.config();
+
+  assert.deepEqual(select.errors, [], "the script and the menu agree");
+  assert.equal(select.remaining(), 0);
+  assert.equal(input.remaining(), 0);
+  assert.deepEqual(JSON.parse(readFileSync(h.globalConfigPath, "utf8")), { server: { port }, model: { sampling: { temperature: 0.3 } } });
+  const saved = h.notes.filter((n) => n.message.startsWith("Saved "));
+  assert.equal(saved.length, 1);
+  assert.ok(saved[0].message.includes("model.sampling.temperature"), saved[0].message);
+  assert.ok(saved[0].message.includes("takes effect on the next /mlx-start"), saved[0].message);
+  assert.equal(saved[0].message.includes("/mlx-restart"), false, "no server of this session is running, so there is nothing to restart");
+  assert.equal(existsSync(h.argvFile), false, "the command started nothing");
+  assert.equal(h.children.length, 0);
+  assert.equal(h.confirms.length, 0);
+
+  // The same extension instance, no reload step: the very next start reads the file as it is now.
+  await h.start("qwen3_4b");
+
+  assert.deepEqual(errorNotes(h.notes), []);
+  assert.ok(h.argv().includes("--temp=0.3"), JSON.stringify(h.argv()));
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  assert.ok(starting[0].message.includes("--temp 0.3 (global file)"), starting[0].message);
+  await h.stop();
+});
+
+test("mlx-config e2e: a profile added in the menu is usable by the next /mlx-start --profile", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const select = scriptSelect(MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.edit, "sampling.temperature", ACTION.set, MENU.done);
+  const input = scriptInput("qwen3_4b", "fast", "0.2");
+  const h = await harness(t, {}, { input }, ALL_SUPPORTED, { select });
+  h.writeConfig({ server: { port } });
+
+  await h.config();
+
+  assert.deepEqual(select.errors, [], "the script and the menu agree");
+  assert.equal(select.remaining(), 0);
+  assert.equal(input.remaining(), 0);
+  assert.deepEqual(JSON.parse(readFileSync(h.globalConfigPath, "utf8")), {
+    server: { port },
+    models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } },
+  });
+  assert.equal(existsSync(h.argvFile), false, "the command started nothing");
+
+  await h.start("qwen3_4b --profile fast");
+
+  assert.deepEqual(errorNotes(h.notes), []);
+  assert.ok(h.argv().includes("--temp=0.2"), JSON.stringify(h.argv()));
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  assert.ok(starting[0].message.includes("\nprofile: fast (/mlx-start)"), starting[0].message);
+  await h.stop();
 });
