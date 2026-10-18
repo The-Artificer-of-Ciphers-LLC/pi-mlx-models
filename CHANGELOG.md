@@ -4,6 +4,8 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-18
+
 ### Added
 
 - **Performance options.** `server.decodeConcurrency`, `server.promptConcurrency`, `server.prefillStepSize`, `server.promptCacheSize` and `server.promptCacheBytes`, each also a `/mlx-start` flag. The concurrency flags need mlx-lm 0.30.6 and the other three 0.31.1; an older install skips them with a warning.
