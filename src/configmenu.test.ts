@@ -423,9 +423,10 @@ test("configmenu delete a model entry: the empty entry left by deleting its last
   const saved = s.notes.filter((note) => note.message.startsWith("Deleted model entry"));
   assert.equal(saved.length, 1, JSON.stringify(s.notes));
   assert.match(saved[0].message, /next \/mlx-start/);
-  const list = s.prompts.find((prompt) => prompt.kind === "select" && prompt.options?.includes(NEW_ENTRY));
-  assert.ok(list?.options, "the model list was shown");
-  assert.deepEqual(list.options, [NEW_ENTRY]);
+  // The last model list is the one MENU.modelEntry opened after the delete; the first was opened before it.
+  const lists = s.prompts.filter((prompt) => prompt.kind === "select" && prompt.options?.includes(NEW_ENTRY));
+  assert.equal(lists.length, 2, "the profile flow's list and the model entry flow's list; the delete flow's list has no new entry");
+  assert.deepEqual(lists[lists.length - 1].options, [NEW_ENTRY]);
   s.assertScriptsUsed();
 });
 

@@ -380,8 +380,24 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     );
   }
 
+  /** Delete a whole model entry after a confirmation: its options, its profiles and its default profile go with it. */
+  async function deleteEntryFlow(): Promise<Flow> {
+    const model = await chooseModel("Choose the model entry to delete", false);
+    if (model === undefined) return "menu";
+    const name = `model entry ${shown(model)}`;
+    const confirmed = await dialogs.confirm(
+      `Delete ${name}?`,
+      `This removes the model entry and everything set in it from the config file. Yes deletes it. No or Esc cancels.`,
+    );
+    if (!confirmed) {
+      dialogs.notify(`Nothing was deleted: ${name} was not confirmed.`, "info");
+      return "menu";
+    }
+    return flowOf(write((draft) => unsetAt(draft, ["models", model]), `Deleted ${name}.`, `${name} was not in the file.`));
+  }
+
   for (let round = 0; round < MAX_MENU_ROUNDS; round += 1) {
-    const entries = [MENU.view, MENU.general, MENU.modelBlock, MENU.modelEntry, MENU.profiles, MENU.defaultProfile, MENU.done];
+    const entries = [MENU.view, MENU.general, MENU.modelBlock, MENU.modelEntry, MENU.profiles, MENU.defaultProfile, MENU.deleteEntry, MENU.done];
     const chosen = await pick("MLX config", entries);
     if (chosen === undefined || entries[chosen] === MENU.done) return;
     let flow: Flow = "menu";
@@ -403,6 +419,9 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
         break;
       case MENU.defaultProfile:
         flow = await defaultProfileFlow();
+        break;
+      case MENU.deleteEntry:
+        flow = await deleteEntryFlow();
         break;
       default:
         break;
