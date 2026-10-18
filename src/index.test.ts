@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROVIDER_ID, VENV_PYTHON } from "./config.js";
 import { createExtension } from "./index.js";
-import { parseHelpFlags, type ProbeResult } from "./flagprobe.js";
+import { parseHelpFlags, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { ensureInstalled, type RuntimeHost } from "./runtime.js";
 import { SETTINGS } from "./settings.js";
@@ -121,12 +121,16 @@ async function setup(
     ctx?: CtxOptions;
     /** What the flag probe answers; default: an install that lists every flag of the schema. */
     probe?: () => Promise<ProbeResult>;
+    /** What the cheap installed-version query answers; default: mlx-lm 0.32.2. */
+    installed?: () => Promise<VersionResult>;
   } = {},
 ) {
   const server = makeFakeServer(options.server);
   const installCalls: any[] = [];
   /** How many times the extension asked which flags the install supports. */
   let probeCalls = 0;
+  /** How many times the extension asked which mlx-lm version is installed. */
+  let installedCalls = 0;
   const fakePi = makeFakePi();
   const fakeCtx = makeCtx(options.select, options.ctx);
   const extension = createExtension({
@@ -141,6 +145,10 @@ async function setup(
       probeCalls += 1;
       return options.probe ? options.probe() : ALL_SUPPORTED;
     },
+    installedVersion: async () => {
+      installedCalls += 1;
+      return options.installed ? options.installed() : { ok: true, version: "0.32.2" };
+    },
     ...(options.sleep ? { sleep: options.sleep } : {}),
   });
   await extension(fakePi.pi);
@@ -151,6 +159,9 @@ async function setup(
     ...fakeCtx,
     get probeCalls() {
       return probeCalls;
+    },
+    get installedCalls() {
+      return installedCalls;
     },
   };
 }
@@ -2609,4 +2620,66 @@ test("mlx-init --pip-index applies to that run only and a bad one is refused wit
     errors(bad.notes)[0],
   );
   assertNothingHappened(bad);
+});
+
+// ---- a pin that differs from the installed mlx-lm is reported on every start and applied only by mlx-init (plan 03-05, D-07, D-08) ----
+
+const PIN_MISMATCH = "mlx-lm pinned 0.31.1 (project file), installed 0.32.2; run /mlx-init to apply";
+
+test("a project pin that differs from the installed mlx-lm warns once, before the start message, starts what is installed and never upgrades", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { mlxLm: { version: "0.31.1" } });
+  const h = await setup({ ctx: { cwd }, installed: async () => ({ ok: true, version: "0.32.2" }) });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), [PIN_MISMATCH]);
+  const warningAt = h.notes.findIndex((n) => n.message === PIN_MISMATCH);
+  const startingAt = h.notes.findIndex((n) => n.message.startsWith("Starting MLX server with"));
+  assert.ok(warningAt >= 0 && startingAt > warningAt, `the warning (${warningAt}) comes before the start message (${startingAt})`);
+  assert.equal(h.server.startCalls.length, 1, "the server still starts");
+  assert.equal(h.installCalls.length, 1);
+  assert.ok(!("upgrade" in h.installCalls[0]), "the start never upgrades or downgrades");
+  assert.equal(h.installedCalls, 1);
+});
+
+test("a pin equal to the installed version shows no warning", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { mlxLm: { version: "0.32.2" } });
+  const h = await setup({ ctx: { cwd } });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), []);
+  assert.equal(h.installedCalls, 1, "the version was compared");
+  assert.equal(h.server.startCalls.length, 1);
+});
+
+test("with no pin, or the word latest, the installed version is never asked and nothing is shown", async () => {
+  const floating = await setup();
+  await startMlx(floating, "qwen3_4b");
+
+  const settings = freshSettings({});
+  writeGlobal(settings, { mlxLm: { version: "latest" } });
+  const latest = await setup({ settings });
+  await startMlx(latest, "qwen3_4b");
+
+  for (const h of [floating, latest]) {
+    assert.equal(h.installedCalls, 0);
+    assert.deepEqual(warningTexts(h.notes), []);
+    assert.equal(h.server.startCalls.length, 1);
+  }
+});
+
+test("when the installed version cannot be read there is no warning and the start goes on", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { mlxLm: { version: "0.31.1" } });
+  const h = await setup({ ctx: { cwd }, installed: async () => ({ ok: false, reason: "could not read the mlx-lm version (python exited with 1)" }) });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(h.installedCalls, 1);
+  assert.deepEqual(warningTexts(h.notes), []);
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(h.server.startCalls.length, 1);
 });
