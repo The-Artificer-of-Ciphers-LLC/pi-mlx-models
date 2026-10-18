@@ -22,8 +22,8 @@ import {
   validateModelKey,
   validateProfileName,
 } from "./configedit.js";
-import { MODEL_PRESETS } from "./presets.js";
-import { MAX_FILE_BYTES, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, prepareSettings, readLayerFile } from "./settings.js";
+import { MODEL_PRESETS, resolveModel } from "./presets.js";
+import { MAX_FILE_BYTES, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, buildLaunch, prepareSettings, readLayerFile, toLaunchSpec } from "./settings.js";
 
 /** A fresh directory under the system temp directory, removed when the test ends. */
 function tempDir(t: { after(fn: () => void): void }): string {
@@ -613,6 +613,29 @@ test("isPlausibleModelKey: a preset key, an id with a slash and a local path can
   for (const key of ["careful", "qwen3.4b", "fast", "gpt2", "Qwen3_4B", "__proto__", "toString"]) {
     assert.equal(isPlausibleModelKey(key), false, key);
   }
+});
+
+test("isPlausibleModelKey WR-01: a bare id such as gpt2 is classified as unlikely, yet a start of exactly that id applies its entry", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  writeFileSync(path, pretty({ models: { gpt2: { numDraftTokens: 4 } } }));
+  const result = resolved(path);
+  assert.ok(result.ok, JSON.stringify(result));
+  const where = { home: dir, cwd: dir };
+
+  const exact = resolveModel("gpt2", "qwen3_4b");
+  assert.equal(exact.error, undefined);
+  assert.equal(exact.modelId, "gpt2");
+  assert.equal(exact.preset, undefined);
+  const applied = buildLaunch(result.prepared, { modelId: "gpt2" }, where);
+  assert.ok(applied.ok, JSON.stringify(applied));
+  assert.ok(toLaunchSpec(applied.launch).extraArgs.includes("--num-draft-tokens=4"), JSON.stringify(toLaunchSpec(applied.launch).extraArgs));
+
+  const other = buildLaunch(result.prepared, { modelId: "org/other" }, where);
+  assert.ok(other.ok, JSON.stringify(other));
+  assert.equal(toLaunchSpec(other.launch).extraArgs.includes("--num-draft-tokens=4"), false);
+
+  assert.equal(isPlausibleModelKey("gpt2"), false);
 });
 
 test("configedit the validateModelKey comment tells the truth: it names isPlausibleModelKey and no longer credits the shape rules to the settings module", () => {

@@ -253,14 +253,20 @@ test("configmenu new model entry: NEW_ENTRY asks for a key, an existing entry do
   bad.assertScriptsUsed();
 });
 
-test("configmenu typed model key that cannot match asks Add anyway and a no writes nothing", async (t) => {
+test("configmenu WR-01: a typed model key that cannot match asks Add anyway, states a likelihood and a no writes nothing", async (t) => {
   const s = session(t, { confirm: false, select: [MENU.profiles, NEW_ENTRY, MENU.done], input: ["careful"] });
   await s.run();
   assert.equal(s.confirms.length, 1, JSON.stringify(s.prompts));
   assert.match(s.confirms[0].title, /careful/);
   assert.match(s.confirms[0].title, /anyway\?/);
   for (const preset of MODEL_PRESETS) assert.ok(s.confirms[0].message.includes(preset.key), preset.key);
-  assert.match(s.confirms[0].message, /no start will use settings stored under/);
+  const message = s.confirms[0].message;
+  assert.match(message, /unlikely/);
+  assert.match(message, /exactly/);
+  assert.match(message, /no slash/);
+  assert.match(message, /profile name/);
+  assert.match(message, /Yes adds it anyway/);
+  assert.doesNotMatch(message, /\b(no start|never)\b/i);
   assert.equal(existsSync(s.path), false);
   assert.ok(s.notes.some((note) => note.type === "info" && /nothing was added/i.test(note.message)), JSON.stringify(s.notes));
   s.assertScriptsUsed();
@@ -274,6 +280,19 @@ test("configmenu typed model key that cannot match: a yes adds the entry and a p
   assert.equal(file.state, "ok");
   assert.equal(prepareSettings({ global: file, env: {} }).ok, true);
   assert.equal(s.confirms.length, 1);
+  s.assertScriptsUsed();
+});
+
+test("configmenu WR-01: a bare model id such as gpt2 is asked about as unlikely, and a yes adds it", async (t) => {
+  const s = session(t, { confirm: true, select: [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: ["gpt2", "fast"] });
+  await s.run();
+  assert.equal(s.confirms.length, 1, JSON.stringify(s.prompts));
+  assert.match(s.confirms[0].message, /unlikely/);
+  assert.doesNotMatch(s.confirms[0].message, /\b(no start|never)\b/i);
+  assert.deepEqual(s.json(), { models: { gpt2: { profiles: { fast: {} } } } });
+  const file = readLayerFile(s.path);
+  assert.equal(file.state, "ok");
+  assert.equal(prepareSettings({ global: file, env: {} }).ok, true);
   s.assertScriptsUsed();
 });
 
