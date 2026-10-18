@@ -18,6 +18,8 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 - The notice for a skipped flag names the pin when one is set: `mlx-lm is pinned to X by SOURCE; raise or remove the pin, then run /mlx-init`.
 - pip is now passed the index as one `--index-url=` argument, and its failures name the spec and the index. The index stays in the progress line while pip prints.
 - An invalid `PI_MLX_MODELS_PIP_INDEX` refuses `/mlx-init` and `/mlx-start` instead of installing from the default index. A refused index never shows its user name or password, and only the plain `http(s)://` spelling is accepted.
+- A pip index with a query string or a fragment, or an `http` host written in a non-canonical form such as `127.1`, `0x7f.1` or a decimal number, is now refused. A query string can carry a token, and pip does not necessarily read those hosts as loopback.
+- A refused index or a stray URL typed after `/mlx-init` or `/mlx-start` now hides everything between the scheme and the last `@`, including passwords that contain `/`, `?` or `#`.
 
 ## 0.2.3 - 2026-10-17
 

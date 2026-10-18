@@ -127,7 +127,7 @@ Use this for a mirror or an internal package index.
 
 2. Run `/mlx-init`. The index is named in the first line it prints and in both pip steps.
 
-The index must carry `pip` itself, because `/mlx-init` upgrades pip from it first. Do not put a user name or password in the URL; it is refused. Use pip's netrc file or keyring for credentials.
+The index must carry `pip` itself, because `/mlx-init` upgrades pip from it first. Do not put a user name or password in the URL; it is refused, and so is a query string or fragment, which can carry a token too. Use pip's netrc file or keyring for credentials.
 
 A project file cannot set the index. Whoever picks the index picks the code that gets installed, so `/mlx-init` and `/mlx-start` refuse a project file that sets it and tell you to move it to the global file. The global file, the environment variable and the flag need no confirmation.
 

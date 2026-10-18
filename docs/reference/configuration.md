@@ -99,7 +99,7 @@ The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and po
 | `baseUrl` | `http` or `https` URL; a trailing slash is removed | `http://<host>:<port>/v1` | | | | `PI_MLX_MODELS_BASE_URL` |
 | `defaultModel` | non-empty model id or preset key | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | | | | `PI_MLX_MODELS_DEFAULT_MODEL` |
 | `mlxLm.version` | the word `latest` or an exact version such as `0.32.2` | `latest` | | | | `PI_MLX_MODELS_MLX_LM_VERSION` |
-| `mlxLm.pipIndex` | `https` URL without credentials or spaces (`http` only for a loopback host) | `https://pypi.org/simple/` | | | | `PI_MLX_MODELS_PIP_INDEX` |
+| `mlxLm.pipIndex` | `https` URL without credentials, spaces, a query string or a fragment (`http` only for a loopback host) | `https://pypi.org/simple/` | | | | `PI_MLX_MODELS_PIP_INDEX` |
 
 The two `mlxLm` rows are settings of `/mlx-init`, not of the server. Their command-line forms are the `/mlx-init` flags `--mlx-lm-version` and `--pip-index`, not `/mlx-start` flags. They have no pi flag.
 
@@ -173,10 +173,11 @@ Nothing else is accepted: no ranges, no specifiers such as `>=`, no URLs. The pr
 
 **`mlxLm.pipIndex`** is the package index pip installs from.
 
-- It must be an `https` URL, or `http` for `127.0.0.1`, `localhost` or `::1`. It must contain no whitespace and no credentials; use pip's netrc file or keyring for those.
+- It must be an `https` URL, or `http` for `127.0.0.1`, `localhost` or `[::1]`. It must contain no whitespace and no credentials; use pip's netrc file or keyring for those. It has no query string or fragment, because either can carry a token that would then show in the install line and in failure texts. For `http` the host must be written as `127.0.0.1`, `localhost` or `[::1]` (any letter case, any port), so spellings such as `127.1`, `0x7f.1` or a decimal number are refused.
 - It is passed to pip as `--index-url=VALUE` in both pip steps, the pip upgrade and the mlx-lm install. The index must therefore carry `pip` itself.
 - Only `--index-url` is passed. pip's own environment and configuration, for example `PIP_EXTRA_INDEX_URL`, still apply.
-- A refused value is shown with its user name and password replaced by `***`. Only the plain `http://` or `https://` spelling is accepted: a backslash, a single slash after the scheme and an escaped character in the host are refused, because pip reads them differently from the check.
+- In a refused value everything from the end of the scheme up to the last `@` is replaced by `***`, whatever it contains (`/`, `?`, `#` or a space). The same is done for a stray URL typed after `/mlx-init` or `/mlx-start`. A path that contains `@` may be hidden too. A query string is refused, not hidden: it is shown once as typed, clipped to 60 characters, in the refusal.
+- Only the plain `http://` or `https://` spelling is accepted: a backslash, a single slash after the scheme and an escaped character in the host are refused, because pip reads them differently from the check.
 - It can be set in the global file, by `PI_MLX_MODELS_PIP_INDEX` or by `/mlx-init --pip-index`. A project file cannot set it; see [Settings that ask for permission](#settings-that-ask-for-permission).
 
 Only `/mlx-init` changes the installed mlx-lm. `/mlx-start` never upgrades or downgrades, and runs pip only when there is no working install at all. In that case it uses the same index and pin as `/mlx-init`, so a configured mirror applies on the first launch.
