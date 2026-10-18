@@ -1,6 +1,6 @@
 # How to set model options
 
-Give a model a draft model for speculative decoding, a LoRA adapter, or a custom chat template, either for every model or for one. The keys and their limits are in the [configuration reference](../reference/configuration.md#model-options).
+Give a model a draft model for speculative decoding, a LoRA adapter, or a custom chat template, either for every model or for one. The keys and their limits are in the [configuration reference](../reference/configuration.md#model-options). For sampling values and named profiles, see [How to use profiles and sampling](use-profiles-and-sampling.md).
 
 ## Apply an option to every model
 

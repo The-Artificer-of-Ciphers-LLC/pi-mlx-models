@@ -28,7 +28,7 @@ The flags apply to that run only. What `/mlx-init` installs is decided by the sa
 ## `/mlx-start`
 
 ```
-/mlx-start [model] [--flag value | --flag=value ...]
+/mlx-start [model] [--profile name] [--flag value | --flag=value ...]
 ```
 
 Starts the local MLX server for a model, waits until it answers a completion, and registers it with pi as the provider `pi-mlx-models`.
@@ -39,8 +39,9 @@ Starts the local MLX server for a model, waits until it answers a completion, an
 | a number from 1 to 5 | The preset at that position in the [preset list](#presets) |
 | a preset key | For example `qwen3_4b` |
 | a model id | Any Hugging Face model id, for example `mlx-community/Qwen3-4B-Instruct-2507-4bit`. It must not start with `-`. |
+| `--profile name` | Starts the model with the named profile for that launch only. The profile must be defined for that model; otherwise the start stops and lists the model's profiles. |
 
-The flags, their syntax and their precedence are in the [configuration reference](configuration.md#mlx-start-arguments).
+The flags, their syntax and their precedence are in the [configuration reference](configuration.md#mlx-start-arguments). Profiles and the sampling settings are described in [Sampling and profiles](configuration.md#sampling-and-profiles).
 
 Before it starts anything, `/mlx-start` checks the arguments and the configuration. A problem is reported in one message and nothing is installed or started. It may then ask for confirmation of settings that [run code or open the network](configuration.md#settings-that-ask-for-permission).
 

@@ -10,9 +10,15 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 - **KV cache quantization.** `server.kvBits`, `server.kvGroupSize` and `server.quantizedKvStart`, which need mlx-lm 0.32.0. A launch with `kvBits` warns that it disables batching, and says when concurrency settings then have no effect.
 - **mlx-lm version policy.** `mlxLm.version` is `latest` or an exact version, set in either file, by `PI_MLX_MODELS_MLX_LM_VERSION` or by `/mlx-init --mlx-lm-version`. `/mlx-init` installs exactly the pinned version. When the installed mlx-lm differs from the pin, `/mlx-start` warns and launches what is installed.
 - **Pip index.** `mlxLm.pipIndex`, `PI_MLX_MODELS_PIP_INDEX` and `/mlx-init --pip-index` install mlx-lm from another index. It is user-level only: a project file that sets it is refused.
+- **Named profiles.** A `models` entry can hold `profiles`, each a set of per-model options and sampling values, and a `defaultProfile`. `/mlx-start MODEL --profile NAME` uses a profile for that launch. A missing profile name stops the start and lists the model's profiles. Server-wide keys are not allowed in a profile, and a project file's profiles follow the same rules as its `model` block.
+- **Sampling.** A `sampling` object (`temperature`, `topP`, `topK`, `minP`, `repetitionPenalty`, `maxTokens`, `stop`, `seed`) in the `model` block, a `models` entry or a profile. `temperature`, `topP`, `topK`, `minP` and `maxTokens` are also passed to the server as `--temp`, `--top-p`, `--top-k`, `--min-p` and `--max-tokens`.
+- **Sampling in requests.** The values are written into the requests pi sends to the launched model, so a configured value replaces pi's own. Requests to other providers or other models are not changed.
+- **Start message.** A launch with a profile shows a `profile:` line, flags from a profile are labelled `(profile NAME)`, and sampling values that have no server flag are listed on a `request:` line.
+- **Profile limits.** Every profile has an optional `limits` object that is reserved and empty: it accepts no keys yet, and a later release uses it for model limits. Until then `sampling.maxTokens` is the profile's output limit.
 
 ### Changed
 
+- `model.chatTemplateArgs` set in config are now also sent with every request to the launched model, replacing pi's `chat_template_kwargs` and removing pi's `reasoning_effort`. Before, they reached the server only as the `--chat-template-args` launch flag. pi's own thinking setting no longer conflicts with a configured value.
 - `/mlx-init` now reads the layered configuration and refuses to run on an invalid file or on a project file that asks for something it may not.
 - `/mlx-start`'s first install, when there is no virtual environment yet, uses the configured index and version. An existing install still makes no network call.
 - The notice for a skipped flag names the pin when one is set: `mlx-lm is pinned to X by SOURCE; raise or remove the pin, then run /mlx-init`.

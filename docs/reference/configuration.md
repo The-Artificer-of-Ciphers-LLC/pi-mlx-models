@@ -59,10 +59,20 @@ Values in files are checked strictly: a number must be a JSON number, a boolean 
     "numDraftTokens": 4,
     "chatTemplate": "./templates/chat.jinja",
     "useDefaultChatTemplate": false,
-    "chatTemplateArgs": { "enable_thinking": false }
+    "chatTemplateArgs": { "enable_thinking": false },
+    "sampling": { "temperature": 0.7, "maxTokens": 2048 }
   },
   "models": {
-    "qwen3_4b": { "numDraftTokens": 2 }
+    "qwen3_4b": {
+      "numDraftTokens": 2,
+      "defaultProfile": "careful",
+      "profiles": {
+        "careful": {
+          "sampling": { "temperature": 0.2, "topP": 0.9 },
+          "chatTemplateArgs": { "enable_thinking": false }
+        }
+      }
+    }
   },
   "baseUrl": "http://127.0.0.1:8080/v1",
   "defaultModel": "qwen3_4b"
@@ -96,10 +106,20 @@ The **Flag** column is the `mlx_lm.server` flag the setting becomes. Host and po
 | `model.chatTemplate` | path to a template file | none | `--chat-template` | `--chat-template` | | |
 | `model.useDefaultChatTemplate` | `true` or `false` | `false` | `--use-default-chat-template` | `--use-default-chat-template` (no value) | | |
 | `model.chatTemplateArgs` | JSON object | none | `--chat-template-args` | `--chat-template-args` (a JSON string) | | |
+| `model.sampling.temperature` | number of at least 0 | none | `--temp` | | | |
+| `model.sampling.topP` | number above 0 and at most 1 | none | `--top-p` | | | |
+| `model.sampling.topK` | integer of at least 0 | none | `--top-k` | | | |
+| `model.sampling.minP` | number from 0 to 1 | none | `--min-p` | | | |
+| `model.sampling.repetitionPenalty` | number above 0 | none | none (request only) | | | |
+| `model.sampling.maxTokens` | integer of at least 1 | none | `--max-tokens` | | | |
+| `model.sampling.stop` | a non-empty string, or a list of 1 to 4 non-empty strings of at most 256 characters each | none | none (request only) | | | |
+| `model.sampling.seed` | integer | none | none (request only) | | | |
 | `baseUrl` | `http` or `https` URL; a trailing slash is removed | `http://<host>:<port>/v1` | | | | `PI_MLX_MODELS_BASE_URL` |
 | `defaultModel` | non-empty model id or preset key | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | | | | `PI_MLX_MODELS_DEFAULT_MODEL` |
 | `mlxLm.version` | the word `latest` or an exact version such as `0.32.2` | `latest` | | | | `PI_MLX_MODELS_MLX_LM_VERSION` |
 | `mlxLm.pipIndex` | `https` URL without credentials, spaces, a query string or a fragment (`http` only for a loopback host) | `https://pypi.org/simple/` | | | | `PI_MLX_MODELS_PIP_INDEX` |
+
+The eight `model.sampling.*` rows can only be set in a file, either in a `model` block, a `models` entry or a profile; they have no `/mlx-start` flag, pi flag or environment variable. See [Sampling and profiles](#sampling-and-profiles).
 
 The two `mlxLm` rows are settings of `/mlx-init`, not of the server. Their command-line forms are the `/mlx-init` flags `--mlx-lm-version` and `--pip-index`, not `/mlx-start` flags. They have no pi flag. When pi loads the extension these two settings are not looked at: a bad value does not change the provider URL or the default model, and only `/mlx-init` and `/mlx-start` report it.
 
@@ -207,11 +227,12 @@ The `model` block and the `models` entries set options for the model being start
 
 1. Global file: `model`, then `models.<preset key>`, then `models.<model id>`
 2. Project file: the same three, in the same order
-3. `/mlx-start` flags
+3. The selected profile, if any: the global file's, then the project file's, key by key (see [Sampling and profiles](#sampling-and-profiles))
+4. `/mlx-start` flags
 
-A `models` entry is keyed by a preset key (for example `qwen3_4b`) or by a full model id, and holds the same keys as the `model` block. A project `model` block beats a global `models` entry.
+A `models` entry is keyed by a preset key (for example `qwen3_4b`) or by a full model id, and holds the same keys as the `model` block, plus `sampling`, `profiles` and `defaultProfile`. A project `model` block beats a global `models` entry.
 
-Values replace each other, except `chatTemplateArgs`: objects from different sources are merged key by key.
+Values replace each other, except `chatTemplateArgs` and `sampling`: objects from different sources are merged key by key. A `sampling.stop` list is a single value and replaces a lower source's list whole.
 
 Paths: `~` is your home directory, and a relative path is relative to pi's working directory.
 
@@ -219,6 +240,75 @@ Limits:
 
 - A chat template file must be a regular file of at most 64 KiB containing non-empty UTF-8 text. Its text, not its path, is passed to the server.
 - `chatTemplateArgs` is at most 16 KiB, after merging.
+
+## Sampling and profiles
+
+Sampling settings and named profiles set how a model answers. A step-by-step guide is in [How to use profiles and sampling](../how-to/use-profiles-and-sampling.md).
+
+### Sampling
+
+The `sampling` object holds eight keys. It is a per-model option: it can be set in the `model` block, in a `models` entry or in a profile.
+
+| Key | OpenAI request field | Server flag |
+|-----|----------------------|-------------|
+| `temperature` | `temperature` | `--temp` |
+| `topP` | `top_p` | `--top-p` |
+| `topK` | `top_k` | `--top-k` |
+| `minP` | `min_p` | `--min-p` |
+| `repetitionPenalty` | `repetition_penalty` | none |
+| `maxTokens` | `max_completion_tokens` (and `max_tokens` when pi sent that name) | `--max-tokens` |
+| `stop` | `stop` | none |
+| `seed` | `seed` | none |
+
+- One value feeds both places. A key that has a server flag is passed to the server as the launch default and is also written into the requests pi sends to that server. `repetitionPenalty`, `stop` and `seed` have no server flag, so they only reach requests; the start message lists them on the `request:` line.
+- A server flag that the installed mlx-lm lacks is skipped with the usual notice (see [Flags the installed mlx-lm does not support](#flags-the-installed-mlx-lm-does-not-support)). The request value still applies.
+- Sampling is merged in this order, lowest first: the `model` block, the `models` entry, the profile. Each layer is merged key by key, and a `stop` list replaces the lower list whole.
+
+### Profiles
+
+A profile is a named set of per-model options for one model.
+
+- **Where.** A profile lives in the `profiles` object of a `models` entry, keyed by a preset key or a model id, in either file. It is not allowed in the `model` block. A profile is reachable only for the model of its entry. When a preset key entry and a model id entry both define the same profile name, the more specific model id entry wins.
+- **What it may hold.** The keys of the `model` block (`adapterPath`, `draftModel`, `numDraftTokens`, `chatTemplate`, `useDefaultChatTemplate`, `chatTemplateArgs`), a `sampling` object, and a `limits` object. Each profile is flat.
+- **What it may not hold.** Every `server` key (`port`, `host`, `logLevel`, `allowedOrigins`, `trustRemoteCode`, the concurrency, cache and KV cache keys), a nested `profiles` object, `extends`, and any key inside `limits`. The start is refused with a message that names the key and the file.
+- **limits is reserved.** Every profile may carry an optional flat `limits` object, but it accepts no keys yet, so any key inside it is an error. A later release defines the model limits that go there. Until then the output limit of a profile is `sampling.maxTokens`. `limits` anywhere other than inside a profile is an unknown key.
+- **Names.** 1 to 64 characters: letters, digits, `.`, `_` and `-`, starting with a letter or digit.
+
+Choosing a profile:
+
+- `/mlx-start MODEL --profile NAME` uses the profile for that launch only.
+- `defaultProfile` in a `models` entry names the profile used when `--profile` is not given. With neither, no profile is used and the launch is as before.
+- Naming a profile that the model does not have stops the start before anything is installed or started, and lists the model's profiles in sorted order:
+
+  ```
+  profile "nope" (/mlx-start --profile): not defined for mlx-community/Qwen3-4B-Instruct-2507-4bit; available profiles: careful, wild
+  ```
+
+- A `defaultProfile` is checked only when it is used. A `defaultProfile` that names a missing profile does not affect a launch of another model, and does not affect a launch that picks another profile with `--profile`.
+
+Layering, from highest precedence to lowest, per key:
+
+1. Flags typed after `/mlx-start`
+2. The selected profile. When both files define it, the project file's value beats the global file's, key by key.
+3. Project file settings (`model`, then the `models` entries)
+4. Global file settings (the same)
+
+A project file may define profiles under the same rules as its `model` block: a `chatTemplate` in a project profile must point inside the project directory, and a profile cannot hold the settings that ask for permission (see [Settings that ask for permission](#settings-that-ask-for-permission)), because those are `server` keys. Choosing a profile adds no confirmation dialog.
+
+### Request settings
+
+pi sends each request to the launched model itself. A hook changes that request before it is sent.
+
+- **Fields written.** `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `stop`, `seed`, the output limit as `max_completion_tokens` (and also `max_tokens` when pi sent a field of that name), and `chat_template_kwargs`.
+- **Configured values win.** A configured value overwrites the same field of pi's request. A field that no source sets is left as pi sent it.
+- **One source of chat template arguments.** When the merged `chatTemplateArgs` is not empty, the hook replaces pi's `chat_template_kwargs` with them (it does not merge) and removes pi's `reasoning_effort`, so that exactly one setting about thinking remains. When no `chatTemplateArgs` is configured, pi's `chat_template_kwargs` and `reasoning_effort` are not touched. The same object is also passed to the server as `--chat-template-args` at launch.
+- **What the hook leaves alone.** Requests to any provider other than `pi-mlx-models`, requests for a model id other than the launched one (for example after switching with `/model`), and every request while no launch has been made in this session (a server started elsewhere, or after `/mlx-stop` or when the session ends).
+- **When values are read.** The values come from the launch made in this session and are held in memory. Nothing is saved between sessions, and the config files are not read for each request: an edit applies from the next `/mlx-start`.
+- **Unexpected shape.** A request that is not an object with a `messages` list is left unchanged. One warning per session says so.
+
+To check what the server receives, set `server.logLevel` to `DEBUG`; see [How to use profiles and sampling](../how-to/use-profiles-and-sampling.md#check-what-the-server-receives).
+
+> Changed in this release: `model.chatTemplateArgs` set in a config file used to reach the server only as the `--chat-template-args` launch flag. They are now also sent with every request to the launched model, replacing pi's `chat_template_kwargs` and removing pi's `reasoning_effort`.
 
 ## `/mlx-init` arguments
 
@@ -233,13 +323,14 @@ Limits:
 ## `/mlx-start` arguments
 
 ```
-/mlx-start [model] [--flag value | --flag=value ...]
+/mlx-start [model] [--profile name] [--flag value | --flag=value ...]
 ```
 
 - `model` is a preset number (1 to 5), a preset key, or a full model id. A model id must not start with `-`.
 - A valued flag takes the next word, unless that word starts with `--`. Use `--flag=value` for such a value.
 - `--trust-remote-code` and `--use-default-chat-template` take no value.
 - The performance and KV cache flags (`--decode-concurrency`, `--prompt-concurrency`, `--prefill-step-size`, `--prompt-cache-size`, `--prompt-cache-bytes`, `--kv-bits`, `--kv-group-size`, `--quantized-kv-start`) take a whole number.
+- `--profile NAME` takes a value, may appear once and may not be empty. It selects a profile of the model for that launch; see [Profiles](#profiles).
 - Single quotes are literal. Inside double quotes a backslash escapes a quote or a backslash. A quoted part joins the text next to it, so `--chat-template-args='{"a":1}'` is one word.
 - A flag may appear once. An unknown flag, a missing value, a second model and an unterminated quote are errors.
 - The whole argument string is limited to 8192 characters.
@@ -289,7 +380,18 @@ The start message lists every flag that differs from its default, with the sourc
 flags: --log-level INFO (global file), --num-draft-tokens 4 (project file)
 ```
 
-Sources are named `global file`, `project file`, `/mlx-start`, `pi flag --mlx-port` and `env PI_MLX_MODELS_PORT`. A skipped flag is marked `skipped`.
+Sources are named `global file`, `project file`, `/mlx-start`, `pi flag --mlx-port` and `env PI_MLX_MODELS_PORT`. A value that comes from a profile is labelled `profile NAME`. A skipped flag is marked `skipped`.
+
+A launch that uses a profile adds a `profile:` line before the flags, naming the profile and where it was chosen. A launch that has request-only sampling values (`repetitionPenalty`, `stop`, `seed`) adds a `request:` line after the flags, because those values never reach the server's command line:
+
+```
+Starting MLX server with mlx-community/Qwen3-4B-Instruct-2507-4bit (preset: qwen3_4b)...
+profile: careful (global file)
+flags: --port 8080 (global file), --temp 0.2 (profile careful), --top-p 0.9 (profile careful)
+request: repetition_penalty 1.1 (profile careful), stop ["###"] (profile careful), seed 42 (profile careful)
+```
+
+The place after `profile:` is `/mlx-start` when `--profile` chose it, otherwise the layer of the `defaultProfile` key (`global file` or `project file`). A launch with no profile and no request-only value shows neither line, and its message is unchanged.
 
 Before the start message, a start can show a [pin warning](#when-the-pin-and-the-install-differ) (the pin differs from the install, or the installed version could not be read) and the [skipped-flag warning](#flags-the-installed-mlx-lm-does-not-support). After it, a launch with `kvBits` shows the [batching warning](#quantized-kv-cache), and a launch with `kvGroupSize` or `quantizedKvStart` but no `kvBits` shows the no-effect note. These are shown on every start, not once.
 
