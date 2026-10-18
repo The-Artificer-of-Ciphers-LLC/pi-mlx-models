@@ -3882,3 +3882,84 @@ test("an other listed model whose id has control characters is read under its ow
   assert.doesNotMatch(message, /[\u0000-\u001f\u007f-\u009f]/);
   assert.equal(message.includes("pwned") || message.includes("org/model"), false);
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// A server that exits while a start is still reading the model (carry-over from plan 05-02)
+// ---------------------------------------------------------------------------------------------------------------------
+
+test("a server that exits while the model's config.json is being read ends the start without a ready note, model line, warning or registration", async () => {
+  const gate = deferred<ModelConfigRead>();
+  let reads = 0;
+  let emit: ((event: ServerEvent) => void) | undefined;
+  const h = await setup({
+    server: {
+      start: async (_model, onEvent) => {
+        emit = onEvent;
+        for (const type of ["launched", "loading", "warming", "ready"] as const) onEvent?.({ type });
+      },
+    },
+    readModelConfig: async () => {
+      reads += 1;
+      return gate.promise;
+    },
+  });
+
+  const started = h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  for (let i = 0; i < 50 && reads === 0; i += 1) await flush();
+  assert.equal(reads, 1, "the start is waiting on the read");
+  emit?.({ type: "exited" });
+  const registrations = h.providerCalls.length;
+
+  gate.resolve({ ok: false, reason: "the Hugging Face Hub answered HTTP 401" });
+  await started;
+  await flush();
+
+  assert.equal(h.providerCalls.length, registrations, "nothing is registered after the server exited");
+  assert.deepEqual(h.providerCalls.at(-1)?.config.models, []);
+  assert.equal(modelNotes(h.notes).length, 0, "no model line");
+  assert.deepEqual(fallbackWarnings(h.notes), []);
+  assert.equal(h.notes.some((n) => n.message === READY_NOTE), false, "no ready message");
+  assert.equal(lastStatus(h.statuses), "mlx: stopped");
+});
+
+test("a server that exits while the other listed models are being read ends the start before its registration, model line and ready message", async () => {
+  const gate = deferred<ModelConfigRead>();
+  let hold = false;
+  let held = 0;
+  let emit: ((event: ServerEvent) => void) | undefined;
+  const settings = freshSettings({});
+  writeGlobal(settings, { provider: { listAllModels: true } });
+  const h = await setup({
+    settings,
+    discovered: [QWEN_ID, "org/cached"],
+    server: {
+      start: async (_model, onEvent) => {
+        emit = onEvent;
+        for (const type of ["launched", "loading", "warming", "ready"] as const) onEvent?.({ type });
+        hold = true;
+      },
+    },
+    readModelConfig: async (id) => {
+      if (hold && id === "org/cached") {
+        held += 1;
+        return gate.promise;
+      }
+      return { ok: true, config: { max_position_embeddings: 65536 }, source: "cache" };
+    },
+  });
+
+  const started = h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  for (let i = 0; i < 50 && held === 0; i += 1) await flush();
+  assert.equal(held, 1, "the post-ready registration is waiting on a read");
+  emit?.({ type: "exited" });
+  const registrations = h.providerCalls.length;
+
+  gate.resolve({ ok: true, config: { max_position_embeddings: 65536 }, source: "cache" });
+  await started;
+  await flush();
+
+  assert.equal(h.providerCalls.length, registrations, "nothing is registered after the server exited");
+  assert.equal(modelNotes(h.notes).length, 0, "no model line");
+  assert.equal(h.notes.some((n) => n.message === READY_NOTE), false, "no ready message");
+  assert.equal(lastStatus(h.statuses), "mlx: stopped");
+});
