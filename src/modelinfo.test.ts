@@ -3,16 +3,22 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo, Socket } from "node:net";
 import {
   FALLBACK_CONTEXT_WINDOW,
+  HUB_TIMEOUT_MS,
   MAX_CONFIG_BYTES,
   contextWindowOf,
   createModelConfigReader,
   defaultMaxTokens,
   deriveModelInfo,
   describeModel,
+  hubBaseUrlOf,
   resolveCacheRoot,
+  type ModelConfigReaderOptions,
   type ModelInfo,
+  type ReadModelConfig,
 } from "./modelinfo.js";
 import { hfFixture, writeHfCache } from "./testkit.js";
 
@@ -443,4 +449,442 @@ test("describeModel cleans, redacts and clips every source text", () => {
   assert.ok(line.includes("***"));
   assert.ok(line.includes("x".repeat(60)));
   assert.equal(line.includes("x".repeat(80)), false, "a long source is clipped to 80 characters");
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The Hugging Face Hub, asked once when the cache has nothing (D-02, T-05-08 to T-05-11). Real loopback servers only.
+// ---------------------------------------------------------------------------------------------------------------------
+
+interface SeenRequest {
+  method: string | undefined;
+  url: string | undefined;
+  authorization: string | undefined;
+}
+
+interface LoopbackHub {
+  base: string;
+  port: number;
+  seen: SeenRequest[];
+}
+
+const CONFIG_PATH = "/org/name/resolve/main/config.json";
+const MISS_PREFIX = "not in the local cache; ";
+
+/** A loopback HTTP server that records every request; its sockets are destroyed and it is closed when the test ends. */
+async function startHub(
+  t: TestContext,
+  handler: (req: IncomingMessage, res: ServerResponse, hub: LoopbackHub) => void,
+): Promise<LoopbackHub> {
+  const sockets = new Set<Socket>();
+  const hub: LoopbackHub = { base: "", port: 0, seen: [] };
+  const server: Server = createServer((req, res) => {
+    hub.seen.push({ method: req.method, url: req.url, authorization: req.headers.authorization });
+    req.on("error", () => undefined);
+    res.on("error", () => undefined);
+    handler(req, res, hub);
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("error", () => undefined);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((done) => server.close(() => done()));
+  });
+  hub.port = (server.address() as AddressInfo).port;
+  hub.base = `http://127.0.0.1:${hub.port}`;
+  return hub;
+}
+
+const sendJson = (res: ServerResponse, body: unknown, status = 200): void => {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+};
+
+const sendText = (res: ServerResponse, body: string, status = 200): void => {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(body);
+};
+
+/** A reader with an empty cache, so every lookup is a cache miss; `options` may replace any default. */
+function missReader(t: TestContext, options: ModelConfigReaderOptions = {}): ReadModelConfig {
+  return createModelConfigReader({ cacheRoot: join(tempDir(t), "empty-cache"), env: {}, ...options });
+}
+
+/** The reason of a lookup that must fail with the Hub allowed. */
+async function failureOf(reader: ReadModelConfig, id = "org/name"): Promise<string> {
+  const read = await reader(id, { hub: true });
+  assert.equal(read.ok, false, JSON.stringify(read));
+  return read.ok ? "" : read.reason;
+}
+
+/** The port of a loopback address nobody listens on. */
+async function unusedPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>((done) => server.close(() => done()));
+  return port;
+}
+
+interface FetchCall {
+  url: string;
+  init: RequestInit | undefined;
+}
+
+/** An injected fetch that answers the calls in order (the last answer repeats) and records them; no network is used. */
+function fetchStub(...answers: Array<() => Response>): { fetch: typeof fetch; calls: FetchCall[] } {
+  const calls: FetchCall[] = [];
+  const stub: typeof fetch = async (input, init) => {
+    calls.push({ url: String(input), init });
+    const answer = answers[Math.min(calls.length - 1, answers.length - 1)];
+    if (!answer) throw new Error("no answer prepared");
+    return answer();
+  };
+  return { fetch: stub, calls };
+}
+
+const authorizationOf = (call: FetchCall | undefined): string | null => new Headers(call?.init?.headers).get("authorization");
+const jsonResponse = (body: unknown) => (): Response => new Response(JSON.stringify(body), { status: 200 });
+const redirectResponse = (location: string | null, status = 302) => (): Response =>
+  new Response(null, { status, headers: location === null ? {} : { location } });
+
+test("a cache hit never contacts the Hub", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 1 }));
+  const cacheRoot = tempDir(t);
+  writeHfCache(cacheRoot, "org/name", { max_position_embeddings: 2048 });
+
+  const read = await createModelConfigReader({ cacheRoot, env: {}, hubBaseUrl: hub.base })("org/name", { hub: true });
+
+  assert.ok(read.ok);
+  assert.equal(read.source, "cache");
+  assert.equal(contextWindowOf(read.config), 2048);
+  assert.equal(hub.seen.length, 0);
+});
+
+test("a cache miss asks the Hub once for the repository's config.json and uses what it sends", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 40960 }));
+
+  const read = await missReader(t, { hubBaseUrl: hub.base })("org/name", { hub: true });
+
+  assert.ok(read.ok);
+  assert.equal(read.source, "hub");
+  assert.equal(contextWindowOf(read.config), 40960);
+  assert.deepEqual(
+    hub.seen.map((seen) => `${seen.method} ${seen.url}`),
+    [`GET ${CONFIG_PATH}`],
+  );
+});
+
+test("a plain single-name repository id is asked at its own path", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 1024 }));
+
+  const read = await missReader(t, { hubBaseUrl: hub.base })("gpt2", { hub: true });
+
+  assert.ok(read.ok);
+  assert.deepEqual(
+    hub.seen.map((seen) => seen.url),
+    ["/gpt2/resolve/main/config.json"],
+  );
+});
+
+test("with the Hub not allowed a cache miss says so and never contacts the Hub", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 1 }));
+
+  const read = await missReader(t, { hubBaseUrl: hub.base })("org/name", { hub: false });
+
+  assert.deepEqual(read, { ok: false, reason: "not in the Hugging Face cache" });
+  assert.equal(hub.seen.length, 0);
+});
+
+test("HF_TOKEN is sent as a bearer token to the Hub's own origin", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 2048 }));
+
+  const read = await missReader(t, { hubBaseUrl: hub.base, env: { HF_TOKEN: " hf_example-token " } })("org/name", { hub: true });
+
+  assert.ok(read.ok);
+  assert.equal(hub.seen[0]?.authorization, "Bearer hf_example-token");
+});
+
+test("without HF_TOKEN, or with a blank one, no Authorization header is sent", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 2048 }));
+
+  for (const env of [{}, { HF_TOKEN: "" }, { HF_TOKEN: "   " }, { HF_TOKEN: undefined }]) {
+    assert.ok((await missReader(t, { hubBaseUrl: hub.base, env })("org/name", { hub: true })).ok);
+  }
+
+  assert.equal(hub.seen.length, 4);
+  for (const seen of hub.seen) assert.equal(seen.authorization, undefined);
+});
+
+test("the token appears in no reason and in no returned value", async (t) => {
+  const token = "hf_SECRETTOKEN0123456789";
+  const refusing = await startHub(t, (_req, res) => sendJson(res, { error: `bad token ${token}` }, 401));
+  const serving = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 2048 }));
+  const env = { HF_TOKEN: token };
+
+  const reason = await failureOf(missReader(t, { hubBaseUrl: refusing.base, env }));
+  const read = await missReader(t, { hubBaseUrl: serving.base, env })("org/name", { hub: true });
+
+  assert.equal(reason.includes(token), false);
+  assert.equal(JSON.stringify(read).includes(token), false);
+  assert.equal(refusing.seen[0]?.authorization, `Bearer ${token}`);
+});
+
+test("a thrown error's text is never echoed into the reason", async (t) => {
+  const secret = "https://user:hf_SECRET@host/path";
+  const stub = fetchStub(() => {
+    throw new Error(`connect failed ${secret}`);
+  });
+
+  const reason = await failureOf(missReader(t, { fetch: stub.fetch, env: { HF_TOKEN: "hf_SECRET" } }));
+
+  assert.equal(reason, `${MISS_PREFIX}the Hugging Face Hub could not be reached`);
+});
+
+test("401 and 403 say the repository is gated, private or missing and name HF_TOKEN", async (t) => {
+  for (const status of [401, 403]) {
+    const hub = await startHub(t, (_req, res) => sendJson(res, { error: "x" }, status));
+    const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base }));
+    assert.equal(
+      reason,
+      `${MISS_PREFIX}the Hugging Face Hub answered HTTP ${status}: the repository is gated, private or missing (set HF_TOKEN for a gated model)`,
+    );
+    assert.ok(reason.includes("gated, private or missing") && reason.includes("HF_TOKEN"));
+  }
+});
+
+test("404 says the model was not found", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { error: "x" }, 404));
+
+  const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base }));
+
+  assert.equal(reason, `${MISS_PREFIX}the model was not found on the Hugging Face Hub (HTTP 404)`);
+});
+
+test("any other status says the status", async (t) => {
+  for (const status of [500, 503, 429]) {
+    const hub = await startHub(t, (_req, res) => sendText(res, "nope", status));
+    const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base }));
+    assert.equal(reason, `${MISS_PREFIX}the Hugging Face Hub answered HTTP ${status}`);
+  }
+});
+
+test("a Hub that never answers is cut at the time limit and says so", async (t) => {
+  const hub = await startHub(t, () => undefined);
+  const started = Date.now();
+
+  const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base, hubTimeoutMs: 200 }));
+  const elapsed = Date.now() - started;
+
+  assert.equal(reason, `${MISS_PREFIX}the Hugging Face Hub did not answer within 200 ms`);
+  assert.ok(elapsed >= 150 && elapsed < 2500, `took ${elapsed} ms`);
+});
+
+test("a Hub that sends headers and then stalls the body is cut by the same limit", async (t) => {
+  const hub = await startHub(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write('{"max_position_embeddings"');
+  });
+  const started = Date.now();
+
+  const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base, hubTimeoutMs: 200 }));
+  const elapsed = Date.now() - started;
+
+  assert.equal(reason, `${MISS_PREFIX}the Hugging Face Hub did not answer within 200 ms`);
+  assert.ok(elapsed >= 150 && elapsed < 2500, `took ${elapsed} ms`);
+});
+
+test("the Hub time limit is 3000 ms", () => {
+  assert.equal(HUB_TIMEOUT_MS, 3000);
+});
+
+test("a body larger than 2 MiB, sent in chunks, is refused", async (t) => {
+  const hub = await startHub(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    const chunk = Buffer.alloc(64 * 1024, 0x20);
+    for (let i = 0; i < 40; i++) res.write(chunk);
+    res.end();
+  });
+
+  const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base }));
+
+  assert.equal(reason, "config.json is larger than 2 MiB");
+});
+
+test("a declared content-length above the cap is refused before the body is read", async (t) => {
+  const hub = await startHub(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "application/json", "content-length": String(MAX_CONFIG_BYTES + 1) });
+    res.flushHeaders();
+  });
+
+  const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base }));
+
+  assert.equal(reason, "config.json is larger than 2 MiB");
+});
+
+test("a body that is not JSON, and one that is JSON but not an object, give the cache branch's reasons", async (t) => {
+  const notJson = await startHub(t, (_req, res) => sendText(res, "<html>not json"));
+  const notObject = await startHub(t, (_req, res) => sendText(res, "[1, 2, 3]"));
+
+  assert.equal(await failureOf(missReader(t, { hubBaseUrl: notJson.base })), "config.json is not valid JSON");
+  assert.equal(await failureOf(missReader(t, { hubBaseUrl: notObject.base })), "config.json is not a JSON object");
+});
+
+test("a Hub nobody listens at is reported as unreachable", async (t) => {
+  const port = await unusedPort();
+
+  const reason = await failureOf(missReader(t, { hubBaseUrl: `http://127.0.0.1:${port}` }));
+
+  assert.equal(reason, `${MISS_PREFIX}the Hugging Face Hub could not be reached`);
+});
+
+test("HF_HUB_OFFLINE set to 1, true, yes or on in any case skips the Hub and says so", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 1 }));
+
+  for (const value of ["1", "true", "TRUE", "yes", "ON", " 1 "]) {
+    const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base, env: { HF_HUB_OFFLINE: value } }));
+    assert.ok(reason.startsWith(MISS_PREFIX) && reason.includes("HF_HUB_OFFLINE"), `${JSON.stringify(value)}: ${reason}`);
+  }
+
+  assert.equal(hub.seen.length, 0);
+});
+
+test("HF_HUB_OFFLINE set to 0, false or nothing does not skip the Hub", async (t) => {
+  const hub = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 1 }));
+
+  for (const value of ["0", "false", ""]) {
+    const read = await missReader(t, { hubBaseUrl: hub.base, env: { HF_HUB_OFFLINE: value } })("org/name", { hub: true });
+    assert.ok(read.ok, JSON.stringify(value));
+  }
+
+  assert.equal(hub.seen.length, 3);
+});
+
+test("a same-origin redirect is followed and keeps the Authorization header", async (t) => {
+  const hub = await startHub(t, (req, res) => {
+    if (req.url === CONFIG_PATH) {
+      res.writeHead(307, { location: "/org/name/resolve/main/moved.json" });
+      res.end();
+    } else {
+      sendJson(res, { max_position_embeddings: 8192 });
+    }
+  });
+
+  const read = await missReader(t, { hubBaseUrl: hub.base, env: { HF_TOKEN: "tok" } })("org/name", { hub: true });
+
+  assert.ok(read.ok);
+  assert.equal(contextWindowOf(read.config), 8192);
+  assert.deepEqual(
+    hub.seen.map((seen) => [seen.url, seen.authorization]),
+    [
+      [CONFIG_PATH, "Bearer tok"],
+      ["/org/name/resolve/main/moved.json", "Bearer tok"],
+    ],
+  );
+});
+
+test("a redirect to another origin is followed without the Authorization header", async (t) => {
+  const second = await startHub(t, (_req, res) => sendJson(res, { max_position_embeddings: 16384 }));
+  const first = await startHub(t, (_req, res) => {
+    res.writeHead(302, { location: `${second.base}/cdn/config.json` });
+    res.end();
+  });
+
+  const read = await missReader(t, { hubBaseUrl: first.base, env: { HF_TOKEN: "tok" } })("org/name", { hub: true });
+
+  assert.ok(read.ok);
+  assert.equal(contextWindowOf(read.config), 16384);
+  assert.equal(first.seen[0]?.authorization, "Bearer tok", "the Hub itself saw the token");
+  assert.equal(second.seen.length, 1);
+  assert.equal(second.seen[0]?.url, "/cdn/config.json");
+  assert.equal(second.seen[0]?.authorization, undefined, "the other origin saw no token");
+});
+
+test("a chain of more than 3 redirects fails", async (t) => {
+  const hub = await startHub(t, (_req, res, self) => {
+    res.writeHead(302, { location: `${CONFIG_PATH}?hop=${self.seen.length}` });
+    res.end();
+  });
+
+  const reason = await failureOf(missReader(t, { hubBaseUrl: hub.base }));
+
+  assert.equal(reason, `${MISS_PREFIX}the Hugging Face Hub redirected too many times`);
+  assert.equal(hub.seen.length, 4, "the first request and 3 followed redirects");
+});
+
+test("a redirect from https to http, to another scheme, or without a location is refused", async (t) => {
+  for (const location of ["http://hub.example.test/config.json", "ftp://hub.example.test/config.json", null]) {
+    const stub = fetchStub(redirectResponse(location));
+    const reason = await failureOf(missReader(t, { fetch: stub.fetch }));
+    assert.equal(reason, `${MISS_PREFIX}the Hugging Face Hub sent a redirect that was refused`, String(location));
+    assert.equal(stub.calls.length, 1, `${location} is not requested`);
+  }
+});
+
+test("hubBaseUrlOf gives the Hub by default and an https HF_ENDPOINT without its trailing slashes", () => {
+  assert.equal(hubBaseUrlOf({}), "https://huggingface.co");
+  assert.equal(hubBaseUrlOf({ HF_ENDPOINT: "https://mirror.example.test" }), "https://mirror.example.test");
+  assert.equal(hubBaseUrlOf({ HF_ENDPOINT: " https://mirror.example.test/ " }), "https://mirror.example.test");
+  assert.equal(hubBaseUrlOf({ HF_ENDPOINT: "https://mirror.example.test/hub///" }), "https://mirror.example.test/hub");
+});
+
+test("hubBaseUrlOf ignores an endpoint that is not a plain https URL", () => {
+  const ignored = [
+    "http://mirror.example.test",
+    "ftp://mirror.example.test",
+    "not a url",
+    "https://user:pass@mirror.example.test",
+    "https://user@mirror.example.test",
+    "https://mirror.example.test?x=1",
+    "https://mirror.example.test/?",
+    "https://mirror.example.test#frag",
+    "https://mirror.example.test/#",
+    "   ",
+    "",
+  ];
+  for (const value of ignored) {
+    assert.equal(hubBaseUrlOf({ HF_ENDPOINT: value }), "https://huggingface.co", JSON.stringify(value));
+  }
+  assert.equal(hubBaseUrlOf({ HF_ENDPOINT: undefined }), "https://huggingface.co");
+});
+
+test("with no base URL given the Hub's own address is asked, with a signal and no automatic redirect", async (t) => {
+  const stub = fetchStub(jsonResponse({ max_position_embeddings: 4096 }));
+
+  const read = await missReader(t, { fetch: stub.fetch })("org/name", { hub: true });
+
+  assert.ok(read.ok);
+  assert.equal(stub.calls.length, 1);
+  assert.equal(stub.calls[0]?.url, "https://huggingface.co/org/name/resolve/main/config.json");
+  assert.equal(stub.calls[0]?.init?.method, "GET");
+  assert.equal(stub.calls[0]?.init?.redirect, "manual");
+  assert.ok(stub.calls[0]?.init?.signal instanceof AbortSignal);
+});
+
+test("HF_ENDPOINT is honoured and the token goes to that origin only", async (t) => {
+  const stub = fetchStub(redirectResponse("https://elsewhere.example.test/cdn/config.json"), jsonResponse({ max_position_embeddings: 4096 }));
+  const env = { HF_ENDPOINT: "https://mirror.example.test/", HF_TOKEN: "tok" };
+
+  const read = await missReader(t, { fetch: stub.fetch, env })("org/name", { hub: true });
+
+  assert.ok(read.ok);
+  assert.equal(stub.calls[0]?.url, "https://mirror.example.test/org/name/resolve/main/config.json");
+  assert.equal(authorizationOf(stub.calls[0]), "Bearer tok");
+  assert.equal(stub.calls[1]?.url, "https://elsewhere.example.test/cdn/config.json");
+  assert.equal(authorizationOf(stub.calls[1]), null);
+});
+
+test("an id that is not a repository id never reaches fetch, and neither does a local path", async (t) => {
+  const stub = fetchStub(jsonResponse({ max_position_embeddings: 4096 }));
+  const reader = missReader(t, { fetch: stub.fetch, cwd: tempDir(t) });
+
+  for (const id of ["a/b/c", "org/..", "-x", "", "../x", "./model", join(tempDir(t), "model")]) {
+    const read = await reader(id, { hub: true });
+    assert.equal(read.ok, false, JSON.stringify(id));
+  }
+
+  assert.equal(stub.calls.length, 0);
 });

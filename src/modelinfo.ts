@@ -13,6 +13,14 @@ export const FALLBACK_CONTEXT_WINDOW = 32768;
 /** The largest `config.json` that is read; a real one is a few KiB, a quantized one a few hundred (T-05-06). */
 export const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
 
+/** The longest the Hugging Face Hub is given to answer, request and body together (A1, T-05-09). */
+export const HUB_TIMEOUT_MS = 3000;
+
+/** The base URL the Hub is asked at: `HF_ENDPOINT` when it is a plain https URL, else the Hub itself (A3, T-05-11). */
+export function hubBaseUrlOf(_env: Record<string, string | undefined>): string {
+  return "";
+}
+
 export type InputKind = "text" | "image";
 
 /** The outcome of looking for a model's `config.json`: the parsed object and where it came from, or why there is none. */
