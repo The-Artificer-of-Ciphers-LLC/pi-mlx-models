@@ -272,9 +272,13 @@ const URL_AUTHORITY = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/;
 
 /**
  * The package index pip installs from: an https URL, or plain http only for a loopback host, with no whitespace,
- * no control character and no credentials (use pip's netrc or keyring). The value is kept as written, because pip
- * takes it as written, and can only ever form the tail of the single argv element `--index-url=VALUE` (T-03-14,
- * T-03-15, T-03-17). The loopback decision uses the parsed host name, never a string prefix.
+ * no control character, no credentials (use pip's netrc or keyring), no query string and no fragment, because
+ * either can carry a token that would then show in the install line, the progress detail and failure texts (IN-02).
+ * The value is kept as written, because pip takes it as written, and can only ever form the tail of the single argv
+ * element `--index-url=VALUE` (T-03-14, T-03-15, T-03-17). The loopback decision uses the parsed host name, never a
+ * string prefix, and only when the host is written the way WHATWG normalises it: `127.1`, `0x7f.1`, a decimal number
+ * and `[0:0:0:0:0:0:0:1]` are refused, because pip does not necessarily read them as the host that was decided on
+ * (T-03-26).
  */
 function checkPipIndex(value: unknown): CheckResult {
   if (typeof value !== "string" || value.length < 1 || value.length > MAX_PIP_INDEX_LENGTH) return bad;
@@ -282,6 +286,8 @@ function checkPipIndex(value: unknown): CheckResult {
   // WHATWG and Python's urlsplit read a backslash, a missing slash and an escaped host differently; only the canonical
   // spelling is accepted, so the host that is checked is the host pip connects to.
   if (!PIP_INDEX_START.test(value) || value.includes("\\") || (URL_AUTHORITY.exec(value)?.[1] ?? "").includes("%")) return bad;
+  // Looked for in the raw text: `url.search` and `url.hash` are empty for a bare `?` or `#`.
+  if (value.includes("?") || value.includes("#")) return bad;
   let url: URL;
   try {
     url = new URL(value);
@@ -292,7 +298,12 @@ function checkPipIndex(value: unknown): CheckResult {
   // An '@' anywhere in the authority is credentials, or a look-alike such as https://pypi.org@evil.example/.
   if (url.username !== "" || url.password !== "" || (URL_AUTHORITY.exec(value)?.[1] ?? "").includes("@")) return bad;
   if (url.protocol === "https:") return ok(value);
-  return url.protocol === "http:" && isLoopbackHost(url.hostname) ? ok(value) : bad;
+  if (url.protocol !== "http:") return bad;
+  // The host as written must be the host WHATWG derived: no decision depends on an https host's spelling, but this one does.
+  const authority = URL_AUTHORITY.exec(value)?.[1] ?? "";
+  const written = authority.startsWith("[") ? authority.slice(0, authority.indexOf("]") + 1) : authority.replace(/:[0-9]*$/, "");
+  if (written.toLowerCase() !== url.hostname) return bad;
+  return isLoopbackHost(url.hostname) ? ok(value) : bad;
 }
 
 const checkDraftTokens = checkIntegerAtLeast(1);

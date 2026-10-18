@@ -1,4 +1,4 @@
-import { cleanLabel, clipDiagnostic } from "./diagnostic.js";
+import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 
 /**
  * The text typed after `/mlx-start`: `[model] [--flag value | --flag=value ...]`.
@@ -82,8 +82,11 @@ export function tokenizeStartArgs(raw: string, command: string = DEFAULT_COMMAND
   return { tokens };
 }
 
-/** A token as echoed in an error: control characters removed and at most 60 characters. */
-const echo = (token: string): string => clipDiagnostic(cleanLabel(token), 60, "start");
+/**
+ * A token as echoed in an error: control characters removed, the user name and password of a URL hidden and at most
+ * 60 characters. In that order, so the clip is last and cannot bring a secret back (WR-01, T-03-25).
+ */
+const echo = (token: string): string => clipDiagnostic(redactCredentials(cleanLabel(token)), 60, "start");
 
 /**
  * Parse the argument text against the flags `specs` allow. The first token that is not a flag is the model;
