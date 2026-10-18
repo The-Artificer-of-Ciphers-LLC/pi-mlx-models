@@ -2676,6 +2676,9 @@ for (const pipIndex of [
   "http://127.0.0.1:3141/root/pypi/+simple/",
   "http://localhost/simple/",
   "http://[::1]:8080/simple/",
+  // The host is written as WHATWG normalises it, in any letter case and with any port (IN-02).
+  "http://LOCALHOST/simple/",
+  "http://127.0.0.1:80/simple/",
 ]) {
   test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is accepted in a global file and kept verbatim`, () => {
     const { prepared, warnings } = resolved({ global: ok({ mlxLm: { pipIndex } }) });
@@ -2700,11 +2703,27 @@ const BAD_PIP_INDEXES: unknown[] = [
   "https://",
   "pypi.org/simple/",
   5,
+  // A query string or a fragment can carry a token, even a bare marker with nothing after it (IN-02).
+  "https://mirror.example/simple/?token=abc",
+  "https://mirror.example/simple/#frag",
+  "https://mirror.example/simple/?",
+  "https://mirror.example/simple/#",
+  // An http host that is loopback only after WHATWG rewrites it is not the host pip reads (IN-02).
+  "http://0x7f.1/simple/",
+  "http://127.1/simple/",
+  "http://2130706433/simple/",
+  "http://[0:0:0:0:0:0:0:1]/simple/",
 ];
+/** What a refused value shows when it holds an `@`: the user and password are gone, spelled out so no test re-implements the pattern (WR-01). */
+const SHOWN_WITHOUT_CREDENTIALS = new Map<unknown, string>([
+  ["https://user:pass@example.test/simple/", '"https://***@example.test/simple/"'],
+  ["https://user@example.test/simple/", '"https://***@example.test/simple/"'],
+  ["https://pypi.org@evil.example/simple/", '"https://***@evil.example/simple/"'],
+  ["https://:@example.test/simple/", '"https://***@example.test/simple/"'],
+]);
 for (const pipIndex of BAD_PIP_INDEXES) {
   test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is refused naming the allowed form`, () => {
-    // Credentials are never repeated back (WR-01): the user and password of a refused URL show as ***.
-    const shown = JSON.stringify(pipIndex).replace(/([/\\]{2})[^\s/\\?#"]*@/g, "$1***@");
+    const shown = SHOWN_WITHOUT_CREDENTIALS.get(pipIndex) ?? JSON.stringify(pipIndex);
     assert.deepEqual(refused({ global: ok({ mlxLm: { pipIndex } }) }), [pipLine(shown)]);
   });
 }
@@ -2914,4 +2933,32 @@ test("an invalid PI_MLX_MODELS_PIP_INDEX refuses instead of falling back to the 
 test("an unset or blank PI_MLX_MODELS_PIP_INDEX still means the next layer down", () => {
   assert.equal(resolved({ env: { PI_MLX_MODELS_PIP_INDEX: "" } }).prepared.install.pipIndex, DEFAULT_PIP_INDEX);
   assert.equal(resolved({ env: { PI_MLX_MODELS_PIP_INDEX: "   " } }).prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+});
+
+// ---- credentials in any spelling and any layer never show (plan 03-06, WR-01, T-03-24) ----
+
+test("a pasted pip index secret with a slash, a question mark or a hash is hidden in every layer's refusal", () => {
+  for (const password of ["s3cr3t/TOKEN", "s3cr3t?TOKEN", "s3cr3t#TOKEN"]) {
+    const index = `https://bob:${password}@mirror.example/simple/`;
+    const layers: Array<[string, ReturnType<typeof resolve>]> = [
+      ["PI_MLX_MODELS_PIP_INDEX", resolve({ env: { PI_MLX_MODELS_PIP_INDEX: index } })],
+      ["the typed /mlx-init value", resolve({ args: { "mlxLm.pipIndex": index } })],
+      ["the global file", resolve({ global: ok({ mlxLm: { pipIndex: index } }) })],
+    ];
+    for (const [layer, result] of layers) {
+      const text = everyText(result);
+      assert.equal(result.ok, false, `${layer}: ${password}`);
+      assert.ok(!text.includes("s3cr3t"), `${layer}: ${text}`);
+      assert.ok(!text.includes("TOKEN"), `${layer}: ${text}`);
+      assert.ok(!text.includes("bob"), `${layer}: ${text}`);
+      assert.ok(text.includes("mirror.example"), `${layer}: the host stays visible to find the mistake: ${text}`);
+    }
+  }
+});
+
+test("a global file whose baseUrl is 200000 slashes is refused at once: nothing in the report path is quadratic (T-03-23)", () => {
+  const started = Date.now();
+  const result = resolve({ global: ok({ baseUrl: "/".repeat(200000) }) });
+  assert.equal(result.ok, false);
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
 });
