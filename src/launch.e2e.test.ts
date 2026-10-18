@@ -144,6 +144,7 @@ async function harness(
     start: (input = "qwen3_4b") => fakePi.commands.get("mlx-start")!(input, fakeCtx.ctx),
     last: (input = "") => fakePi.commands.get("mlx-last")!(input, fakeCtx.ctx),
     status: (input = "") => fakePi.commands.get("mlx-status")!(input, fakeCtx.ctx),
+    restart: (input = "") => fakePi.commands.get("mlx-restart")!(input, fakeCtx.ctx),
     stop: () => fakePi.commands.get("mlx-stop")!("", fakeCtx.ctx),
   };
 }
@@ -1720,4 +1721,60 @@ test("mlx-status e2e crash: after the child is killed from outside the status is
   assert.equal(block.includes("profile:"), false, block);
   assert.equal(block.includes("flags:"), false, block);
   assert.equal(block.includes("a start is under way"), false, block);
+});
+
+// ---- /mlx-restart: the same model and profile selection through the files read now, flags not kept (plan 06-09: CMD-04) ----
+
+const hasExited = (child: ChildProcess) => child.exitCode !== null || child.signalCode !== null;
+
+test("mlx-restart e2e: a running server is replaced by a new child with the override, and /mlx-status shows the new flags", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(FAST_PROFILE_FILE(port));
+  await h.start("qwen3_4b --profile fast");
+  assert.deepEqual(errorNotes(h.notes), []);
+  assert.equal(h.children.length, 1);
+
+  await h.restart("--log-level DEBUG");
+
+  assert.deepEqual(errorNotes(h.notes), []);
+  assert.equal(h.children.length, 2, "the restart spawned a new child");
+  assert.equal(hasExited(h.children[0]), true, "the first child is gone");
+  assert.equal(hasExited(h.children[1]), false, "the second child serves the port");
+  const argv = h.argv();
+  assert.ok(argv.includes("--log-level=DEBUG"), JSON.stringify(argv));
+  assert.ok(argv.includes("--temp=0.2"), JSON.stringify(argv));
+  const restarts = startNotes(h.notes).filter((n) => n.message.includes("(previous launch)"));
+  assert.equal(restarts.length, 1, "the restart's start message words the kept profile as the previous launch's");
+  assert.ok(restarts[0].message.includes("\nprofile: fast (previous launch)"), restarts[0].message);
+
+  const before = h.notes.length;
+  await h.status();
+  const block = addedSince(h.notes, before)[0].message;
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes("--log-level DEBUG"), block);
+  assert.ok(block.includes("--temp 0.2 (profile fast)"), block);
+
+  await h.restart();
+
+  assert.deepEqual(errorNotes(h.notes), []);
+  assert.equal(h.children.length, 3);
+  assert.equal(h.argv().some((arg) => arg.startsWith("--log-level")), false, "the override applied to one restart only");
+  assert.ok(h.argv().includes("--temp=0.2"), "the profile selection is kept");
+  await h.stop();
+});
+
+test("mlx-restart e2e: an edit of the global file takes effect on the next restart", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(FAST_PROFILE_FILE(port));
+  await h.start("qwen3_4b --profile fast");
+  assert.ok(h.argv().includes("--temp=0.2"), JSON.stringify(h.argv()));
+
+  h.writeConfig(FAST_PROFILE_FILE(port, 0.5));
+  await h.restart();
+
+  assert.deepEqual(errorNotes(h.notes), []);
+  assert.deepEqual(h.argv().filter((arg) => arg.startsWith("--temp")), ["--temp=0.5"]);
+  await h.stop();
 });
