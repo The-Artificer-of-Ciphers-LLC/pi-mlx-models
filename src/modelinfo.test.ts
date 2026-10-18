@@ -9,6 +9,7 @@ import {
   FALLBACK_CONTEXT_WINDOW,
   HUB_TIMEOUT_MS,
   MAX_CONFIG_BYTES,
+  REASONING_NAME_TOKENS,
   contextWindowOf,
   createModelConfigReader,
   defaultMaxTokens,
@@ -16,11 +17,14 @@ import {
   describeModel,
   extrasFallbackNotice,
   hubBaseUrlOf,
+  isReasoningModelId,
   resolveCacheRoot,
+  type ModelConfigRead,
   type ModelConfigReaderOptions,
   type ModelInfo,
   type ReadModelConfig,
 } from "./modelinfo.js";
+import { MODEL_PRESETS } from "./presets.js";
 import { hfFixture, writeHfCache } from "./testkit.js";
 
 /** A fresh temporary directory, removed when the test ends. */
@@ -408,6 +412,132 @@ test("the default output limit is a quarter of the window, capped at 8192 or 327
   for (const [window, reasoning, expected] of table) {
     assert.equal(defaultMaxTokens(window, reasoning), expected, `${window} ${reasoning}`);
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The reasoning flag: the preset first, then the curated whole-token list on the id, nothing else (D-04, MOD-02)
+// ---------------------------------------------------------------------------------------------------------------------
+
+const R1_ID = MODEL_PRESETS[0].modelId;
+const NOT_R1_PRESET_IDS = MODEL_PRESETS.filter((p) => p.key !== "deepseek_r1_1_5b").map((p) => p.modelId);
+const windowOfFixture = (name: string): ModelConfigRead => ({ ok: true, config: hfFixture(name), source: "cache" });
+const windowOf = (n: number): ModelConfigRead => ({ ok: true, config: { max_position_embeddings: n }, source: "cache" });
+
+test("the id rule flags the R1 distill, QwQ, thinking, reasoning, reasoner and magistral models, in any letter case", () => {
+  const positives = [
+    R1_ID,
+    "deepseek-ai/DeepSeek-R1",
+    "mlx-community/QwQ-32B-4bit",
+    "mlx-community/Qwen3-4B-Thinking-2507-4bit",
+    "org/Some-Reasoning-Model",
+    "org/Deepseek-Reasoner",
+    "mlx-community/Magistral-Small-2506-4bit",
+    "org/model-R1",
+    "org/MODEL-QWQ",
+    "org/model-THINKING",
+    "org/Model-Reasoning",
+    "org/model-REASONER",
+    "org/MAGISTRAL",
+    "org/model_r1_4bit",
+  ];
+  for (const id of positives) assert.equal(isReasoningModelId(id), true, id);
+});
+
+test("the id rule leaves the other presets, KAT-Coder and Qwen3 Instruct unflagged", () => {
+  const negatives = [
+    ...NOT_R1_PRESET_IDS,
+    "mlx-community/KAT-Coder-V2.5-Dev-OptiQ-4bit",
+    "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+  ];
+  assert.equal(NOT_R1_PRESET_IDS.length, 4);
+  for (const id of negatives) assert.equal(isReasoningModelId(id), false, id);
+});
+
+test("the id rule matches whole tokens of the last path segment only", () => {
+  const negatives = [
+    "org/xr1-model",
+    "org/r10",
+    "org/model-qwq2",
+    "org/thinkingmodel",
+    "thinking-machines/plain-model",
+    "reasoning-lab/plain-model",
+    "/Users/r1/models/Llama-3.2-3B-Instruct",
+    "C:\\models\\r1\\Plain-Model",
+  ];
+  for (const id of negatives) assert.equal(isReasoningModelId(id), false, id);
+  assert.equal(isReasoningModelId("/models/DeepSeek-R1-Distill"), true);
+  assert.equal(isReasoningModelId("C:\\models\\QwQ-32B"), true);
+});
+
+test("the curated token list is exactly r1, qwq, thinking, reasoning, reasoner and magistral", () => {
+  assert.deepEqual([...REASONING_NAME_TOKENS], ["r1", "qwq", "thinking", "reasoning", "reasoner", "magistral"]);
+});
+
+test("the preset flag decides for every preset id: true for the R1 distill only, source preset for all five", () => {
+  for (const preset of MODEL_PRESETS) {
+    const info = deriveModelInfo({ id: preset.modelId });
+    assert.equal(info.reasoning, preset.key === "deepseek_r1_1_5b", preset.key);
+    assert.equal(info.reasoningSource, "preset", preset.key);
+  }
+});
+
+test("a non-preset id on the list is reasoning with source model name, and one off the list is not, with source default", () => {
+  const listed = deriveModelInfo({ id: "org/Some-QwQ-32B" });
+  assert.equal(listed.reasoning, true);
+  assert.equal(listed.reasoningSource, "model name");
+
+  const plain = deriveModelInfo({ id: "org/Plain-Instruct" });
+  assert.equal(plain.reasoning, false);
+  assert.equal(plain.reasoningSource, "default");
+});
+
+test("the chat template is not an input: a config that mentions thinking changes no outcome", () => {
+  const thinking = {
+    max_position_embeddings: 262144,
+    chat_template: "{% if enable_thinking %}<think>{% endif %}",
+    enable_thinking: true,
+  };
+  const qwen = deriveModelInfo({ id: MODEL_PRESETS[3].modelId, config: { ok: true, config: thinking, source: "cache" } });
+  assert.equal(qwen.reasoning, false);
+  assert.equal(qwen.reasoningSource, "preset");
+
+  const other = deriveModelInfo({ id: "org/Plain-Instruct", config: { ok: true, config: thinking, source: "cache" } });
+  assert.equal(other.reasoning, false);
+  assert.equal(other.reasoningSource, "default");
+
+  const real = deriveModelInfo({ id: MODEL_PRESETS[3].modelId, config: windowOfFixture("qwen3-4b-instruct-2507-4bit") });
+  assert.equal(real.reasoning, false);
+});
+
+test("the output limit default through deriveModelInfo: 32768 for the R1 distill, 8192 for the plain presets", () => {
+  const table: Array<[string, string, number]> = [
+    [R1_ID, "deepseek-r1-distill-qwen-1.5b-4bit", 32768],
+    [MODEL_PRESETS[3].modelId, "qwen3-4b-instruct-2507-4bit", 8192],
+    [MODEL_PRESETS.find((p) => p.key === "smollm3_3b")!.modelId, "smollm3-3b-4bit", 8192],
+    [MODEL_PRESETS.find((p) => p.key === "gemma4_e2b")!.modelId, "gemma-4-e2b-it-4bit", 8192],
+  ];
+  for (const [id, fixture, expected] of table) {
+    const info = deriveModelInfo({ id, config: windowOfFixture(fixture) });
+    assert.equal(info.maxTokens, expected, id);
+    assert.equal(info.maxTokensSource, "default", id);
+    assert.deepEqual(info.input, ["text"], id);
+    assert.equal(info.inputSource, "default", id);
+  }
+});
+
+test("the output limit of a list-matched reasoning id is a quarter of its window, at most 32768", () => {
+  assert.equal(deriveModelInfo({ id: "org/Some-QwQ-32B", config: windowOf(65536) }).maxTokens, 16384);
+  assert.equal(deriveModelInfo({ id: "org/Some-QwQ-32B", config: windowOf(262144) }).maxTokens, 32768);
+  assert.equal(deriveModelInfo({ id: "org/Some-QwQ-32B" }).maxTokens, 8192);
+});
+
+test("describeModel of the R1 distill reads max output 32768 (default) and reasoning yes (preset)", () => {
+  const info = deriveModelInfo({ id: R1_ID, config: windowOfFixture("deepseek-r1-distill-qwen-1.5b-4bit") });
+
+  assert.equal(
+    describeModel(info),
+    "model: context 131072 (config.json), max output 32768 (default), reasoning yes (preset), input text (default)",
+  );
 });
 
 // ---------------------------------------------------------------------------------------------------------------------

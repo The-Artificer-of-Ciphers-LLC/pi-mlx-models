@@ -356,6 +356,15 @@ export function createModelConfigReader(options: ModelConfigReaderOptions = {}):
   };
 }
 
+/** The whole name tokens that mark a model as a reasoning model (D-04). */
+export const REASONING_NAME_TOKENS: readonly string[] = [];
+
+/** Whether the last segment of `id` holds one of `REASONING_NAME_TOKENS` as a whole token (D-04). */
+export function isReasoningModelId(id: string): boolean {
+  void id;
+  return false;
+}
+
 /**
  * The output limit pi is told when nothing else sets it (D-07): a quarter of the window, at most 8192 for a model that
  * does not reason and 32768 for one that does, and at least 1.

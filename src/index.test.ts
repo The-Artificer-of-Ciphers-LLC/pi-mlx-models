@@ -3963,3 +3963,58 @@ test("a server that exits while the other listed models are being read ends the 
   assert.equal(h.notes.some((n) => n.message === READY_NOTE), false, "no ready message");
   assert.equal(lastStatus(h.statuses), "mlx: stopped");
 });
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Reasoning models: the flag, the compat object and the id rule through the registration (MOD-02, D-04, D-06)
+// ---------------------------------------------------------------------------------------------------------------------
+
+const REASONING_COMPAT = { supportsDeveloperRole: false, supportsReasoningEffort: false };
+
+test("a raw-id launch registers reasoning with the compat object when the id is on the list, and neither when it is not", async () => {
+  const thinking = await setup();
+  await thinking.commands.get("mlx-start")!("org/Foo-Thinking-2507", thinking.ctx);
+  const flagged = thinking.providerCalls.at(-1)?.config.models[0];
+  assert.equal(flagged.id, "org/Foo-Thinking-2507");
+  assert.equal(flagged.reasoning, true);
+  assert.deepEqual(flagged.compat, REASONING_COMPAT);
+  assert.ok(modelNotes(thinking.notes)[0].message.includes("reasoning yes (model name)"));
+
+  const instruct = await setup();
+  await instruct.commands.get("mlx-start")!("org/Foo-Instruct", instruct.ctx);
+  const plain = instruct.providerCalls.at(-1)?.config.models[0];
+  assert.equal(plain.id, "org/Foo-Instruct");
+  assert.equal(plain.reasoning, false);
+  assert.equal("compat" in plain, false);
+  assert.ok(modelNotes(instruct.notes)[0].message.includes("reasoning no (default)"));
+});
+
+test("launching the R1 distill by its full model id registers reasoning, the compat object and 32768 as its preset key does", async () => {
+  const h = await setup({ readModelConfig: makeFakeModelConfig({}, { ok: true, config: { max_position_embeddings: 131072 }, source: "cache" }).read });
+
+  await h.commands.get("mlx-start")!(MODEL_PRESETS[0].modelId, h.ctx);
+
+  const model = h.providerCalls.at(-1)?.config.models[0];
+  assert.equal(model.id, MODEL_PRESETS[0].modelId);
+  assert.equal(model.reasoning, true);
+  assert.equal(model.maxTokens, 32768);
+  assert.deepEqual(model.compat, REASONING_COMPAT);
+  assert.deepEqual(model.input, ["text"]);
+});
+
+test("with provider.listAllModels true an other listed model gets the flag and the compat object from its id alone", async () => {
+  const h = await setupListAll([QWEN_ID, "org/Some-QwQ-32B", "org/Plain-Instruct"], {
+    ids: { "org/Some-QwQ-32B": { max_position_embeddings: 131072 }, "org/Plain-Instruct": { max_position_embeddings: 131072 } },
+  });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  const models = h.providerCalls.at(-1)?.config.models as Array<Record<string, unknown> & { id: string }>;
+  const byId = Object.fromEntries(models.map((m) => [m.id, m]));
+  assert.equal(byId["org/Some-QwQ-32B"].reasoning, true);
+  assert.deepEqual(byId["org/Some-QwQ-32B"].compat, REASONING_COMPAT);
+  assert.equal(byId["org/Some-QwQ-32B"].maxTokens, 32768);
+  assert.equal(byId["org/Plain-Instruct"].reasoning, false);
+  assert.equal("compat" in byId["org/Plain-Instruct"], false);
+  assert.equal(byId[QWEN_ID].reasoning, false);
+  assert.equal("compat" in byId[QWEN_ID], false);
+});
