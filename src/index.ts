@@ -24,8 +24,10 @@ import {
   buildLaunch,
   cliFlagSpecs,
   describeFlags,
+  describeInstall,
   formatConfigErrors,
   formatProjectRefusal,
+  initFlagSpecs,
   kvNotices,
   prepareSettings,
   readLayerFile,
@@ -453,18 +455,28 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
     pi.registerCommand("mlx-init", {
       description: "Initialize local MLX runtime (python venv + mlx-lm)",
-      handler: async (_args, ctx) => {
+      handler: async (args, ctx) => {
         // A start in flight owns the venv and the progress widget; replacing it would abandon the start.
         if (startInFlight !== null) {
           ctx.ui.notify("mlx-init failed: MLX server is starting; run /mlx-stop first", "error");
           return;
         }
+        // Only the flags of /mlx-init's own list, and no model: typed text can never become another pip option (T-03-10).
+        const parsed = parseStartArgs(args ?? "", initFlagSpecs(), { command: "/mlx-init", takesModel: false });
+        if (!parsed.ok) {
+          ctx.ui.notify(`mlx-init failed: ${parsed.error}`, "error");
+          return;
+        }
+        const typed: Record<string, string | true> = {};
+        for (const flag of parsed.flags) typed[flag.path] = flag.raw;
         // The same layered configuration as /mlx-start, read the same way, and refused the same way: an invalid file or
-        // a project file that asks for something it may never ask for stops the init before any side effect.
+        // a project file that asks for something it may never ask for stops the init before any side effect. What was
+        // typed applies to this run only and is kept nowhere (Phase 2 D-10).
         const result = prepareSettings({
           global: readLayerFile(deps.settings.globalConfigPath),
           project: readLayerFile(join(workingDirectory(ctx), PROJECT_CONFIG_RELPATH)),
           env: deps.settings.env,
+          args: typed,
         });
         showConfigWarnings(ctx, result.warnings);
         if (!result.ok) {
@@ -489,6 +501,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
         let step = 0;
         try {
           ctx.ui.notify("Installing local MLX runtime...", "info");
+          ctx.ui.notify(`Installing ${describeInstall(prepared.install)}`, "info");
           await install({
             upgrade: true,
             policy,

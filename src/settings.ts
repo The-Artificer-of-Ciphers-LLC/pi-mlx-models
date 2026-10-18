@@ -1348,6 +1348,14 @@ export interface TrustRisk {
 const showInDialog = (text: string): string => clipDiagnostic(cleanLabel(text), 300, "start");
 
 /**
+ * The line /mlx-init shows before it installs: the version policy and the index, each with the layer it came from or
+ * "default". The index is cleaned and clipped long enough that clipping cannot hide where a look-alike URL points.
+ */
+export function describeInstall(install: InstallSettings): string {
+  return `mlx-lm ${install.version} (${install.versionSource ?? "default"}) from ${showInDialog(install.pipIndex)} (${install.pipIndexSource ?? "default"})`;
+}
+
+/**
  * The risks in the effective merged values whose layer is not the project file (that one is refused by
  * `projectViolations` before this is asked), in the order trustRemoteCode, host, baseUrl. An empty list means
  * the launch needs no confirmation (D-13, D-14, D-17).
