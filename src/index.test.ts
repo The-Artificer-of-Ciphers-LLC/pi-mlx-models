@@ -5095,6 +5095,33 @@ test("mlx-status record survives a stale start that fails late: the newer record
   assert.ok(block.includes(OTHER_PRESET.modelId), block);
 });
 
+test("mlx-status record replaced during the probe: the status describes the newer launch, not a server this session did not start", async () => {
+  const gate = deferred();
+  let probes = 0;
+  const { h } = await lastSetup({
+    setup: {
+      probeHealth: async () => {
+        probes += 1;
+        if (probes === 1) await gate.promise;
+        return PROBE_ANSWERS();
+      },
+    },
+  });
+  await startMlx(h, "qwen3_4b");
+
+  const status = statusCommand(h);
+  await flush();
+  assert.equal(probes, 1, "premise: the probe of the status is in flight");
+  await startMlx(h, OTHER_PRESET.key);
+  gate.resolve();
+  await status;
+  const block = h.notes[h.notes.length - 1].message;
+
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes(OTHER_PRESET.modelId), block);
+  assert.equal(block.includes("not started by this session"), false, block);
+});
+
 test("mlx-status record shows flags marked skipped, as the start message showed them", async () => {
   const { h } = await lastSetup({
     setup: {
