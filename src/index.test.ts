@@ -1047,7 +1047,7 @@ test("mlx-start with an unknown flag is refused, with the valid flags listed, an
   await h.commands.get("mlx-start")!("--bogus 1", h.ctx);
 
   assert.deepEqual(errors(h.notes), [
-    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --kv-bits, --kv-group-size, --quantized-kv-start, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
+    "mlx-start failed: unknown flag --bogus (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --kv-bits, --kv-group-size, --quantized-kv-start, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args, --profile)",
   ]);
   assert.equal(h.notes.length, 1);
   assertNothingHappened(h);
@@ -2488,7 +2488,7 @@ test("mlx-start still rejects --mlx-lm-version as an unknown flag and does not l
   await h.commands.get("mlx-start")!("qwen3_4b --mlx-lm-version 0.31.1", h.ctx);
 
   assert.deepEqual(errors(h.notes), [
-    "mlx-start failed: unknown flag --mlx-lm-version (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --kv-bits, --kv-group-size, --quantized-kv-start, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args)",
+    "mlx-start failed: unknown flag --mlx-lm-version (valid flags: --host, --port, --allowed-origins, --log-level, --trust-remote-code, --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes, --kv-bits, --kv-group-size, --quantized-kv-start, --adapter-path, --draft-model, --num-draft-tokens, --chat-template, --use-default-chat-template, --chat-template-args, --profile)",
   ]);
   assertNothingHappened(h);
 });

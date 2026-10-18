@@ -861,3 +861,81 @@ test("a second /mlx-start picks up the edited config (D-12)", { timeout: 30_000 
   assert.equal(await h.postToServer(port, result), 200);
   assert.equal((h.requests().at(-1)?.body as Record<string, unknown>).temperature, 0.9);
 });
+
+// ---- profiles (CFG-04, SRV-03, GEN-01, GEN-02): a profile picked at start reaches the argv, the start message and the request ----
+
+const PROFILE_CONFIG = (port: number) => ({
+  server: { port },
+  models: {
+    qwen3_4b: {
+      profiles: { fast: { sampling: { temperature: 0.2, maxTokens: 2048 }, chatTemplateArgs: { enable_thinking: false } } },
+    },
+  },
+});
+
+test("a profile picked with --profile reaches the spawned argv, the start message and the request the server receives", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(PROFILE_CONFIG(port));
+
+  await h.start("qwen3_4b --profile fast");
+
+  assert.deepEqual(h.argv(), [
+    "--model",
+    QWEN.modelId,
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+    '--chat-template-args={"enable_thinking":false}',
+    "--temp=0.2",
+    "--max-tokens=2048",
+  ]);
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  assert.equal(
+    starting[0].message,
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nprofile: fast (/mlx-start)\nflags: --port ${port} (global file), --chat-template-args {"enable_thinking":false} (profile fast), --temp 0.2 (profile fast), --max-tokens 2048 (profile fast)`,
+  );
+
+  const rewritten = await h.runHook(piPayload(QWEN.modelId));
+  assert.equal(await h.postToServer(port, rewritten), 200);
+  const body = h.requests().at(-1)?.body as Record<string, unknown>;
+  assert.equal(body.temperature, 0.2);
+  assert.equal(body.max_completion_tokens, 2048);
+  assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
+});
+
+test("the profile applies to that launch only: the next start without --profile is back to the file's base", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(PROFILE_CONFIG(port));
+  await h.start("qwen3_4b --profile fast");
+  await h.stop();
+
+  await h.start("qwen3_4b");
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port)]);
+  const second = startNotes(h.notes)[1];
+  assert.equal(second.message, `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --port ${port} (global file)`);
+  assert.ok(!second.message.includes("profile:"));
+  assert.equal(await h.runHook(piPayload(QWEN.modelId)), undefined);
+});
+
+test("an unknown profile name is refused before any install, probe or spawn, naming the available profiles", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(PROFILE_CONFIG(port));
+
+  await h.start("qwen3_4b --profile nope");
+
+  const failures = h.notes.filter((n) => n.type === "error");
+  assert.equal(failures.length, 1);
+  assert.ok(failures[0].message.startsWith("mlx-start failed: invalid configuration"), failures[0].message);
+  assert.ok(
+    failures[0].message.includes(`profile "nope" (/mlx-start --profile): not defined for ${QWEN.modelId}; available profiles: fast`),
+    failures[0].message,
+  );
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+});

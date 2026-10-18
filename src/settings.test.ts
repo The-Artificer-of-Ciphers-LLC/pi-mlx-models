@@ -6,10 +6,12 @@ import { join } from "node:path";
 import { DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX } from "./config.js";
 import {
   PI_FLAGS,
+  PROFILE_FLAG_SPEC,
   SETTINGS,
   buildLaunch,
   cliFlagSpecs,
   describeFlags,
+  describeProfile,
   describeRequest,
   formatConfigErrors,
   formatProjectRefusal,
@@ -22,6 +24,7 @@ import {
   sameVersion,
   toLaunchSpec,
   trustRisks,
+  type BuildOptions,
   type LayerFile,
   type PrepareInput,
   type Prepared,
@@ -3364,4 +3367,233 @@ test("describeRequest shows a hostile stop string cleaned and clipped, never raw
   assert.ok(!/[\u0000-\u001f\u007f]/.test(text), JSON.stringify(text));
   assert.ok(text.length < 120, `${text.length} characters`);
   assert.ok(!text.includes("end"), "the clip drops the tail");
+});
+
+// ---- profiles (CFG-04): plan 04-04 ----
+
+/** Build the launch of `model` with the profile options and require success. */
+function launchWith(input: Partial<PrepareInput>, options: BuildOptions, model: ModelIdentity = QWEN, context = LAUNCH_CTX) {
+  const built = buildLaunch(resolved(input).prepared, model, context, options);
+  assert.ok(built.ok, `expected a launch, got ${JSON.stringify(built)}`);
+  return built.launch;
+}
+
+/** The report of a launch with the profile options that must be refused at the second stage. */
+function errorsWith(input: Partial<PrepareInput>, options: BuildOptions, model: ModelIdentity = QWEN, context = LAUNCH_CTX): string[] {
+  const built = buildLaunch(resolved(input).prepared, model, context, options);
+  assert.equal(built.ok, false, "expected the launch to be refused");
+  assert.ok(!built.ok);
+  return built.errors;
+}
+
+/** The argv of a launch with the profile options. */
+const argvWith = (input: Partial<PrepareInput>, options: BuildOptions, model: ModelIdentity = QWEN, context = LAUNCH_CTX): readonly string[] =>
+  toLaunchSpec(launchWith(input, options, model, context)).extraArgs;
+
+/** What a flag looks like in the flags line: its name, argv and label. */
+const flagSummary = (launch: ReturnType<typeof launchWith>) => launch.flags.map((flag) => ({ flag: flag.flag, args: flag.args, label: flag.label }));
+
+const FAST_PROFILE = { sampling: { temperature: 0.2, maxTokens: 2048 }, chatTemplateArgs: { enable_thinking: false } };
+const FAST_FILE = () => ok({ models: { qwen3_4b: { profiles: { fast: FAST_PROFILE } } } });
+const FAST = { profile: "fast" };
+const MISSING_PROFILE = (name: string, tail: string) =>
+  `profile "${name}" (/mlx-start --profile): not defined for ${QWEN.modelId}; ${tail}`;
+
+test("the profile flag is a /mlx-start flag of its own and not a settings row", () => {
+  assert.deepEqual(PROFILE_FLAG_SPEC, { flag: "--profile", path: "profile", takesValue: true });
+  assert.ok(!cliFlagSpecs().some((spec) => spec.flag === "--profile"));
+});
+
+test("a profile's values become the model flags in schema order, each labelled with the profile", () => {
+  const launch = launchWith({ global: FAST_FILE() }, FAST);
+  assert.deepEqual(flagSummary(launch), [
+    { flag: "--chat-template-args", args: ['--chat-template-args={"enable_thinking":false}'], label: "profile fast" },
+    { flag: "--temp", args: ["--temp=0.2"], label: "profile fast" },
+    { flag: "--max-tokens", args: ["--max-tokens=2048"], label: "profile fast" },
+  ]);
+});
+
+test("launch.profile names the profile and /mlx-start, and launch.request carries the same values", () => {
+  const launch = launchWith({ global: FAST_FILE() }, FAST);
+  assert.deepEqual(launch.profile, { name: "fast", source: "/mlx-start" });
+  assert.deepEqual(launch.request, { sampling: { temperature: 0.2, maxTokens: 2048 }, chatTemplateArgs: { enable_thinking: false } });
+});
+
+test("without the profile option the same file adds no model flags and no profile", () => {
+  const launch = launchWith({ global: FAST_FILE() }, {});
+  assert.deepEqual(launch.flags, []);
+  assert.equal(launch.profile, undefined);
+  assert.deepEqual(launch.request, { sampling: {} });
+});
+
+test("a profile wins over the model block and the models entry for the same key", () => {
+  const input = {
+    global: ok({
+      model: { sampling: { temperature: 0.7 } },
+      models: { qwen3_4b: { sampling: { temperature: 0.5 }, profiles: { fast: { sampling: { temperature: 0.2 } } } } },
+    }),
+  };
+  assert.deepEqual(argvWith(input, FAST), ["--temp=0.2"]);
+  assert.deepEqual(argvWith(input, {}), ["--temp=0.5"]);
+  assert.equal(launchWith(input, FAST).flags[0].label, "profile fast");
+});
+
+test("a typed model flag beats the profile's value for the same key", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { profiles: { fast: { draftModel: "profile-draft" } } } } }),
+    args: { "model.draftModel": "typed-draft" },
+  };
+  const launch = launchWith(input, FAST);
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--draft-model=typed-draft"]);
+  assert.equal(launch.flags[0].label, "/mlx-start");
+});
+
+test("chatTemplateArgs of the base and of the profile merge key by key", () => {
+  const launch = launchWith(
+    {
+      global: ok({
+        model: { chatTemplateArgs: { a: 1, b: 2 } },
+        models: { qwen3_4b: { profiles: { fast: { chatTemplateArgs: { b: 3 } } } } },
+      }),
+    },
+    FAST,
+  );
+  assert.deepEqual(launch.request.chatTemplateArgs, { a: 1, b: 3 });
+});
+
+test("a profile is reachable only for the model its entry names", () => {
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, FAST, LLAMA), [
+    `profile "fast" (/mlx-start --profile): not defined for ${LLAMA.modelId}; no profiles are defined for this model`,
+  ]);
+});
+
+test("an unknown profile is refused with one line that lists the model's profile", () => {
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "nope" }), [MISSING_PROFILE("nope", "available profiles: fast")]);
+});
+
+test("the available profiles in an unknown-profile line are sorted", () => {
+  const input = { global: ok({ models: { qwen3_4b: { profiles: { fast: {}, careful: {} } } } }) };
+  assert.deepEqual(errorsWith(input, { profile: "nope" }), [MISSING_PROFILE("nope", "available profiles: careful, fast")]);
+});
+
+test("a model with no profiles at all says that none are defined", () => {
+  assert.deepEqual(errorsWith({}, { profile: "nope" }), [MISSING_PROFILE("nope", "no profiles are defined for this model")]);
+});
+
+test("a project file's models entry may hold profiles, and their flags carry the profile label", () => {
+  const launch = launchWith({ project: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.3 } } } } } }) }, FAST);
+  assert.deepEqual(flagSummary(launch), [{ flag: "--temp", args: ["--temp=0.3"], label: "profile fast" }]);
+});
+
+test("every model key is accepted inside a profile and reaches the flags", (t) => {
+  const template = writeTemplate(t, "{{ t }}");
+  const profile = {
+    adapterPath: "/adapters/a",
+    draftModel: "org/draft",
+    numDraftTokens: 3,
+    chatTemplate: template.path,
+    useDefaultChatTemplate: true,
+    chatTemplateArgs: { enable_thinking: false },
+  };
+  assert.deepEqual(argvWith({ global: ok({ models: { qwen3_4b: { profiles: { fast: profile } } } }) }, FAST), [
+    "--adapter-path=/adapters/a",
+    "--draft-model=org/draft",
+    "--num-draft-tokens=3",
+    "--chat-template={{ t }}",
+    "--use-default-chat-template",
+    '--chat-template-args={"enable_thinking":false}',
+  ]);
+});
+
+test("a server-wide key inside a profile is refused, naming the key, the profile and the file", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { port: 9100 } } } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, [
+    'models["qwen3_4b"].profiles["fast"].port (global config.json): unknown key (port is a "server" key, not part of a profile)',
+  ]);
+});
+
+test("a profile name that breaks the naming rule is refused", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { "bad name!": {} } } } }) });
+  assert.ok(!result.ok);
+  assert.equal(result.errors.length, 1);
+  assert.ok(result.errors[0].startsWith('models["qwen3_4b"].profiles["bad name!"] (global config.json): '), result.errors[0]);
+});
+
+test("a project profile's chatTemplate outside the project directory is refused like the model block's", (t) => {
+  const project = writeTemplate(t, "{{ project }}");
+  const elsewhere = writeTemplate(t, "{{ elsewhere }}");
+  const context = { home: "/nowhere", cwd: project.dir };
+  const projectProfile = (chatTemplate: string) => ({ project: ok({ models: { qwen3_4b: { profiles: { fast: { chatTemplate } } } } }) });
+  assert.deepEqual(argvWith(projectProfile("template.jinja"), FAST, QWEN, context), ["--chat-template={{ project }}"]);
+  assert.deepEqual(errorsWith(projectProfile(elsewhere.path), FAST, QWEN, context), [
+    `model.chatTemplate (${PROJECT}): ${elsewhere.path} is outside the project directory`,
+  ]);
+});
+
+test("the same chatTemplate path in a global profile is read and launches", (t) => {
+  const project = writeTemplate(t, "{{ project }}");
+  const elsewhere = writeTemplate(t, "{{ elsewhere }}");
+  const context = { home: "/nowhere", cwd: project.dir };
+  const input = { global: ok({ models: { qwen3_4b: { profiles: { fast: { chatTemplate: elsewhere.path } } } } }) };
+  assert.deepEqual(argvWith(input, FAST, QWEN, context), ["--chat-template={{ elsewhere }}"]);
+});
+
+test("describeProfile words the profile line, and is empty for a launch without one", () => {
+  assert.equal(describeProfile(launchWith({ global: FAST_FILE() }, FAST)), "profile: fast (/mlx-start)");
+  assert.equal(describeProfile(launchWith({ global: FAST_FILE() }, {})), "");
+});
+
+test("limits is reserved: an empty limits object is accepted and changes nothing", () => {
+  const plain = launchWith({ global: FAST_FILE() }, FAST);
+  const withLimits = launchWith(
+    { global: ok({ models: { qwen3_4b: { profiles: { fast: { ...FAST_PROFILE, limits: {} } } } } }) },
+    FAST,
+  );
+  assert.deepEqual(withLimits.flags, plain.flags);
+  assert.deepEqual(withLimits.request, plain.request);
+});
+
+test("a key inside limits is refused: limits is reserved and accepts no keys yet", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { limits: { contextWindow: 1 } } } } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, [
+    'models["qwen3_4b"].profiles["fast"].limits.contextWindow (global config.json): unknown key (limits is reserved and accepts no keys yet)',
+  ]);
+});
+
+test("limits that is not an object is refused with the usual object line", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { limits: 5 } } } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ['models["qwen3_4b"].profiles["fast"].limits (global config.json): 5 must be a JSON object']);
+});
+
+test("a row added under model.limits is read from a profile with no change to the reader, and reaches neither argv nor the request", () => {
+  const row: SettingDef = {
+    path: "model.limits.example",
+    kind: "integer",
+    perModel: true,
+    expected: "an integer of at least 1",
+    check: (value) => (typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? { ok: true, value } : { ok: false }),
+    problem: (shown) => `${shown} is not an integer of at least 1`,
+    parseText: () => ({ ok: false }),
+    emit: () => [],
+  };
+  const table = SETTINGS as SettingDef[];
+  table.push(row);
+  try {
+    const input = { global: ok({ models: { qwen3_4b: { profiles: { fast: { ...FAST_PROFILE, limits: { example: 3 } } } } } }) };
+    const { prepared } = resolved(input);
+    assert.equal(prepared.modelSettings.layers[0].models.get("qwen3_4b")?.profiles.get("fast")?.get("model.limits.example"), 3);
+    const plain = launchWith({ global: FAST_FILE() }, FAST);
+    const launch = launchWith(input, FAST);
+    assert.deepEqual(launch.flags, plain.flags);
+    assert.deepEqual(toLaunchSpec(launch).extraArgs, toLaunchSpec(plain).extraArgs);
+    assert.deepEqual(launch.request, plain.request);
+    const bad = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { limits: { example: 0 } } } } } }) });
+    assert.ok(!bad.ok);
+    assert.equal(bad.errors[0], 'models["qwen3_4b"].profiles["fast"].limits.example (global config.json): 0 is not an integer of at least 1');
+  } finally {
+    table.pop();
+  }
 });

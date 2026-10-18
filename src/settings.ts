@@ -835,6 +835,9 @@ export function cliFlagSpecs(): CliFlagSpec[] {
   return SETTINGS.flatMap((row) => (row.cli === undefined ? [] : [{ flag: row.cli, path: row.path, takesValue: row.bare !== true }]));
 }
 
+/** The `/mlx-start` flag that picks a profile for one launch (D-02). It is not a setting row, so `cliFlagSpecs()` does not list it. */
+export const PROFILE_FLAG_SPEC: CliFlagSpec = { flag: "--profile", path: "profile", takesValue: true };
+
 /** The flags `/mlx-init` accepts, derived from the rows that declare an `initCli`; all of them take a value. */
 export function initFlagSpecs(): CliFlagSpec[] {
   return SETTINGS.flatMap((row) => (row.initCli === undefined ? [] : [{ flag: row.initCli, path: row.path, takesValue: true }]));
@@ -1084,11 +1087,21 @@ export interface InstallSettings {
   pipIndexSource?: string;
 }
 
+/**
+ * One `models` entry of a file: its own validated model values, its named profiles (D-01) and the profile it defaults
+ * to. Profile names are only ever Map keys, so a hostile name is just a key (T-04-15).
+ */
+export interface ModelEntry {
+  values: Map<string, SettingValue>;
+  profiles: Map<string, Map<string, SettingValue>>;
+  defaultProfile?: string;
+}
+
 /** One file's model options: the `model` block, and each `models` entry by its key or model id. */
 interface ModelLayer {
   layer: "global" | "project";
   model: ReadonlyMap<string, SettingValue>;
-  models: ReadonlyMap<string, ReadonlyMap<string, SettingValue>>;
+  models: ReadonlyMap<string, ModelEntry>;
 }
 
 /** The model options before a model is known: the file layers from lowest to highest precedence, and the typed flags. */
@@ -1180,9 +1193,9 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
     else problems.push(`${path} (${label}): ${(result.problem ?? row.problem)(showValue(value))}${flagSuffix(row)}`);
   };
   /** One `models` entry: the same keys and checks as the `model` block, with the entry's own path in every line. */
-  const considerEntry = (id: string, entry: Map<string, SettingValue>, key: string, value: unknown) => {
+  const considerEntry = (id: string, entry: ModelEntry, key: string, value: unknown) => {
     if (key === SAMPLING_KEY) {
-      readSampling(entry, entryPath(id), label, value, problems);
+      readSampling(entry.values, entryPath(id), label, value, problems);
       return;
     }
     const where = `${entryPath(id)}.${showKey(key)}`;
@@ -1192,7 +1205,7 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
       return;
     }
     const result = row.check(value);
-    if (result.ok) entry.set(row.path, result.value);
+    if (result.ok) entry.values.set(row.path, result.value);
     else problems.push(`${where} (${label}): ${(result.problem ?? row.problem)(showValue(value))}${flagSuffix(row)}`);
   };
   for (const [key, value] of Object.entries(file.data)) {
@@ -1206,7 +1219,7 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
           problems.push(`${entryPath(id)} (${label}): ${PHRASES.object(showValue(entryValue))}`);
           continue;
         }
-        const entry = new Map<string, SettingValue>();
+        const entry: ModelEntry = { values: new Map(), profiles: new Map() };
         data.models.set(id, entry);
         for (const [child, childValue] of Object.entries(entryValue)) considerEntry(id, entry, child, childValue);
       }
@@ -1227,7 +1240,7 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
 /** What one config file holds: the validated top-level and block values, and the validated `models` entries. */
 interface FileLayerData {
   values: Map<string, SettingValue>;
-  models: Map<string, Map<string, SettingValue>>;
+  models: Map<string, ModelEntry>;
 }
 
 /** The path of a `models` entry as an error line shows it: `models["id"]`, the id cleaned and at most 80 characters. */
@@ -1441,6 +1454,13 @@ export interface ResolvedLaunch {
   request: RequestOverrides;
   /** The request-only sampling values with their layer, in schema order, for the `request:` line of the start message. */
   requestNotes: RequestNote[];
+  /** The profile this launch applies and where its name came from; absent for a launch without one (D-06). */
+  profile?: { name: string; source: string };
+}
+
+/** What `/mlx-start` typed that is not a setting: today the name of the profile to apply to this launch (D-02). */
+export interface BuildOptions {
+  profile?: string;
 }
 
 export type BuildResult = { ok: true; launch: ResolvedLaunch } | { ok: false; errors: string[] };
@@ -1526,7 +1546,12 @@ const layerLabel = (layer: LayerName, row: SettingDef): string =>
  * precedence up (so a project `model` block beats a global `models` entry), and what was typed on `/mlx-start`
  * comes last. Paths are resolved, the chat template file is read, and the flags come out in schema order.
  */
-export function buildLaunch(prepared: Prepared, model: { modelId: string; presetKey?: string }, where: LaunchContext): BuildResult {
+export function buildLaunch(
+  prepared: Prepared,
+  model: { modelId: string; presetKey?: string },
+  where: LaunchContext,
+  options: BuildOptions = {},
+): BuildResult {
   const folded = new Map<string, { value: SettingValue; layer: LayerName }>();
   const apply = (values: ReadonlyMap<string, SettingValue> | undefined, layer: LayerName) => {
     if (values === undefined) return;
@@ -1537,8 +1562,8 @@ export function buildLaunch(prepared: Prepared, model: { modelId: string; preset
   };
   for (const data of prepared.modelSettings.layers) {
     apply(data.model, data.layer);
-    if (model.presetKey !== undefined) apply(data.models.get(model.presetKey), data.layer);
-    apply(data.models.get(model.modelId), data.layer);
+    if (model.presetKey !== undefined) apply(data.models.get(model.presetKey)?.values, data.layer);
+    apply(data.models.get(model.modelId)?.values, data.layer);
   }
   apply(prepared.modelSettings.args, "args");
 
@@ -1630,6 +1655,11 @@ export function describeFlags(launch: ResolvedLaunch, skipped?: ReadonlySet<stri
     (flag) => `${flag.flag}${flag.display ? ` ${flag.display}` : ""} (${flag.label}${!flag.core && skipped?.has(flag.flag) ? ", skipped" : ""})`,
   );
   return `flags: ${parts.join(", ")}`;
+}
+
+/** The `profile: NAME (SOURCE)` line of the start message, or "" when the launch applies no profile (D-06). */
+export function describeProfile(launch: ResolvedLaunch): string {
+  return "";
 }
 
 /** The `request: ...` line of the start message, or "" when no value is request-only. */
