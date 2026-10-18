@@ -490,6 +490,7 @@ A loopback host is `127.0.0.1`, `localhost` or `::1`. Everything else is non-loo
 | `server.trustRemoteCode: true` | The start is refused. | Asks for confirmation. |
 | `server.host` that is non-loopback | The start is refused. | Asks for confirmation. |
 | `baseUrl` that is non-loopback | The start is refused. | Asks for confirmation. |
+| `server.allowedOrigins` (any non-empty list) | The start is refused. | Accepted without a dialog at start. `/mlx-config` asks before it saves it. |
 | `mlxLm.pipIndex` | `/mlx-init` and `/mlx-start` are refused. | Accepted without a dialog from the global file, the environment or the `/mlx-init` flag. |
 | `autoStart` | Refused with either value, `true` or `false`. The message names the global file and `PI_MLX_MODELS_AUTO_START`. | Accepted without a dialog from the global file or the environment. `/mlx-config` asks before it saves `true`. See [Auto-start](#auto-start). |
 
@@ -604,7 +605,14 @@ Once the server is ready and the provider is registered, a start shows what pi w
 
 ## Server process
 
-The server is started with `PYTHONSAFEPATH=1`, so that the project directory is not searched for Python modules.
+The server is started with these environment variables added to pi's own:
+
+| Variable | Value |
+|----------|-------|
+| `PYTHONSAFEPATH` | `1`, so that the project directory is not searched for Python modules |
+| `HF_HOME` | `<agent dir>/pi-mlx-models/models` |
+| `TRANSFORMERS_CACHE` | `<agent dir>/pi-mlx-models/models` |
+| `HF_HUB_DISABLE_TELEMETRY` | `1` |
 
 ## Local data
 
