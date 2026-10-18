@@ -22,14 +22,16 @@ The exception is the environment. A bad environment variable is ignored with a w
 
 Opening a repository in pi is not the same as trusting it. A project file is part of that repository, so whoever wrote the repository wrote it.
 
-Four settings are dangerous in untrusted hands:
+Some settings are dangerous in untrusted hands:
 
 - `trustRemoteCode` lets a model repository run Python on your machine.
 - A non-loopback `host` makes the server reachable from your network, and it has no authentication.
 - A non-loopback `baseUrl` sends your conversations to another machine.
 - `mlxLm.pipIndex` chooses where `/mlx-init` runs `pip install` from. Whoever chooses the index chooses which code is installed on your machine.
+- `server.allowedOrigins` lets web pages open in your browser call the local server.
+- `autoStart` starts a model when pi opens, with nobody asked. Opening a repository should not be enough to load a model.
 
-A project file may set none of them. The extension refuses the start, or the `/mlx-init`, and says where to move the setting. The same values in your own global file, or typed by you, are fine, but they ask first, at every start. A decision made once and remembered would apply to a different model the next time.
+A project file may set none of them (`autoStart` is refused with either value, `true` or `false`). The extension refuses the start, or the `/mlx-init`, and says where to move the setting. The same values for the first three, in your own global file or typed by you, are fine, but they ask first, at every start. `allowedOrigins` and `autoStart` from your own sources need no question at start; `/mlx-config` asks before it saves either. A decision made once and remembered would apply to a different model the next time.
 
 The pip index is the odd one out in one respect. It asks for no confirmation from you, because it is your own setting and `/mlx-init` always prints it before installing. A version pin is different: it only chooses among the versions of the index you configured, so a project may pin.
 
