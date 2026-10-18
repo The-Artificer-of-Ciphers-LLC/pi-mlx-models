@@ -16,6 +16,7 @@ import {
   formatConfigErrors,
   formatProjectRefusal,
   initFlagSpecs,
+  isAutoStartRequested,
   kvNotices,
   pinNotice,
   pinUnreadableNotice,
@@ -4244,4 +4245,88 @@ test("provider.listAllModels names the layer that set it in the sources", () => 
   }).prepared;
   assert.equal(fromProject.sources.get("provider.listAllModels")?.label, "project file");
   assert.equal(resolved().prepared.sources.has("provider.listAllModels"), false);
+});
+
+// ---- autoStart (plan 06-01, D-24, D-26): opt-in, the user's own sources only ----
+
+const AUTO_START_ENV = "PI_MLX_MODELS_AUTO_START";
+
+test("the autoStart row is a user-level boolean with an environment variable and no flag of any kind", () => {
+  const row = SETTINGS.find((candidate) => candidate.path === "autoStart");
+  assert.ok(row, "the SETTINGS table has an autoStart row");
+  assert.equal(row.kind, "bool");
+  assert.equal(row.userLevelOnly, true);
+  assert.equal(row.env, AUTO_START_ENV);
+  assert.equal(row.default, false);
+  assert.equal(row.cli, undefined);
+  assert.equal(row.initCli, undefined);
+  assert.equal(row.piFlag, undefined);
+  assert.equal(row.mlxFlag, undefined);
+  assert.deepEqual(row.emit(true), []);
+  assert.deepEqual(row.emit(false), []);
+  assert.ok(!cliFlagSpecs().some((spec) => spec.path === "autoStart"));
+  assert.ok(!PI_FLAGS.some((flag) => flag.path === "autoStart"));
+});
+
+test("autoStart accepted from the global file with no warning, no violation and no flag; other values are refused naming the layer", () => {
+  const accepted = resolved({ global: ok({ autoStart: true }) });
+  assert.deepEqual(accepted.warnings, []);
+  assert.deepEqual(accepted.prepared.projectViolations, []);
+  assert.deepEqual(accepted.prepared.flags, []);
+  assert.equal(accepted.prepared.sources.get("autoStart")?.label, "global file");
+  assert.deepEqual(refused({ global: ok({ autoStart: "yes" }) }), [`autoStart (${GLOBAL}): "yes" must be true or false`]);
+  assert.deepEqual(refused({ global: ok({ autoStart: 1 }) }), [`autoStart (${GLOBAL}): 1 must be true or false`]);
+});
+
+test("autoStart misspelled in a file is an unknown key whose hint names autoStart", () => {
+  assert.equal(unknownLine({ autoStar: true }), `autoStar (${GLOBAL}): unknown key (did you mean autoStart?)`);
+  assert.equal(unknownLine({ autostart: true }), `autostart (${GLOBAL}): unknown key (did you mean autoStart?)`);
+});
+
+test("autoStart pre-gate, file: only a global file whose own autoStart is the boolean true answers true", () => {
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), {}), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: false }), {}), false);
+  assert.equal(isAutoStartRequested(absent, {}), false);
+  assert.equal(isAutoStartRequested({ state: "unusable", reason: "is not valid JSON" }, {}), false);
+  assert.equal(isAutoStartRequested(ok({ autoStart: "true" }), {}), false);
+  assert.equal(isAutoStartRequested(ok({ autoStart: 1 }), {}), false);
+  assert.equal(isAutoStartRequested(ok({ server: { port: 9000 } }), {}), false);
+});
+
+test("autoStart pre-gate, environment: a valid true or false text beats the file; blank or bad text leaves the file to decide", () => {
+  assert.equal(isAutoStartRequested(ok({ autoStart: false }), { [AUTO_START_ENV]: "true" }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), { [AUTO_START_ENV]: "false" }), false);
+  assert.equal(isAutoStartRequested(absent, { [AUTO_START_ENV]: " true " }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), { [AUTO_START_ENV]: "" }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), { [AUTO_START_ENV]: "   " }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: false }), { [AUTO_START_ENV]: "" }), false);
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), { [AUTO_START_ENV]: "maybe" }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: false }), { [AUTO_START_ENV]: "maybe" }), false);
+  assert.equal(isAutoStartRequested(absent, { [AUTO_START_ENV]: "maybe" }), false);
+  assert.doesNotThrow(() => isAutoStartRequested(absent, { [AUTO_START_ENV]: undefined, OTHER: "x" }));
+  assert.doesNotThrow(() => isAutoStartRequested(ok({ autoStart: true }), Object.create(null) as Record<string, string | undefined>));
+});
+
+test("autoStart pre-gate ignores every other key: a file invalid elsewhere still answers, and no project file is taken", () => {
+  assert.equal(isAutoStartRequested(ok({ autoStart: true, server: { port: "x" }, unknown: 1 }), {}), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: false, server: { port: "x" } }), {}), false);
+  assert.equal(isAutoStartRequested.length, 2, "the function takes the global file and the environment, nothing else");
+});
+
+test("autoStart in a project file, true or false, is one autoStart-only violation and changes nothing that resolves", () => {
+  const violation = { path: "autoStart", shown: "", reason: "starts a model when pi opens; only your own config file or PI_MLX_MODELS_AUTO_START may turn it on", autoStartOnly: true };
+  for (const value of [true, false]) {
+    const project = ok({ autoStart: value });
+    assert.deepEqual(violationsOf(project), [violation], String(value));
+    assert.equal(resolved({ project }).prepared.sources.has("autoStart"), false, String(value));
+    // A higher or lower layer does not hide the violation.
+    assert.deepEqual(violationsOf(project, { global: ok({ autoStart: true }) }), [violation], String(value));
+    assert.deepEqual(violationsOf(project, { env: { [AUTO_START_ENV]: "true" } }), [violation], String(value));
+  }
+  const withGlobal = resolved({ global: ok({ autoStart: true }), project: ok({ autoStart: false }) }).prepared;
+  assert.equal(withGlobal.sources.get("autoStart")?.label, "global file", "the project value never wins");
+});
+
+test("autoStart in a project file that fails the boolean check is an ordinary project file error, not a violation", () => {
+  assert.deepEqual(refused({ project: ok({ autoStart: "yes" }) }), [`autoStart (${PROJECT}): "yes" must be true or false`]);
 });

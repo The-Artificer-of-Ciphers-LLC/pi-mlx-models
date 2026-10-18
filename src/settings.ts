@@ -2130,3 +2130,10 @@ export function formatProjectRefusal(violations: readonly ProjectViolation[], gl
     footer,
   ].join("\n");
 }
+
+/** Placeholder for the test-first step of plan 06-01; the real body follows in the next commit. */
+export function isAutoStartRequested(global: LayerFile, env: Record<string, string | undefined>): boolean {
+  void global;
+  void env;
+  throw new Error("not implemented");
+}
