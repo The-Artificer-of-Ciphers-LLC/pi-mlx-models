@@ -101,6 +101,24 @@ function shownValue(value: unknown): string {
   }
 }
 
+/** The most lines of a result the next menu title carries, so a long refusal cannot make the menu taller than the screen. */
+export const CARRY_MAX_LINES = 6;
+/** The most characters of a result the next menu title carries. */
+export const CARRY_MAX_CHARS = 500;
+
+/**
+ * A notice as the title of the next menu carries it: the first lines, cut to a length, with "..." when anything was left
+ * out. The message was built from `shown(...)` parts, so it is already cleaned and has credentials hidden; it is not
+ * redacted again, because redaction works by position over a whole text. clipDiagnostic still replaces control characters.
+ */
+function carriedCopy(message: string): string {
+  const lines = message.split("\n");
+  const kept = lines.slice(0, CARRY_MAX_LINES).join("\n");
+  const clipped = clipDiagnostic(kept, CARRY_MAX_CHARS, "start");
+  const cut = lines.length > CARRY_MAX_LINES || kept.trim().length > CARRY_MAX_CHARS;
+  return cut ? `${clipped}...` : clipped;
+}
+
 /** The result of one flow: go back to the top menu, or end the menu (the file cannot be used). */
 type Flow = "menu" | "end";
 
@@ -155,6 +173,23 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     return;
   }
 
+  /** The last result of an action, waiting for the title of the next menu; shown once. */
+  let pendingResult: string | undefined;
+
+  /** Tell the user what happened: notify with the message as it is, and remember a bounded copy for the next menu title. */
+  function report(message: string, type: "info" | "warning" | "error" = "info"): void {
+    dialogs.notify(message, type);
+    pendingResult = carriedCopy(message);
+  }
+
+  /** The title with the last result above it, once; the result is cleared. Without a result the title is unchanged. */
+  function titled(title: string): string {
+    if (pendingResult === undefined) return title;
+    const carried = pendingResult;
+    pendingResult = undefined;
+    return `Last result: ${carried}\n\n${title}`;
+  }
+
   /** The index of the chosen option, or undefined for a dismissal or an answer that is not one of the options. */
   async function pick(title: string, choices: string[]): Promise<number | undefined> {
     const answer = await dialogs.select(title, choices);
@@ -173,16 +208,16 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   function write(change: (draft: ConfigTree) => ConfigTree, saved: string, unchanged: string): Written {
     const outcome: EditOutcome = editConfig(path, change);
     if (!outcome.ok) {
-      dialogs.notify(`Not saved: ${outcome.message}`, "error");
+      report(`Not saved: ${outcome.message}`, "error");
       return outcome.kind === "unreadable" ? "end" : "refused";
     }
     if (!outcome.changed) {
-      dialogs.notify(`Nothing changed: ${unchanged}`, "info");
+      report(`Nothing changed: ${unchanged}`, "info");
       return "unchanged";
     }
     const created = outcome.created ? ` The config file ${shown(path, 200)} was created.` : "";
     const running = options.serverRunning ? " A server is running: run /mlx-restart to apply it." : "";
-    dialogs.notify(`${saved} The change takes effect on the next /mlx-start.${running}${created}`, "info");
+    report(`${saved} The change takes effect on the next /mlx-start.${running}${created}`, "info");
     return "saved";
   }
 
@@ -426,7 +461,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
 
   for (let round = 0; round < MAX_MENU_ROUNDS; round += 1) {
     const entries = [MENU.view, MENU.general, MENU.modelBlock, MENU.modelEntry, MENU.profiles, MENU.defaultProfile, MENU.deleteEntry, MENU.done];
-    const chosen = await pick(MENU_TITLE, entries);
+    const chosen = await pick(titled(MENU_TITLE), entries);
     if (chosen === undefined || entries[chosen] === MENU.done) return;
     let flow: Flow = "menu";
     switch (entries[chosen]) {
