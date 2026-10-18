@@ -16,7 +16,16 @@ import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { discoverModelIds } from "./discovery.js";
 import { createFlagProbe, partitionFlags, skippedNotice, type ProbeResult, type VersionResult } from "./flagprobe.js";
 import { MODEL_PRESETS, resolveModel, type ModelPreset } from "./presets.js";
-import { createModelConfigReader, describeModel, deriveModelInfo, fallbackNotice, type ModelConfigRead, type ModelInfo, type ReadModelConfig } from "./modelinfo.js";
+import {
+  createModelConfigReader,
+  describeModel,
+  deriveModelInfo,
+  extrasFallbackNotice,
+  fallbackNotice,
+  type ModelConfigRead,
+  type ModelInfo,
+  type ReadModelConfig,
+} from "./modelinfo.js";
 import { createProgress, type Progress } from "./progress.js";
 import { applyRequestOverrides, type ActiveLaunch } from "./request.js";
 import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
@@ -288,8 +297,17 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
    * earlier list; pi's unregisterProvider is never used, so a stop or a shutdown registers an empty list instead.
    * A user of an external server (PI_MLX_MODELS_BASE_URL) has no loaded model and so sees no models until
    * `provider.listAllModels` is true.
+   *
+   * Every listed model other than the loaded one gets metadata from a local-only read of its `config.json` (the Hub is never
+   * asked for these), with the fallback where there is none. Those that fell back are reported by one warning that gives
+   * their count and the first reason, never an id, and only when the caller has a command context (`ctx`). `launching` names
+   * a model whose start is under way: it is neither read nor counted, because its own read comes after the launch. `abandon`
+   * lets a start that was stopped or superseded during the reads drop the registration.
    */
-  async function registerProvider(pi: PiHost, options?: { includeFallback?: boolean }) {
+  async function registerProvider(
+    pi: PiHost,
+    options?: { includeFallback?: boolean; ctx?: any; launching?: string; abandon?: () => boolean },
+  ) {
     const includeFallback = options?.includeFallback ?? false;
     let modelIds: string[];
     if (listAllModels) {
@@ -299,13 +317,34 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       modelIds = loaded === null ? [] : [loaded.id];
     }
 
+    // The loaded model carries the metadata read for it; any other id the server reports is read locally, one at a time.
+    const infos = new Map<string, ModelInfo>();
+    const reasons: string[] = [];
+    for (const id of modelIds) {
+      if (loaded !== null && loaded.id === id) {
+        infos.set(id, loaded.info);
+        continue;
+      }
+      if (id === options?.launching) continue;
+      let read: ModelConfigRead;
+      try {
+        read = await deps.readModelConfig(id, { hub: false });
+      } catch {
+        read = { ok: false, reason: "the model reader failed" };
+      }
+      const info = deriveModelInfo({ id, config: read });
+      infos.set(id, info);
+      if (info.fallbackReason !== undefined) reasons.push(info.fallbackReason);
+    }
+    if (options?.abandon?.() === true) return;
+    if (options?.ctx !== undefined && reasons.length > 0) showConfigWarnings(options.ctx, [extrasFallbackNotice(reasons.length, reasons[0] ?? "")]);
+
     pi.registerProvider(PROVIDER_ID, {
       name: "PI MLX Models",
       baseUrl: activeBaseUrl,
       apiKey: "DUMMY",
       api: "openai-completions",
-      // The loaded model carries the metadata read for it; any other id the server reports gets the defaults.
-      models: asProviderModels(modelIds, (id) => (loaded !== null && loaded.id === id ? loaded.info : deriveModelInfo({ id }))),
+      models: asProviderModels(modelIds, (id) => infos.get(id) ?? deriveModelInfo({ id })),
     });
   }
 
@@ -405,7 +444,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     const { modelId: model, presetKey } = launch.model;
     activeBaseUrl = launch.baseUrl;
     listAllModels = listAll;
-    await registerProvider(pi, { includeFallback: false });
+    await registerProvider(pi, { includeFallback: false, ctx, launching: model, abandon: isStale });
     if (isStale()) return;
 
     const progress = newProgress(ctx, `MLX start progress (${model})`, [
@@ -545,7 +584,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       // The local value, never the closure's, after an await.
       const info = deriveModelInfo({ id: model, config: read });
       loaded = { id: model, info };
-      await registerProvider(pi, { includeFallback: true });
+      await registerProvider(pi, { includeFallback: true, ctx, abandon: isStale });
       if (isStale()) return;
       // A window that could not be read is registered as the fallback and said so once per model and reason (D-03). The
       // once-per-text set means "once per model id and reason" for the life of this extension instance.
@@ -729,7 +768,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       description: "Stop local MLX server",
       handler: async (_args, ctx) => {
         await stopServer(ctx);
-        await registerProvider(pi, { includeFallback: false });
+        await registerProvider(pi, { includeFallback: false, ctx });
         ctx.ui.notify("MLX server stopped.", "info");
       },
     });

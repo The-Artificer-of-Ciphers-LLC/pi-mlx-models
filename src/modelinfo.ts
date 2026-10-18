@@ -427,6 +427,9 @@ export function fallbackNotice(id: string, reason: string): string {
  * The one warning for the other listed models whose context window could not be read: how many, and the first reason, never
  * an id (D-12, D-03, T-05-10).
  */
-export function extrasFallbackNotice(_count: number, _reason: string): string {
-  return "";
+export function extrasFallbackNotice(count: number, reason: string): string {
+  return (
+    `context window unavailable for ${count} other listed model${count === 1 ? "" : "s"} (${safe(reason, 160)}); ` +
+    `using ${FALLBACK_CONTEXT_WINDOW} for ${count === 1 ? "it" : "them"}`
+  );
 }
