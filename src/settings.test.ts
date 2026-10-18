@@ -4037,3 +4037,72 @@ test("provider.listAllModels: the project file beats the global file in both dir
   assert.equal(resolved({ global: globalTrue, project: ok({ provider: { listAllModels: false } }) }).prepared.listAllModels, false);
   assert.equal(resolved({ global: globalFalse, project: ok({ provider: { listAllModels: true } }) }).prepared.listAllModels, true);
 });
+
+test("provider.listAllModels refuses a value that is not true or false with one line naming the key, the file and the allowed values", () => {
+  for (const [value, shown] of [
+    ["yes", '"yes"'],
+    [1, "1"],
+    [null, "null"],
+    ["true", '"true"'],
+  ] as const) {
+    assert.deepEqual(refused({ global: ok({ provider: { listAllModels: value } }) }), [
+      `provider.listAllModels (${GLOBAL}): ${shown} must be true or false`,
+    ]);
+  }
+});
+
+test("provider.listAllModels has no environment variable, flag, pi flag, init flag, server flag or request field", () => {
+  const row = SETTINGS.find((candidate) => candidate.path === "provider.listAllModels");
+  assert.ok(row, "the row exists");
+  assert.equal(row.kind, "bool");
+  for (const field of ["env", "cli", "initCli", "piFlag", "mlxFlag", "requestField", "default", "bare"] as const) {
+    assert.equal(row[field], undefined, field);
+  }
+  assert.deepEqual(row.emit(true), []);
+  assert.ok(!cliFlagSpecs().some((spec) => spec.path === "provider.listAllModels"));
+  assert.ok(!initFlagSpecs().some((spec) => spec.path === "provider.listAllModels"));
+  assert.ok(!PI_FLAGS.some((flag) => flag.path === "provider.listAllModels"));
+  const env = {
+    PI_MLX_MODELS_LIST_ALL_MODELS: "true",
+    PI_MLX_MODELS_LIST_ALL: "true",
+    PI_MLX_MODELS_PROVIDER_LIST_ALL_MODELS: "true",
+  };
+  const typed = resolved({
+    env,
+    args: { "provider.listAllModels": "true" },
+    piFlags: { "mlx-list-all-models": "true" },
+  });
+  assert.equal(typed.prepared.listAllModels, false);
+  assert.deepEqual(typed.warnings, []);
+  assert.deepEqual(extraOf({ global: ok({ provider: { listAllModels: true } }) }), [], "the key never reaches argv");
+});
+
+test("a project file with provider.listAllModels true is not a project violation and refuses nothing", () => {
+  const { prepared } = resolved({ project: ok({ provider: { listAllModels: true } }) });
+  assert.equal(prepared.listAllModels, true);
+  assert.deepEqual(prepared.projectViolations, []);
+});
+
+test("a mistyped provider key names provider.listAllModels, and the key written at the top level points into the provider block", () => {
+  assert.deepEqual(refused({ global: ok({ provider: { listAllModel: true } }) }), [
+    `provider.listAllModel (${GLOBAL}): unknown key (did you mean provider.listAllModels?)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ listAllModels: true }) }), [
+    `listAllModels (${GLOBAL}): unknown key (did you mean provider.listAllModels?)`,
+  ]);
+});
+
+test("a provider value that is not an object is the usual one-line object refusal", () => {
+  assert.deepEqual(refused({ global: ok({ provider: 5 }) }), [`provider (${GLOBAL}): 5 must be a JSON object`]);
+});
+
+test("provider.listAllModels names the layer that set it in the sources", () => {
+  const fromGlobal = resolved({ global: ok({ provider: { listAllModels: true } }) }).prepared;
+  assert.equal(fromGlobal.sources.get("provider.listAllModels")?.label, "global file");
+  const fromProject = resolved({
+    global: ok({ provider: { listAllModels: true } }),
+    project: ok({ provider: { listAllModels: false } }),
+  }).prepared;
+  assert.equal(fromProject.sources.get("provider.listAllModels")?.label, "project file");
+  assert.equal(resolved().prepared.sources.has("provider.listAllModels"), false);
+});

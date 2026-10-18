@@ -131,6 +131,8 @@ async function setup(
   let probeCalls = 0;
   /** How many times the extension asked which mlx-lm version is installed. */
   let installedCalls = 0;
+  /** How many times the extension asked the server which models it reports. */
+  let discoveryCalls = 0;
   const fakePi = makeFakePi();
   const fakeCtx = makeCtx(options.select, options.ctx);
   const extension = createExtension({
@@ -139,7 +141,10 @@ async function setup(
       installCalls.push(opts);
       await options.ensureInstalled?.(opts);
     }) as any,
-    discoverModelIds: async () => options.discovered ?? [],
+    discoverModelIds: async () => {
+      discoveryCalls += 1;
+      return options.discovered ?? [];
+    },
     settings: options.settings ?? freshSettings(options.env ?? {}),
     probeFlags: async () => {
       probeCalls += 1;
@@ -163,10 +168,13 @@ async function setup(
     get installedCalls() {
       return installedCalls;
     },
+    get discoveryCalls() {
+      return discoveryCalls;
+    },
   };
 }
 
-const errors = (notes: Note[]) => notes.filter((n) => n.type === "error").map((n) => n.message);
+const errors =(notes: Note[]) => notes.filter((n) => n.type === "error").map((n) => n.message);
 
 test("the extension registers mlx-init, mlx-start and mlx-stop, a session_shutdown handler and one initial provider", async () => {
   const { commands, handlers, providerCalls } = await setup();
@@ -3491,4 +3499,99 @@ test("with provider.listAllModels true in the global file a start registers ever
   await commands.get("mlx-start")!("qwen3_4b", ctx);
 
   assert.deepEqual(modelIdsOf(providerCalls.at(-1)), [MODEL_PRESETS[3].modelId, "org/a", "org/b"]);
+});
+
+test("by default the model discovery is never asked: not at load, not for a start, not for a stop and not at shutdown", async () => {
+  const h = await setup({ discovered: [QWEN.modelId, "org/a", "org/b"], sleep: never });
+  assert.equal(h.discoveryCalls, 0, "after the load-time registration");
+
+  await startMlx(h, "qwen3_4b");
+  assert.equal(h.discoveryCalls, 0, "after a start");
+
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  assert.equal(h.discoveryCalls, 0, "after /mlx-stop");
+
+  await h.handlers.get("session_shutdown")!();
+  assert.equal(h.discoveryCalls, 0, "after session_shutdown");
+});
+
+test("by default nothing is listed before a start, and a start registers twice: an empty list before it, the launched model after ready", async () => {
+  const h = await setup({ discovered: [QWEN.modelId, "org/a"] });
+
+  assert.deepEqual(h.providerCalls.map(modelIdsOf), [[]], "the load-time registration lists nothing although the server reports models");
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.providerCalls.map(modelIdsOf), [[], [], [QWEN.modelId]]);
+});
+
+test("provider.listAllModels true in the global file is honoured at load, and a stop registers whatever discovery reports then", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { provider: { listAllModels: true } });
+  const options = { settings, discovered: [QWEN.modelId, "org/a"], sleep: never };
+  const h = await setup(options);
+
+  assert.deepEqual(modelIdsOf(h.providerCalls[0]), [QWEN.modelId, "org/a"], "the load-time list is the discovery result");
+
+  options.discovered = ["org/c"];
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), ["org/c"]);
+
+  options.discovered = [];
+  await h.handlers.get("session_shutdown")!();
+  assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), []);
+});
+
+test("in the all-models list a discovered id with control characters keeps its id and gets a clean display name", async () => {
+  const hostile = "org/model\u001b]0;pwned\u0007\u009b31m";
+  const settings = freshSettings({});
+  writeGlobal(settings, { provider: { listAllModels: true } });
+  const { providerCalls } = await setup({ settings, discovered: [hostile] });
+
+  const [model] = providerCalls[0].config.models as Array<{ id: string; name: string }>;
+
+  assert.equal(model.id, hostile);
+  assert.doesNotMatch(model.name, /[\u0000-\u001f\u007f-\u009f]/);
+  assert.match(model.name, /^org\/model/);
+});
+
+test("with provider.listAllModels true and nothing discovered the list is empty before a start and the launched model after ready", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { provider: { listAllModels: true } });
+  const h = await setup({ settings, discovered: [] });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(h.providerCalls.map(modelIdsOf), [[], [], [QWEN.modelId]]);
+});
+
+test("a project file holding provider.listAllModels true is honoured by the start that reads it, with no refusal", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { provider: { listAllModels: true } });
+  const h = await setup({ ctx: { cwd }, discovered: [QWEN.modelId, "org/a"] });
+  assert.deepEqual(modelIdsOf(h.providerCalls[0]), [], "the project file is not read at load");
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), [QWEN.modelId, "org/a"]);
+});
+
+test("by default a stop and a shutdown register an empty list, a new start replaces the old list, and pi's unregisterProvider is not needed", async () => {
+  const h = await setup({ discovered: [QWEN.modelId, "org/a"], sleep: never });
+  assert.ok(!("unregisterProvider" in h.pi), "premise: the fake pi has no unregisterProvider");
+
+  await startMlx(h, "qwen3_4b");
+  assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), [QWEN.modelId]);
+
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), []);
+
+  await startMlx(h, QWEN.key);
+  await startMlx(h, OTHER_PRESET.key);
+  assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), [OTHER_PRESET.modelId], "the second start replaces the first list");
+
+  await h.handlers.get("session_shutdown")!();
+  assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), []);
+  assert.deepEqual(errors(h.notes), []);
 });
