@@ -30,7 +30,7 @@ import {
 import { createProgress, type Progress } from "./progress.js";
 import { applyRequestOverrides, type ActiveLaunch } from "./request.js";
 import { ensureInstalled, type InstallPolicy, type RuntimeEvent } from "./runtime.js";
-import { createMlxServer, type MlxServer } from "./server.js";
+import { createMlxServer, type MlxServer, type ServerAddress } from "./server.js";
 import {
   PI_FLAGS,
   PROFILE_FLAG_SPEC,
@@ -57,17 +57,21 @@ import {
 } from "./settings.js";
 import { lastLaunchPath, readLastLaunch, writeLastLaunch } from "./laststate.js";
 import { parseStartArgs, type CliFlagValue } from "./startargs.js";
+import { classifyHealth, createHealthProbe, formatStatus, type ProbeHealth, type SessionState, type StatusView } from "./status.js";
 
 const PROGRESS_WIDGET = "mlx-progress";
 
 /** The commands that start a model, as their names without the slash. A closed set of constants: no user text becomes one (T-06-05). */
 type LaunchCommand = "mlx-start" | "mlx-last" | "mlx-restart";
 
+/** Every command whose failures and refusals are worded by `failed`: the launch commands and the read-only ones. Constants only. */
+type CommandName = LaunchCommand | "mlx-status";
+
 /** The text of a refused or failed launch of `command`. The only place a command name is joined to a failure message. */
-const failed = (command: LaunchCommand, text: string): string => `${command} failed: ${text}`;
+const failed = (command: CommandName, text: string): string => `${command} failed: ${text}`;
 
 /** The text of a launch of `command` the user declined. The only place a command name is joined to a cancel message. */
-const cancelled = (command: LaunchCommand, text: string): string => `${command} cancelled: ${text}`;
+const cancelled = (command: CommandName, text: string): string => `${command} cancelled: ${text}`;
 
 /** What one launch needs to know about the command that asked for it. */
 interface LaunchRun {
@@ -84,6 +88,29 @@ const SLASH_FORM: Record<LaunchCommand, "/mlx-start" | "/mlx-last" | "/mlx-resta
   "mlx-last": "/mlx-last",
   "mlx-restart": "/mlx-restart",
 };
+
+/**
+ * What this session knows about the launch it made, kept in memory from the moment a start begins until its server ends
+ * (D-10, D-11). The profile, flags and request lines are the strings the start message showed; /mlx-status repeats them and
+ * derives nothing again. Separate from `active` (the request rewrite) and `loaded` (the model information) because each of
+ * those is cleared and set on its own schedule.
+ */
+interface LaunchRecord {
+  /** The start epoch of the start that made it: a stale start never touches a newer record. */
+  epoch: number;
+  modelId: string;
+  presetKey?: string;
+  /** The selection handed to `buildLaunch`; absent when none was typed or kept, so `defaultProfile` decided. A restart replays it. */
+  profile?: string;
+  command: LaunchCommand;
+  address: ServerAddress;
+  baseUrl: string;
+  profileLine: string;
+  flagsLine: string;
+  requestLine: string;
+  /** True once the model information is stored; until then /mlx-status says loading. */
+  ready: boolean;
+}
 
 /**
  * Shown once per session when a request for this provider's launched model has a payload the rewrite cannot read (D-11).
@@ -150,6 +177,8 @@ export interface ExtensionDeps {
   probeFlags: () => Promise<ProbeResult>;
   /** Asks the installed mlx-lm for its version only (cheap, no mlx import); used when an exact pin is configured. */
   installedVersion: () => Promise<VersionResult>;
+  /** The probe /mlx-status uses: whether a connect to the address is accepted and, if so, whether /v1/models answers. */
+  probeHealth: ProbeHealth;
   /** How long session_shutdown waits for the server to stop before letting pi exit. */
   shutdownWaitMs: number;
   sleep: (ms: number) => Promise<void>;
@@ -221,6 +250,7 @@ function withDefaults(overrides: Partial<ExtensionDeps>): ExtensionDeps {
     settings: overrides.settings ?? { env: process.env, globalConfigPath: GLOBAL_CONFIG_PATH, home: homedir() },
     probeFlags: overrides.probeFlags ?? probe.probe,
     installedVersion: overrides.installedVersion ?? probe.installedVersion,
+    probeHealth: overrides.probeHealth ?? createHealthProbe(),
     shutdownWaitMs: overrides.shutdownWaitMs ?? 5000,
     sleep: overrides.sleep ?? unrefSleep,
   };
@@ -242,6 +272,13 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
    * start, while one is under way and after a stop.
    */
   let loaded: { id: string; info: ModelInfo } | null = null;
+  /**
+   * The launch of this session as /mlx-status reports it: created at the top of a start, replaced by a newer start, and
+   * cleared by /mlx-stop, session shutdown, the server exiting and a failed start (D-10, D-11).
+   */
+  let launchRecord: LaunchRecord | null = null;
+  /** The record of the start with this epoch, or null when it was cleared or a newer start replaced it. */
+  const recordOf = (epoch: number): LaunchRecord | null => (launchRecord !== null && launchRecord.epoch === epoch ? launchRecord : null);
   /** Config warnings already shown, so each distinct text appears once per extension instance. */
   const shownWarnings = new Set<string>();
   /** Whether the bad-payload notice has been shown in this extension instance (D-11). */
@@ -477,6 +514,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     cancelStarts(); // cancels an in-flight start or init, including one still waiting on the installer
     active = null; // the values end with the launch (D-12)
     loaded = null;
+    launchRecord = null;
     activeProgress?.clear();
     activeProgress = null;
     await server.stop();
@@ -589,6 +627,21 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     active = null;
     loaded = null;
     const { modelId: model, presetKey } = launch.model;
+    // The record exists from the first moment of the start; the flags line is replaced once the skipped set is known, and
+    // `ready` is set where the model information is stored.
+    launchRecord = {
+      epoch: mine,
+      modelId: model,
+      ...(presetKey === undefined ? {} : { presetKey }),
+      ...(run.profile === undefined ? {} : { profile: run.profile }),
+      command: run.command,
+      address: launch.address,
+      baseUrl: launch.baseUrl,
+      profileLine: describeProfile(launch),
+      flagsLine: describeFlags(launch),
+      requestLine: describeRequest(launch),
+      ready: false,
+    };
     activeBaseUrl = launch.baseUrl;
     listAllModels = listAll;
     await registerProvider(pi, { includeFallback: false, ctx, launching: model, abandon: isStale });
@@ -662,6 +715,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       const profileLine = describeProfile(launch);
       const flagsLine = describeFlags(launch, skipped);
       const requestLine = describeRequest(launch);
+      const own = recordOf(mine);
+      if (own !== null) own.flagsLine = flagsLine; // the line the start shows, skipped marks included
       ctx.ui.notify(
         `Starting MLX server with ${model}${presetKey ? ` (preset: ${presetKey})` : ""}...${profileLine ? `\n${profileLine}` : ""}${flagsLine ? `\n${flagsLine}` : ""}${requestLine ? `\n${requestLine}` : ""}`,
         "info",
@@ -711,6 +766,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
             serverExited = true;
             active = null; // a dead server's values must never apply to a later server on the same port (A7)
             loaded = null;
+            if (recordOf(mine) !== null) launchRecord = null;
             progress.stop();
             ctx.ui.setStatus(PROVIDER_ID, "mlx: stopped");
             break;
@@ -744,6 +800,8 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       // The local value, never the closure's, after an await.
       const info = deriveModelInfo({ id: model, ...(read === undefined ? {} : { config: read }), limits: launch.limits });
       loaded = { id: model, info };
+      const stored = recordOf(mine);
+      if (stored !== null) stored.ready = true;
       await registerProvider(pi, { includeFallback: true, ctx, abandon: isAbandoned });
       if (isAbandoned()) return;
       // A window that could not be read is registered as the fallback and said so once per model and reason (D-03). The
@@ -770,6 +828,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     } catch (e) {
       // /mlx-stop or a newer /mlx-start took over; their UI state wins.
       if (isStale()) return;
+      if (recordOf(mine) !== null) launchRecord = null;
       progress.stop();
       // stop() only halts the animation; replace the last frame it drew so it cannot linger.
       ctx.ui.setStatus(PROVIDER_ID, "mlx: failed");
@@ -934,6 +993,74 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       },
     });
 
+    pi.registerCommand("mlx-status", {
+      description: "Show the MLX server: model, profile, port, flags in effect and health (down, loading, ready)",
+      handler: async (args, ctx) => {
+        // No arguments: nothing typed here can choose an address or a setting.
+        const parsed = parseStartArgs(args ?? "", [], { command: "/mlx-status", takesModel: false });
+        if (!parsed.ok) {
+          ctx.ui.notify(failed("mlx-status", parsed.error), "error");
+          return;
+        }
+        const snapshot = launchRecord;
+        let address: ServerAddress;
+        let baseUrl: string;
+        if (snapshot !== null) {
+          ({ address, baseUrl } = snapshot);
+        } else {
+          // No launch of this session: look where the configuration says a server would be, read now. The refusals are the
+          // launch commands' own and come before any connection, so a cloned project cannot choose where this connects (T-06-28).
+          const piFlags: Record<string, string> = {};
+          for (const flag of PI_FLAGS) {
+            const value = flag.path === undefined ? undefined : pi.getFlag(flag.name);
+            if (typeof value === "string") piFlags[flag.name] = value;
+          }
+          const result = prepareSettings({
+            global: readLayerFile(deps.settings.globalConfigPath),
+            project: readLayerFile(join(workingDirectory(ctx), PROJECT_CONFIG_RELPATH)),
+            env: deps.settings.env,
+            piFlags,
+            ignoreInstall: true,
+          });
+          showConfigWarnings(ctx, result.warnings);
+          if (!result.ok) {
+            ctx.ui.notify(failed("mlx-status", formatConfigErrors(result.errors)), "error");
+            return;
+          }
+          if (result.prepared.projectViolations.length > 0) {
+            ctx.ui.notify(failed("mlx-status", formatProjectRefusal(result.prepared.projectViolations, deps.settings.globalConfigPath)), "error");
+            return;
+          }
+          ({ address, baseUrl } = result.prepared);
+        }
+
+        const probe = await deps.probeHealth(address, baseUrl);
+        // Health is observed, never stored. A record that was cleared or replaced during the probe no longer describes it.
+        const record = snapshot !== null && recordOf(snapshot.epoch) !== null ? snapshot : null;
+        const session: SessionState = record === null ? "none" : record.ready ? "ready" : "starting";
+        const view: StatusView = {
+          health: classifyHealth(session, probe),
+          address,
+          session,
+          ...(record === null
+            ? {}
+            : {
+                launch: {
+                  modelId: record.modelId,
+                  ...(record.presetKey === undefined ? {} : { presetKey: record.presetKey }),
+                  profileLine: record.profileLine,
+                  flagsLine: record.flagsLine,
+                  requestLine: record.requestLine,
+                  // The line the start showed, from the model information the start kept; nothing is read again (D-10).
+                  ...(record.ready && loaded !== null && loaded.id === record.modelId ? { modelLine: describeModel(loaded.info) } : {}),
+                },
+              }),
+          served: probe.models.answers ? probe.models.ids : [],
+        };
+        ctx.ui.notify(formatStatus(view), "info");
+      },
+    });
+
     pi.registerCommand("mlx-stop", {
       description: "Stop local MLX server",
       handler: async (_args, ctx) => {
@@ -947,6 +1074,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       cancelStarts(); // a start still waiting on the installer must not launch a server after shutdown
       active = null; // the values end with the launch, before any await (D-12)
       loaded = null;
+      launchRecord = null;
       activeProgress?.stop();
       // Wait for the child to exit so a quitting pi does not leave it holding the port, but never
       // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.
