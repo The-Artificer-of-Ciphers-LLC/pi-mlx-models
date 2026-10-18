@@ -12,6 +12,7 @@ import {
   editableKeys,
   getAt,
   isPlausibleModelKey,
+  modelEntrySummary,
   modelKeys,
   profileNames,
   renderConfig,
@@ -623,4 +624,26 @@ test("configedit the validateModelKey comment tells the truth: it names isPlausi
   const block = text.slice(start, end);
   assert.ok(block.includes("isPlausibleModelKey"), block);
   assert.equal(block.includes("rule the settings module puts on a model id"), false, block);
+});
+
+test("modelEntrySummary: the sorted profile names, option keys and default profile of one entry; anything else is the empty summary", () => {
+  const tree: ConfigTree = {
+    models: { m: { numDraftTokens: 2, sampling: { temperature: 0.2 }, defaultProfile: "fast", profiles: { slow: {}, fast: {} } }, shell: { profiles: {} }, five: 5 },
+  };
+  assert.deepEqual(modelEntrySummary(tree, "m"), { profiles: ["fast", "slow"], options: ["numDraftTokens", "sampling"], defaultProfile: "fast" });
+  const empty = { profiles: [], options: [], defaultProfile: undefined };
+  assert.deepEqual(modelEntrySummary(tree, "shell"), empty);
+  for (const key of ["missing", "toString", "__proto__", "five"]) assert.deepEqual(modelEntrySummary(tree, key), empty, key);
+});
+
+// The editing core builds objects without a prototype; JSON turns them into plain objects for the comparison.
+const plain = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
+
+test("unsetAt keeps an emptied container: removing the last key of a profile leaves the profile, and the input is not changed", () => {
+  const flat: ConfigTree = { a: { b: 1 } };
+  assert.deepEqual(plain(unsetAt(flat, ["a", "b"])), { a: {} });
+  assert.deepEqual(flat, { a: { b: 1 } });
+  const tree: ConfigTree = { models: { m: { profiles: { p: {} } } } };
+  assert.deepEqual(plain(unsetAt(tree, ["models", "m", "profiles", "p"])), { models: { m: { profiles: {} } } });
+  assert.deepEqual(tree, { models: { m: { profiles: { p: {} } } } });
 });

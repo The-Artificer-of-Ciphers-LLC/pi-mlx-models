@@ -430,6 +430,93 @@ test("configmenu delete a model entry: the empty entry left by deleting its last
   s.assertScriptsUsed();
 });
 
+test("configmenu delete a model entry names what is lost: the profiles, the options and the default profile are listed, and a shell says nothing is lost", async (t) => {
+  const start = { models: { qwen3_4b: { numDraftTokens: 2, defaultProfile: "fast", profiles: { fast: {}, slow: {} } }, other: {} } };
+  const s = session(t, { file: start, confirm: true, select: [MENU.deleteEntry, "qwen3_4b", MENU.done] });
+  await s.run();
+  assert.equal(s.confirms.length, 1);
+  assert.ok(s.confirms[0].title.includes("qwen3_4b"), s.confirms[0].title);
+  for (const part of ["fast", "slow", "numDraftTokens", "defaultProfile"]) assert.ok(s.confirms[0].message.includes(part), `${part}: ${s.confirms[0].message}`);
+  assert.deepEqual(s.json(), { models: { other: {} } });
+  s.assertScriptsUsed();
+
+  const shell = session(t, { file: { models: { careful: { profiles: {} } } }, confirm: true, select: [MENU.deleteEntry, "careful", MENU.done] });
+  await shell.run();
+  assert.equal(shell.confirms.length, 1);
+  assert.match(shell.confirms[0].message, /holds nothing/);
+  assert.match(shell.confirms[0].message, /no setting is lost/);
+  assert.doesNotMatch(shell.confirms[0].message, /profile/i);
+  assert.deepEqual(shell.json(), { models: {} });
+  shell.assertScriptsUsed();
+});
+
+test("configmenu delete a model entry declined: a no, an undefined and a throw leave the file byte for byte and the menu goes on", async (t) => {
+  const start = { models: { careful: { numDraftTokens: 2, profiles: { fast: {} } } } };
+  const answers: Array<[string, Partial<ConfigMenuUi>]> = [
+    ["no", { confirm: async () => false }],
+    ["undefined", { confirm: async () => undefined as unknown as boolean }],
+    ["throw", { confirm: async () => { throw new Error("dialog failed"); } }],
+  ];
+  for (const [answer, ui] of answers) {
+    const s = session(t, { file: start, select: [MENU.deleteEntry, "careful", MENU.done], ui });
+    await s.run();
+    assert.equal(s.text(), pretty(start), answer);
+    s.assertScriptsUsed();
+    if (answer === "no") assert.ok(s.notes.some((note) => note.type === "info" && /Nothing was deleted/.test(note.message)), JSON.stringify(s.notes));
+  }
+  const plain = session(t, { file: start, confirm: false, select: [MENU.deleteEntry, "careful", MENU.done] });
+  await plain.run();
+  assert.equal(plain.text(), pretty(start));
+  assert.equal(plain.confirms.length, 1);
+  assert.ok(plain.notes.some((note) => note.type === "info" && /Nothing was deleted/.test(note.message)), JSON.stringify(plain.notes));
+  plain.assertScriptsUsed();
+
+  const dismissed = session(t, { file: start, select: [MENU.deleteEntry, undefined, MENU.done] });
+  await dismissed.run();
+  assert.equal(dismissed.text(), pretty(start));
+  assert.equal(dismissed.confirms.length, 0);
+  dismissed.assertScriptsUsed();
+});
+
+test("configmenu delete a model entry with nothing to delete: no model entries open no dialog, and an unreadable file is reported and ends the menu", async (t) => {
+  for (const file of [undefined, {}, { server: { port: 8081 } }, { models: {} }]) {
+    const s = session(t, { file, select: [MENU.deleteEntry, MENU.done] });
+    await s.run();
+    assert.equal(s.confirms.length, 0);
+    assert.equal(s.prompts.filter((prompt) => prompt.kind === "select").length, 2, "only the top menu was shown, twice");
+    if (file === undefined) assert.equal(existsSync(s.path), false);
+    else assert.equal(s.text(), pretty(file));
+    assert.ok(s.notes.some((note) => note.type === "info" && /no model/i.test(note.message)), JSON.stringify(s.notes));
+    s.assertScriptsUsed();
+  }
+
+  const before = "[1, 2]";
+  const unreadable = session(t, { file: before, select: [MENU.deleteEntry, MENU.done] });
+  await unreadable.run();
+  assert.equal(unreadable.text(), before);
+  assert.ok(unreadable.notes.some((note) => note.type === "error" && /not changed/.test(note.message)), JSON.stringify(unreadable.notes));
+  assert.equal(unreadable.select.remaining(), 1);
+  assert.equal(unreadable.confirms.length, 0);
+});
+
+test("configmenu delete a model entry with hostile names: keys are shown cleaned and removed exactly, and __proto__ is a plain key", async (t) => {
+  const key = "qwen\u001b[31mred";
+  const text = `{"models": {${JSON.stringify(key)}: {"numDraftTokens": 2}, "__proto__": {}}}`;
+  const s = session(t, { file: text, confirm: true, select: [MENU.deleteEntry, "qwen", MENU.deleteEntry, 0, MENU.done] });
+  await s.run();
+  const control = /[\u0000-\u001f\u007f-\u009f]/;
+  const lists = s.prompts.filter((prompt) => prompt.kind === "select" && prompt.title === "Choose the model entry to delete");
+  assert.equal(lists.length, 2);
+  for (const list of lists) assert.equal(list.options?.some((option) => control.test(option)), false, "no control character reaches a menu line");
+  assert.equal(s.confirms.length, 2);
+  for (const confirm of s.confirms) assert.equal(control.test(confirm.title) || control.test(confirm.message), false, `${confirm.title} | ${confirm.message}`);
+  assert.equal(s.notes.some((note) => control.test(note.message.replace(/\n/g, " "))), false, JSON.stringify(s.notes));
+  assert.equal(s.notes.filter((note) => note.message.startsWith("Deleted model entry")).length, 2, JSON.stringify(s.notes));
+  assert.deepEqual(s.json(), { models: {} });
+  assert.deepEqual(Object.keys(Object.prototype), []);
+  s.assertScriptsUsed();
+});
+
 test("configmenu default profile: a profile name sets it, NO_DEFAULT removes it, and a model without profiles gets a notice and no write", async (t) => {
   const profiles = { fast: {}, slow: {} };
   const set = session(t, { file: { models: { qwen3_4b: { profiles } } }, select: [MENU.defaultProfile, "qwen3_4b", "slow", MENU.done] });

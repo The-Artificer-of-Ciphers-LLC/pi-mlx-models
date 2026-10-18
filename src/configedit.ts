@@ -347,6 +347,17 @@ export function profileNames(tree: ConfigTree, model: string): string[] {
   return sortedKeys(getAt(tree, ["models", model, "profiles"]));
 }
 
+/** What deleting one model entry takes with it: the profile names, the option keys and the default profile, for the confirm text. */
+export interface ModelEntrySummary {
+  profiles: string[];
+  options: string[];
+  defaultProfile: string | undefined;
+}
+
+export function modelEntrySummary(_tree: ConfigTree, _model: string): ModelEntrySummary {
+  return { profiles: [], options: [], defaultProfile: undefined };
+}
+
 type Checked = { ok: true; value: string } | { ok: false; message: string };
 
 const MAX_MODEL_KEY_LENGTH = 4096;
