@@ -1983,3 +1983,153 @@ test("auto-start e2e: with the option off, opening pi does nothing at all", { ti
     assert.equal(readFileSync(lastRecordPath(first), "utf8"), record, "the record is as it was");
   }
 });
+
+// ---- the daily-driver loop: the five roadmap criteria of phase 6 together, over real child processes and fresh instances (plan 06-12: CMD-01 to CMD-06) ----
+
+test("daily-driver loop: configure in the menu, start, status, edit, restart, stop, then /mlx-last from a reopened pi", { timeout: 60_000 }, async (t) => {
+  const port = await freePort();
+  // One script for both /mlx-config sessions: the first adds the model entry and the profile, the second changes one value of it.
+  const select = scriptSelect(
+    MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.edit, "sampling.temperature", ACTION.set, MENU.done,
+    MENU.profiles, 0, 0, PROFILE_ACTION.edit, "sampling.temperature", ACTION.set, MENU.done,
+  );
+  const input = scriptInput("qwen3_4b", "careful", "0.2", "0.4");
+  const first = await harness(t, {}, { input }, ALL_SUPPORTED, { select });
+  first.writeConfig({ server: { port } });
+
+  // Criterion 2 (editing without leaving pi): the menu writes the global file; nothing is started by it.
+  await first.config();
+  assert.deepEqual(select.errors, [], "the script and the menu agree");
+  assert.deepEqual(JSON.parse(readFileSync(first.globalConfigPath, "utf8")), {
+    server: { port },
+    models: { qwen3_4b: { profiles: { careful: { sampling: { temperature: 0.2 } } } } },
+  });
+  assert.equal(first.children.length, 0, "the menu started nothing");
+
+  // Criterion 3 (status): a started model is ready, and the block repeats the lines the start showed.
+  await first.start("qwen3_4b --profile careful");
+  assert.deepEqual(errorNotes(first.notes), []);
+  assert.ok(first.argv().includes("--temp=0.2"), JSON.stringify(first.argv()));
+  const starting = startNotes(first.notes);
+  assert.equal(starting.length, 1);
+  const startLines = starting[0].message.split("\n").slice(1);
+  assert.ok(startLines.some((line) => line.startsWith("profile: careful")), starting[0].message);
+  const modelNote = first.notes.find((n) => n.message.startsWith("model: "));
+  assert.ok(modelNote, "the start shows a model line");
+  let before = first.notes.length;
+  await first.status();
+  let block = addedSince(first.notes, before)[0].message;
+  assert.ok(block.startsWith("status: ready"), block);
+  for (const line of startLines) assert.ok(block.includes(line), `the status block repeats "${line}": ${block}`);
+  assert.ok(block.includes(modelNote.message), `the status block repeats the model line: ${block}`);
+
+  // A second menu session edits the value while the server runs; it points to /mlx-restart and restarts nothing.
+  before = first.notes.length;
+  await first.config();
+  assert.deepEqual(select.errors, [], "the script and the menu agree");
+  assert.equal(select.remaining(), 0);
+  assert.equal(input.remaining(), 0);
+  assert.equal(
+    JSON.parse(readFileSync(first.globalConfigPath, "utf8")).models.qwen3_4b.profiles.careful.sampling.temperature,
+    0.4,
+  );
+  const saved = addedSince(first.notes, before).filter((n) => n.message.startsWith("Saved "));
+  assert.equal(saved.length, 1);
+  assert.ok(saved[0].message.includes("/mlx-restart"), saved[0].message);
+  assert.equal(first.children.length, 1, "the menu did not restart the server");
+
+  // Criterion 3 (restart): the same model and profile through the file as it is now, plus a flag for this restart only.
+  await first.restart("--log-level DEBUG");
+  assert.deepEqual(errorNotes(first.notes), []);
+  assert.equal(first.children.length, 2);
+  const restartedArgv = first.argv();
+  assert.ok(restartedArgv.includes("--temp=0.4"), JSON.stringify(restartedArgv));
+  assert.ok(restartedArgv.includes("--log-level=DEBUG"), JSON.stringify(restartedArgv));
+  before = first.notes.length;
+  await first.status();
+  block = addedSince(first.notes, before)[0].message;
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes("--log-level DEBUG"), block);
+  assert.ok(block.includes("--temp 0.4 (profile careful)"), block);
+
+  // Criterion 1 (stop, then down).
+  await first.stop();
+  assert.equal(await connectRefused(port), true, "no child answers after the stop");
+  before = first.notes.length;
+  await first.status();
+  block = addedSince(first.notes, before)[0].message;
+  assert.ok(block.startsWith("status: down"), block);
+
+  // Criterion 1 (relaunch): pi is closed and opened again; /mlx-last needs no picker, keeps the profile and drops the one-time flag.
+  rmSync(first.argvFile);
+  const second = await reopened(t, first);
+  second.ctx.ui.select = async () => {
+    throw new Error("the picker must not open");
+  };
+  await second.last();
+  assert.deepEqual(errorNotes(second.notes), []);
+  const relaunchedArgv = second.argv();
+  assert.ok(relaunchedArgv.includes("--temp=0.4"), JSON.stringify(relaunchedArgv));
+  assert.equal(relaunchedArgv.some((arg) => arg.startsWith("--log-level")), false, JSON.stringify(relaunchedArgv));
+  const relaunch = startNotes(second.notes);
+  assert.equal(relaunch.length, 1);
+  assert.ok(relaunch[0].message.includes("\nprofile: careful (previous launch)"), relaunch[0].message);
+  assert.equal(second.prompts.length, 0, "no dialog opened");
+  await second.stop();
+  assert.equal(await connectRefused(port), true, "no child answers after the last stop");
+});
+
+test("daily-driver auto-start and the empty case: nothing remembered does nothing, a remembered launch starts when asked, and not when the option is off", { timeout: 60_000 }, async (t) => {
+  const port = await freePort();
+  const fresh = await harness(t);
+  fresh.writeConfig({ server: { port }, autoStart: true });
+
+  // Criterion 4 (nothing remembered): /mlx-last says so and points to /mlx-start.
+  await fresh.last();
+  assert.deepEqual(errorNotes(fresh.notes), []);
+  assert.equal(fresh.notes.length, 1);
+  assert.equal(fresh.notes[0].type, "info");
+  assert.ok(fresh.notes[0].message.includes("/mlx-start"), fresh.notes[0].message);
+  assert.equal(fresh.children.length, 0, "no child was started");
+  // Criterion 5 (nothing remembered): even with the option on, opening pi starts nothing and says nothing.
+  const quiet = await reopenedWithRegistry(t, fresh);
+  await quiet.sessionStart();
+  assert.deepEqual(quiet.notes, []);
+  assert.equal(quiet.children.length, 0);
+  assert.equal(existsSync(quiet.argvFile), false, "no child was started");
+  assert.equal(quiet.setModelCalls.length, 0);
+
+  // A start and a stop leave the record behind.
+  await fresh.start("qwen3_4b");
+  assert.deepEqual(errorNotes(fresh.notes), []);
+  const argv = fresh.argv();
+  await fresh.stop();
+  assert.equal(await connectRefused(port), true, "premise: nothing answers on the port after the stop");
+  const record = readFileSync(lastRecordPath(fresh), "utf8");
+  rmSync(fresh.argvFile);
+
+  // Criterion 5 (option on, nothing answering): the remembered model starts in the background and the selected model is untouched.
+  const on = await reopenedWithRegistry(t, fresh);
+  await on.sessionStart();
+  assert.deepEqual(errorNotes(on.notes), []);
+  assert.deepEqual(on.argv(), argv, "the same model and the same server arguments as the first start");
+  assert.equal(on.children.length, 1);
+  assert.equal(on.setModelCalls.length, 0, "pi's selected model is not changed");
+  assert.equal(on.confirms.length, 0, "no dialog was opened");
+  assert.equal(on.prompts.length, 0, "nothing was asked");
+  assert.ok(on.notes.some((n) => n.type === "info" && n.message === READY_HINT_TEXT), "the ready message is the usual hint");
+  assert.equal(readFileSync(lastRecordPath(fresh), "utf8"), record);
+  await on.stop();
+  assert.equal(await connectRefused(port), true, "premise: stopped again");
+  rmSync(on.argvFile);
+
+  // Criterion 5 (option off): with the key removed from the file, opening pi does nothing at all.
+  fresh.writeConfig({ server: { port } });
+  const off = await reopenedWithRegistry(t, fresh);
+  await off.sessionStart();
+  assert.deepEqual(off.notes, []);
+  assert.equal(off.children.length, 0);
+  assert.equal(existsSync(off.argvFile), false, "no child was started");
+  assert.equal(off.setModelCalls.length, 0);
+  assert.equal(readFileSync(lastRecordPath(fresh), "utf8"), record);
+});
