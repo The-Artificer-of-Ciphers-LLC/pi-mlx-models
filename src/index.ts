@@ -426,7 +426,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     ctx: any,
     command: LaunchCommand,
     flags: readonly CliFlagValue[],
-    options: { readModelFlag?: boolean } = {},
+    options: { readModelFlag?: boolean; skipProjectFile?: boolean } = {},
   ): { prepared: Prepared; profile: string | undefined; modelFlag: boolean | string | undefined } | undefined {
     // An empty profile name (`--profile=` or `--profile ""`) names nothing: it is refused here, before any file is read,
     // and never falls back to the model's defaultProfile (D-02).
@@ -452,10 +452,11 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
     }
 
     // The global file and the project file (the working directory's own, never a parent's) are read on every
-    // start, so an edit needs no reload (D-04, D-05).
+    // start, so an edit needs no reload (D-04, D-05). An unattended start (auto-start) never reads the project file: a cloned
+    // repository must not steer a launch nobody asked for (WR-03), so that layer is left out and its file is not opened.
     const result = prepareSettings({
       global: readLayerFile(deps.settings.globalConfigPath),
-      project: readLayerFile(join(workingDirectory(ctx), PROJECT_CONFIG_RELPATH)),
+      ...(options.skipProjectFile === true ? {} : { project: readLayerFile(join(workingDirectory(ctx), PROJECT_CONFIG_RELPATH)) }),
       env: deps.settings.env,
       piFlags,
       args: typed,
@@ -909,7 +910,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
       return;
     }
 
-    const settings = readLaunchSettings(pi, ctx, "auto-start", [], {});
+    const settings = readLaunchSettings(pi, ctx, "auto-start", [], { skipProjectFile: true });
     if (settings === undefined) return;
     const { prepared } = settings;
 

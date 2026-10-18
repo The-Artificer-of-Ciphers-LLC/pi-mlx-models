@@ -5877,43 +5877,30 @@ test("auto-start never confirms for the user: a launch that needs a trust confir
   assertAutoStartIdle(wideHost.h);
 });
 
-test("auto-start with an invalid configuration shows one skipped notice with the usual report, and a project file asking for trustRemoteCode is refused", async () => {
+test("auto-start with an invalid configuration shows one skipped notice with the usual report", async () => {
   const invalid = await autoSetup({ global: { autoStart: true, server: { port: 99999 } } });
-  const cwd = newCwd();
-  writeProject(cwd, { server: { trustRemoteCode: true } });
-  const project = await autoSetup({ setup: { ctx: { cwd } } });
 
   await sessionStart(invalid.h);
-  await sessionStart(project.h);
 
   assert.equal(invalid.h.notes.length, 1);
   assert.equal(invalid.h.notes[0].type, "error");
   assert.ok(invalid.h.notes[0].message.startsWith("auto-start skipped: invalid configuration"), invalid.h.notes[0].message);
-  assert.equal(project.h.notes.length, 1);
-  assert.equal(project.h.notes[0].type, "error");
-  assert.ok(
-    project.h.notes[0].message.startsWith("auto-start skipped: .pi/pi-mlx-models.json cannot enable settings that run code or open the network:"),
-    project.h.notes[0].message,
-  );
   assertAutoStartIdle(invalid.h);
-  assertAutoStartIdle(project.h);
 });
 
-test("auto-start cannot be switched on by a project file, and a project value is a refusal when the option is on elsewhere", async () => {
+test("auto-start never reads the project file: a project value that /mlx-start would refuse neither stops it nor applies (WR-03)", async () => {
   const cwd = newCwd();
-  writeProject(cwd, { autoStart: true });
+  writeProject(cwd, { autoStart: true, server: { trustRemoteCode: true } });
   const off = await autoSetup({ global: {}, setup: { ctx: { cwd } } });
   const on = await autoSetup({ global: { autoStart: true }, setup: { ctx: { cwd } } });
 
   await sessionStart(off.h);
   await sessionStart(on.h);
 
-  assert.deepEqual(off.h.notes, [], "the option is off, so the project file is not even looked at");
+  assert.deepEqual(off.h.notes, [], "a project file cannot switch the option on");
   assertAutoStartIdle(off.h);
-  assert.equal(on.h.notes.length, 1);
-  assert.equal(on.h.notes[0].type, "error");
-  assert.ok(on.h.notes[0].message.startsWith("auto-start skipped: .pi/pi-mlx-models.json cannot set autoStart"), on.h.notes[0].message);
-  assertAutoStartIdle(on.h);
+  assert.deepEqual(errors(on.h.notes), [], "the project file is not read, so it cannot be refused");
+  assert.deepEqual(on.h.server.startCalls, [QWEN_ID]);
 });
 
 test("auto-start with a remembered profile the model no longer defines shows one note that lists the profiles and ends with the way to start by hand", async () => {
