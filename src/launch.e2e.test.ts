@@ -1,6 +1,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
+import { createServer, type Server } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -18,6 +19,7 @@ import {
   hfFixture,
   makeCtx,
   makeFakePi,
+  makeFakeRegistry,
   makeFakeModelConfig,
   readRequests,
   scriptInput,
@@ -90,6 +92,8 @@ async function harness(
   });
 
   let installCalls = 0;
+  /** The promises of the background work the extension hands over (auto-start), so a test can wait for them without a timer. */
+  const background: Promise<void>[] = [];
   const extension = createExtension({
     server,
     ensureInstalled: async () => {
@@ -99,6 +103,11 @@ async function harness(
     readModelConfig: extras.readModelConfig ?? makeFakeModelConfig().read,
     settings: { env, globalConfigPath, home: dir },
     probeFlags: async () => probe,
+    // The runtime precheck of auto-start: the stand-in installer always leaves a usable runtime, so the real venv is never looked at.
+    runtimeInstalled: async () => true,
+    trackBackground: (work) => {
+      background.push(work);
+    },
     shutdownWaitMs: 1000,
   });
   const fakePi = makeFakePi();
@@ -152,6 +161,16 @@ async function harness(
     restart: (input = "") => fakePi.commands.get("mlx-restart")!(input, fakeCtx.ctx),
     config: (input = "") => fakePi.commands.get("mlx-config")!(input, fakeCtx.ctx),
     stop: () => fakePi.commands.get("mlx-stop")!("", fakeCtx.ctx),
+    /**
+     * Fire pi's session_start event the way pi does and wait for the background work it started (auto-start). The handler
+     * itself returns at once; the wait is on the promises it handed to `trackBackground`, never on a timer.
+     */
+    async sessionStart(reason = "startup") {
+      const handler = fakePi.handlers.get("session_start");
+      assert.ok(handler, "the extension registers a session_start handler");
+      await handler({ type: "session_start", reason }, fakeCtx.ctx);
+      while (background.length > 0) await background.shift();
+    },
   };
 }
 
@@ -1869,4 +1888,98 @@ test("mlx-config e2e: a profile added in the menu is usable by the next /mlx-sta
   assert.equal(starting.length, 1);
   assert.ok(starting[0].message.includes("\nprofile: fast (/mlx-start)"), starting[0].message);
   await h.stop();
+});
+
+// ---- auto-start: opening pi starts the last model in the background, only when asked and only when nothing answers (plan 06-11: CMD-05) ----
+
+/** The ready message of a start that did not switch pi's model: the user picks it with /model. */
+const READY_HINT_TEXT = "MLX server is ready for prompts. Use /model and pick pi-mlx-models/...";
+
+/** A first session that starts qwen3_4b on `port` and stops, so a record exists and nothing answers any more. Returns the argv it saw. */
+async function rememberedLaunch(t: TestContext, port: number) {
+  const first = await harness(t);
+  first.writeConfig({ server: { port } });
+  await first.start("qwen3_4b");
+  assert.deepEqual(errorNotes(first.notes), []);
+  const argv = first.argv();
+  await first.stop();
+  assert.equal(await connectRefused(port), true, "premise: nothing answers on the port after the stop");
+  rmSync(first.argvFile);
+  return { first, argv, record: readFileSync(lastRecordPath(first), "utf8") };
+}
+
+/** pi opened again over the files of `earlier`, with a model registry that knows the started model so a switch would be possible. */
+const reopenedWithRegistry = (t: TestContext, earlier: { dir: string }) => {
+  const registry = makeFakeRegistry([{ provider: PROVIDER_ID, id: QWEN.modelId }]);
+  return harness(t, {}, { modelRegistry: registry.registry }, ALL_SUPPORTED, { dir: earlier.dir });
+};
+
+test("auto-start e2e: with the option on and nothing answering, opening pi starts the remembered model in the background and leaves the selected model alone", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const { first, argv, record } = await rememberedLaunch(t, port);
+  first.writeConfig({ server: { port }, autoStart: true });
+
+  const second = await reopenedWithRegistry(t, first);
+  await second.sessionStart();
+
+  assert.deepEqual(errorNotes(second.notes), []);
+  assert.deepEqual(second.argv(), argv, "the same model and the same server arguments as the first start");
+  assert.equal(second.children.length, 1, "one child was spawned");
+  assert.equal(startNotes(second.notes).length, 1, "the same start message as /mlx-start");
+  assert.ok(second.notes.some((n) => n.type === "info" && n.message === READY_HINT_TEXT), "the ready message is the usual hint");
+  assert.equal(second.setModelCalls.length, 0, "pi's selected model is not changed");
+  assert.equal(readFileSync(lastRecordPath(first), "utf8"), record, "the record still holds the model");
+  assert.equal(second.confirms.length, 0, "no dialog was opened");
+  assert.equal(second.prompts.length, 0, "nothing was asked");
+  assert.equal(await connectRefused(port), false, "the started server answers on the port");
+  await second.stop();
+});
+
+test("auto-start e2e: with something already answering on the port, opening pi starts nothing, says so once and leaves that server alone", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const { first } = await rememberedLaunch(t, port);
+  first.writeConfig({ server: { port }, autoStart: true });
+  // Somebody else's server: it answers /v1/models on the configured port.
+  const listener: Server = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(req.url === "/v1/models" ? JSON.stringify({ data: [{ id: "someone/elses-model" }] }) : "{}");
+  });
+  await new Promise<void>((resolve) => listener.listen(port, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => listener.close(() => resolve())));
+
+  const second = await reopenedWithRegistry(t, first);
+  await second.sessionStart();
+
+  assert.equal(existsSync(second.argvFile), false, "no child was started");
+  assert.equal(second.children.length, 0);
+  assert.equal(second.notes.length, 1, "exactly one notice");
+  assert.equal(second.notes[0].type, "info");
+  assert.ok(second.notes[0].message.includes("auto-start skipped"), second.notes[0].message);
+  assert.ok(second.notes[0].message.includes(String(port)), second.notes[0].message);
+  assert.equal(second.setModelCalls.length, 0);
+  assert.equal(second.confirms.length, 0);
+  assert.equal(second.installCalls, 0);
+  assert.equal(second.providerCalls.length, 1, "no provider was registered for the server that answers");
+  const res = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  assert.equal(res.status, 200, "the other server is still serving");
+  assert.deepEqual(await res.json(), { data: [{ id: "someone/elses-model" }] });
+});
+
+test("auto-start e2e: with the option off, opening pi does nothing at all", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const { first, record } = await rememberedLaunch(t, port);
+
+  for (const config of [{ server: { port } }, { server: { port }, autoStart: false }]) {
+    first.writeConfig(config);
+    const second = await reopenedWithRegistry(t, first);
+    await second.sessionStart();
+
+    assert.deepEqual(second.notes, [], `no notice with ${JSON.stringify(config)}`);
+    assert.equal(existsSync(second.argvFile), false, "no child was started");
+    assert.equal(second.children.length, 0);
+    assert.equal(second.installCalls, 0);
+    assert.equal(second.setModelCalls.length, 0);
+    assert.equal(second.providerCalls.length, 1);
+    assert.equal(readFileSync(lastRecordPath(first), "utf8"), record, "the record is as it was");
+  }
 });
