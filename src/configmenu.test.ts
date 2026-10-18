@@ -1102,6 +1102,15 @@ test("configmenu IN-01: text with an at sign that is not a URL credential is car
   assert.ok(cutChars.endsWith("..."));
 });
 
+test("configmenu 06 review IN-04: the notice of a new profile says it is already saved and stays if the user chooses Back", async (t) => {
+  const created = session(t, { file: { models: { qwen3_4b: {} } }, select: [MENU.profiles, "qwen3_4b", NEW_PROFILE, PROFILE_ACTION.back, MENU.done], input: ["fast"] });
+  await created.run();
+  assert.equal(created.notes.length, 1, JSON.stringify(created.notes));
+  assert.match(created.notes[0].message, /^Created profile fast of model qwen3_4b\. The change takes effect on the next \/mlx-start\./);
+  assert.ok(created.notes[0].message.endsWith(" The profile is already saved and stays in the file if you choose Back."), created.notes[0].message);
+  created.assertScriptsUsed();
+});
+
 test("configmenu IN-01: ctx.ui.notify receives the notice exactly as built, and the next title shows it with the status word kept and only the credential span masked", async (t) => {
   const created = session(t, {
     select: [MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.back, MENU.done],
