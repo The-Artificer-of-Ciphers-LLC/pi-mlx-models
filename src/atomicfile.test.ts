@@ -113,6 +113,19 @@ test("writeFileAtomic with followSymlink follows a relative link and a chain of 
   assert.equal(readFileSync(join(dir, "managed", "config.json"), "utf8"), "end of the chain");
 });
 
+test("writeFileAtomic with followSymlink resolves a dangling relative link against the real directory when a parent is a link", { skip: SYMLINKS }, (t) => {
+  const dir = tempDir(t);
+  mkdirSync(join(dir, "real", "dir"), { recursive: true });
+  mkdirSync(join(dir, "lex"));
+  symlinkSync(join(dir, "real", "dir"), join(dir, "lex", "cfgdir"));
+  symlinkSync(join("..", "shared", "config.json"), join(dir, "real", "dir", "config.json"));
+  mkdirSync(join(dir, "real", "shared"));
+  assert.deepEqual(writeFileAtomic(join(dir, "lex", "cfgdir", "config.json"), "behind the real directory", { followSymlink: true }), { ok: true });
+  assert.ok(lstatSync(join(dir, "real", "dir", "config.json")).isSymbolicLink(), "the link is still a link");
+  assert.equal(readFileSync(join(dir, "real", "shared", "config.json"), "utf8"), "behind the real directory");
+  assert.ok(!existsSync(join(dir, "lex", "shared")), "nothing is created beside the lexical path");
+});
+
 test("writeFileAtomic with followSymlink and a loop of links gives up with a reason and leaves the links alone", { skip: SYMLINKS }, (t) => {
   const dir = tempDir(t);
   const a = join(dir, "a.json");
