@@ -421,6 +421,14 @@ export const SETTINGS: readonly SettingDef[] = [
     default: false,
   },
   integerFlagRow("decodeConcurrency", "--decode-concurrency"),
+  integerFlagRow("promptConcurrency", "--prompt-concurrency"),
+  integerFlagRow("prefillStepSize", "--prefill-step-size"),
+  integerFlagRow("promptCacheSize", "--prompt-cache-size"),
+  // A plain integer of bytes, as the flag takes it; size strings such as "8GB" stay deferred (D-16).
+  integerFlagRow("promptCacheBytes", "--prompt-cache-bytes", {
+    expected: "an integer number of bytes, at least 1 (for example 8589934592 for 8 GiB)",
+    problem: (shown) => `${shown} is not an integer number of bytes of at least 1, for example 8589934592 for 8 GiB`,
+  }),
   {
     path: "model.adapterPath",
     kind: "path",
