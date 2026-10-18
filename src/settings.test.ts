@@ -2665,6 +2665,147 @@ test("with no layer setting it the pip index is the default and has no source", 
   assert.equal(prepared.install.pipIndexSource, undefined);
 });
 
+const PIP_PROBLEM = "must be an https URL without credentials or spaces (http only for a loopback host)";
+const pipLine = (shown: string, label = GLOBAL) => `mlxLm.pipIndex (${label}): ${shown} ${PIP_PROBLEM}`;
+
+for (const pipIndex of [
+  "https://pypi.org/simple/",
+  "https://mirror.example:8443/root/pypi/+simple/",
+  "http://127.0.0.1:3141/root/pypi/+simple/",
+  "http://localhost/simple/",
+  "http://[::1]:8080/simple/",
+]) {
+  test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is accepted in a global file and kept verbatim`, () => {
+    const { prepared, warnings } = resolved({ global: ok({ mlxLm: { pipIndex } }) });
+    assert.equal(prepared.install.pipIndex, pipIndex);
+    assert.deepEqual(warnings, []);
+  });
+}
+
+const BAD_PIP_INDEXES: unknown[] = [
+  "http://example.com/simple/",
+  "ftp://example.test/simple/",
+  "file:///tmp/simple/",
+  "",
+  "https://exa mple.test/simple/",
+  " https://example.test/simple/",
+  "https://example.test/simple/ ",
+  "https://example.test/sim\nple/",
+  "https://user:pass@example.test/simple/",
+  "https://user@example.test/simple/",
+  "https://pypi.org@evil.example/simple/",
+  "https://:@example.test/simple/",
+  "https://",
+  "pypi.org/simple/",
+  5,
+];
+for (const pipIndex of BAD_PIP_INDEXES) {
+  test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is refused naming the allowed form`, () => {
+    assert.deepEqual(refused({ global: ok({ mlxLm: { pipIndex } }) }), [pipLine(JSON.stringify(pipIndex))]);
+  });
+}
+
+test("PI_MLX_MODELS_PIP_INDEX is used and its source is the variable", () => {
+  const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_PIP_INDEX: " https://env.example/simple/ " } });
+  assert.equal(prepared.install.pipIndex, "https://env.example/simple/", "surrounding whitespace of a typed value is trimmed");
+  assert.equal(prepared.install.pipIndexSource, "env PI_MLX_MODELS_PIP_INDEX");
+  assert.deepEqual(warnings, []);
+});
+
+test("an invalid PI_MLX_MODELS_PIP_INDEX is ignored with a warning naming the variable and the next layer is used", () => {
+  const { prepared, warnings } = resolved({
+    global: ok({ mlxLm: { pipIndex: "https://global.example/simple/" } }),
+    env: { PI_MLX_MODELS_PIP_INDEX: "http://example.com/simple/" },
+  });
+  assert.equal(prepared.install.pipIndex, "https://global.example/simple/");
+  assert.equal(prepared.install.pipIndexSource, "global file");
+  assert.deepEqual(warnings, [
+    'PI_MLX_MODELS_PIP_INDEX="http://example.com/simple/" is not an https URL without credentials (http only for a loopback host); ignoring it.',
+  ]);
+});
+
+test("a blank PI_MLX_MODELS_PIP_INDEX counts as unset", () => {
+  for (const raw of ["", "   "]) {
+    const { prepared, warnings } = resolved({ env: { PI_MLX_MODELS_PIP_INDEX: raw } });
+    assert.equal(prepared.install.pipIndex, DEFAULT_PIP_INDEX, JSON.stringify(raw));
+    assert.equal(prepared.install.pipIndexSource, undefined);
+    assert.deepEqual(warnings, []);
+  }
+});
+
+test("mlxLm.pipIndex: /mlx-init beats the environment, which beats the global file; a project value takes no part", () => {
+  const global = ok({ mlxLm: { pipIndex: "https://global.example/simple/" } });
+  const project = ok({ mlxLm: { pipIndex: "https://project.example/simple/" } });
+  const env = { PI_MLX_MODELS_PIP_INDEX: "https://env.example/simple/" };
+  const args = { "mlxLm.pipIndex": "https://args.example/simple/" };
+  const at = (input: Partial<PrepareInput>) => {
+    const { install } = resolved(input).prepared;
+    return [install.pipIndex, install.pipIndexSource];
+  };
+  assert.deepEqual(at({ global }), ["https://global.example/simple/", "global file"]);
+  assert.deepEqual(at({ global, project }), ["https://global.example/simple/", "global file"]);
+  assert.deepEqual(at({ project }), [DEFAULT_PIP_INDEX, undefined]);
+  assert.deepEqual(at({ global, project, env }), ["https://env.example/simple/", "env PI_MLX_MODELS_PIP_INDEX"]);
+  assert.deepEqual(at({ global, project, env, args }), ["https://args.example/simple/", "/mlx-init"]);
+});
+
+test("a project file with mlxLm.pipIndex is one install-only violation, whatever a higher layer says", () => {
+  const project = ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" } });
+  const expected = [
+    { path: "mlxLm.pipIndex", shown: "https://mirror.example/simple/", reason: "chooses where mlx-lm is installed from", installOnly: true },
+  ];
+  assert.deepEqual(violationsOf(project), expected);
+  assert.deepEqual(violationsOf(project, { env: { PI_MLX_MODELS_PIP_INDEX: "https://env.example/simple/" } }), expected);
+  assert.deepEqual(violationsOf(project, { args: { "mlxLm.pipIndex": "https://args.example/simple/" } }), expected);
+});
+
+test("a project file that only pins the version has no violation", () => {
+  assert.deepEqual(violationsOf(ok({ mlxLm: { version: "0.31.1" } })), []);
+});
+
+test("formatProjectRefusal for a pip index alone uses the install header and footer", () => {
+  const text = formatProjectRefusal(violationsOf(ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" } })), "/home/u/config.json");
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:",
+      "  mlxLm.pipIndex (https://mirror.example/simple/): chooses where mlx-lm is installed from",
+      "Move them to /home/u/config.json. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking.",
+    ].join("\n"),
+  );
+});
+
+test("formatProjectRefusal lists a pip index and trustRemoteCode together under the install header", () => {
+  const text = formatProjectRefusal(
+    violationsOf(ok({ mlxLm: { pipIndex: "https://mirror.example/simple/" }, server: { trustRemoteCode: true } })),
+    "/home/u/config.json",
+  );
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:",
+      "  server.trustRemoteCode: lets the model repository run Python code",
+      "  mlxLm.pipIndex (https://mirror.example/simple/): chooses where mlx-lm is installed from",
+      "Move them to /home/u/config.json. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking.",
+    ].join("\n"),
+  );
+});
+
+test("formatProjectRefusal for the four older violations alone keeps its exact text", () => {
+  const project = ok({ baseUrl: "http://example.test/v1", server: { host: "0.0.0.0", trustRemoteCode: true, allowedOrigins: ["*"] } });
+  assert.equal(
+    formatProjectRefusal(violationsOf(project), "/home/u/config.json"),
+    [
+      ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+      "  server.trustRemoteCode: lets the model repository run Python code",
+      "  server.host (0.0.0.0): listens on a non-loopback address",
+      "  baseUrl (http://example.test/v1): sends prompts to a non-loopback address",
+      '  server.allowedOrigins ("*"): lets web pages call the local server',
+      "Move them to /home/u/config.json; starting then asks for confirmation.",
+    ].join("\n"),
+  );
+});
+
 test("a typo of pipIndex inside the mlxLm block is an unknown key that names mlxLm.pipIndex", () => {
   assert.equal(unknownLine({ mlxLm: { pipindex: "https://mirror.example/simple/" } }), `mlxLm.pipindex (${GLOBAL}): unknown key (did you mean mlxLm.pipIndex?)`);
 });

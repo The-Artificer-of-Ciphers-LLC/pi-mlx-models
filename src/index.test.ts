@@ -2260,8 +2260,8 @@ test("an install that lists every KV flag passes all three in schema order with 
 const PIP_INDEX_ARG = "--index-url=https://pypi.org/simple/";
 
 /** An extension around the REAL ensureInstalled over a scripted host: no network and no real pip. */
-async function setupRealInstall(globalFile?: unknown) {
-  const settings = freshSettings({});
+async function setupRealInstall(globalFile?: unknown, extra: { env?: Record<string, string | undefined>; cwd?: string } = {}) {
+  const settings = freshSettings(extra.env ?? {});
   if (globalFile !== undefined) writeGlobal(settings, globalFile);
   const hostCalls: string[][] = [];
   const host: RuntimeHost = {
@@ -2273,15 +2273,16 @@ async function setupRealInstall(globalFile?: unknown) {
     },
   };
   const fakePi = makeFakePi();
-  const fakeCtx = makeCtx();
+  const fakeCtx = makeCtx(undefined, extra.cwd === undefined ? undefined : { cwd: extra.cwd });
+  const server = makeFakeServer();
   const extension = createExtension({
-    server: makeFakeServer(),
+    server,
     ensureInstalled: ((opts?: any) => ensureInstalled({ ...opts, host })) as any,
     discoverModelIds: async () => [],
     settings,
   });
   await extension(fakePi.pi);
-  return { hostCalls, ...fakePi, ...fakeCtx };
+  return { hostCalls, server, settings, ...fakePi, ...fakeCtx };
 }
 
 const pipStep = (spec: string) => [VENV_PYTHON, "-m", "pip", "install", "--upgrade", spec, PIP_INDEX_ARG];
@@ -2483,4 +2484,110 @@ test("mlx-init shows the configured index and where it came from in its progress
   await h.commands.get("mlx-init")!("", h.ctx);
 
   assert.ok(infos(h.notes).includes(`Installing mlx-lm latest (default) from ${MIRROR} (global file)`), infos(h.notes).join("|"));
+});
+
+// ---- the pip index is user-level: a project file may not choose it (plan 03-04, D-01, D-02, D-18) ----
+
+const PIP_PROJECT = { mlxLm: { pipIndex: MIRROR } };
+const PIP_VIOLATION_LINE = `  mlxLm.pipIndex (${MIRROR}): chooses where mlx-lm is installed from`;
+/** Spelled out here, not imported, so changing the production sentence is a deliberate edit of two places. */
+const installRefusalText = (command: string, settings: { globalConfigPath: string }, lines: string[]) =>
+  [
+    `${command} failed: .pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:`,
+    ...lines,
+    `Move them to ${settings.globalConfigPath}. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking.`,
+  ].join("\n");
+
+test("a project file with a pip index makes mlx-init end with the refusal, and nothing is installed or drawn", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, PIP_PROJECT);
+  const h = await setupRealInstall(undefined, { cwd });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [installRefusalText("mlx-init", h.settings, [PIP_VIOLATION_LINE])]);
+  assert.deepEqual(h.hostCalls, [], "the installer was never called");
+  assert.deepEqual(h.widgets, [], "no progress widget was drawn");
+  assert.equal(h.confirms.length, 0);
+});
+
+test("a project file with a pip index makes mlx-start end with the same refusal, and nothing is installed, spawned or registered", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, PIP_PROJECT);
+  const h = await setupRealInstall(undefined, { cwd });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [installRefusalText("mlx-start", h.settings, [PIP_VIOLATION_LINE])]);
+  assert.deepEqual(h.hostCalls, [], "nothing was installed");
+  assert.deepEqual(h.server.startCalls, [], "no server was spawned");
+  assert.equal(h.providerCalls.length, 1, "no provider beyond the initial one");
+  assert.deepEqual(h.widgets, []);
+  assert.equal(h.confirms.length, 0);
+});
+
+test("an environment index does not launder a project file's index: both commands still refuse", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, PIP_PROJECT);
+  const h = await setupRealInstall(undefined, { cwd, env: { PI_MLX_MODELS_PIP_INDEX: "https://other.example/simple/" } });
+
+  await h.commands.get("mlx-init")!("", h.ctx);
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+  await h.commands.get("mlx-init")!("--pip-index https://typed.example/simple/", h.ctx);
+
+  assert.deepEqual(errors(h.notes), [
+    installRefusalText("mlx-init", h.settings, [PIP_VIOLATION_LINE]),
+    installRefusalText("mlx-start", h.settings, [PIP_VIOLATION_LINE]),
+    installRefusalText("mlx-init", h.settings, [PIP_VIOLATION_LINE]),
+  ]);
+  assert.deepEqual(h.hostCalls, []);
+  assert.deepEqual(h.server.startCalls, []);
+});
+
+test("an index from the global file, the environment or the flag reaches the installer unchanged with no dialog and no warning", async () => {
+  const typedIndex = "https://typed.example/simple/";
+  const fromFile = freshSettings({});
+  writeGlobal(fromFile, { mlxLm: { pipIndex: MIRROR } });
+  const cases: Array<[string, Awaited<ReturnType<typeof setup>>, string, string]> = [
+    ["the global file", await setup({ settings: fromFile }), "", MIRROR],
+    ["the environment", await setup({ env: { PI_MLX_MODELS_PIP_INDEX: "https://env.example/simple/" } }), "", "https://env.example/simple/"],
+    ["the flag", await setup(), `--pip-index ${typedIndex}`, typedIndex],
+  ];
+  for (const [name, h, args, expected] of cases) {
+    await h.commands.get("mlx-init")!(args, h.ctx);
+
+    assert.equal(h.installCalls.length, 1, name);
+    assert.equal(h.installCalls[0].policy.pipIndex, expected, name);
+    assert.equal(h.confirms.length, 0, `${name}: no dialog`);
+    assert.deepEqual(warnings(h.notes), [], `${name}: no warning`);
+    assert.deepEqual(errors(h.notes), [], name);
+  }
+});
+
+test("mlx-init --pip-index applies to that run only and a bad one is refused with nothing happening", async () => {
+  const h = await setup();
+
+  await h.commands.get("mlx-init")!("--pip-index https://typed.example/simple/", h.ctx);
+  await h.commands.get("mlx-init")!("", h.ctx);
+
+  assert.deepEqual(
+    h.installCalls.map((call) => call.policy.pipIndex),
+    ["https://typed.example/simple/", "https://pypi.org/simple/"],
+  );
+  assert.ok(
+    infos(h.notes).includes("Installing mlx-lm latest (default) from https://typed.example/simple/ (/mlx-init)"),
+    infos(h.notes).join("|"),
+  );
+
+  const bad = await setup();
+  await bad.commands.get("mlx-init")!("--pip-index http://example.com/simple/", bad.ctx);
+
+  assert.equal(errors(bad.notes).length, 1);
+  assert.ok(
+    errors(bad.notes)[0].includes(
+      'mlxLm.pipIndex (/mlx-init --pip-index): "http://example.com/simple/" must be an https URL without credentials or spaces (http only for a loopback host)',
+    ),
+    errors(bad.notes)[0],
+  );
+  assertNothingHappened(bad);
 });
