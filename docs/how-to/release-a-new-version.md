@@ -22,6 +22,13 @@ For maintainers. A release is one manual run of the **Release** workflow, follow
 
 The release is live only after step 5.
 
+## Check the listing
+
+There is nothing to submit. The pi gallery lists every npm package that carries the `pi-package` keyword, and this package already does.
+
+1. Run `npm view @taoc/pi-mlx-models version` once you have approved the release. It shows the new version.
+2. Open https://pi.dev/packages/@taoc/pi-mlx-models and check that it shows the new version. pi.dev documents no refresh time, so reload later if the old version still shows. The README links on that page go to GitHub.
+
 ## If something goes wrong
 
 - **The run stops before staging.** Nothing was published or pushed. Fix what the message says and run it again.

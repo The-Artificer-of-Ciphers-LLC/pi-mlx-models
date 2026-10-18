@@ -7,11 +7,11 @@ Local MLX model launcher for [pi](https://pi.dev) on Apple Silicon.
   <a href="https://www.npmjs.com/package/@taoc/pi-mlx-models"><img alt="npm downloads per month" src="https://img.shields.io/npm/dm/@taoc/pi-mlx-models?style=for-the-badge&logo=npm&label=downloads" /></a>
   <a href="https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/actions/workflows/ci.yml"><img alt="tests" src="https://img.shields.io/github/actions/workflow/status/The-Artificer-of-Ciphers-LLC/pi-mlx-models/ci.yml?branch=main&style=for-the-badge&logo=github&label=tests" /></a>
   <a href="https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/The-Artificer-of-Ciphers-LLC/pi-mlx-models?style=for-the-badge&logo=github&label=stars" /></a>
-  <a href="./LICENSE"><img alt="license" src="https://img.shields.io/github/license/The-Artificer-of-Ciphers-LLC/pi-mlx-models?style=for-the-badge&label=license" /></a>
+  <a href="https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/github/license/The-Artificer-of-Ciphers-LLC/pi-mlx-models?style=for-the-badge&label=license" /></a>
 </p>
 
 <p align="center">
-  <img src="./assets/preset-selector.png" alt="Preset selector" width="780" />
+  <img src="https://raw.githubusercontent.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/main/assets/preset-selector.png" alt="Preset selector" width="780" />
 </p>
 
 `@taoc/pi-mlx-models` adds a local OpenAI-compatible provider to pi, with a guided startup flow for MLX models.
@@ -34,7 +34,7 @@ Local MLX model launcher for [pi](https://pi.dev) on Apple Silicon.
 ## Requirements
 
 - macOS on Apple Silicon
-- Python 3.11 or newer
+- Python 3.11 or newer (to use another interpreter, see [How to use a different Python](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/configure-the-server.md#use-a-different-python))
 
 ## Install
 
@@ -59,7 +59,7 @@ In pi:
 /mlx-start
 ```
 
-`/mlx-init` builds the runtime the first time. `/mlx-start` with no arguments opens a selector: pick a preset with the arrow keys and Enter. When the server is ready, pi says so. A step-by-step walk-through is in [Get started](./docs/tutorials/get-started.md).
+`/mlx-init` builds the runtime the first time. `/mlx-start` with no arguments opens a selector: pick a preset with the arrow keys and Enter. When the server is ready, pi says so. A step-by-step walk-through is in [Get started](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/tutorials/get-started.md).
 
 To start a model directly, give a preset number or key, or any Hugging Face model id:
 
@@ -72,7 +72,7 @@ Stop it with `/mlx-stop`.
 
 ## Commands
 
-Details, arguments and the preset list are in the [commands reference](./docs/reference/commands.md).
+Details, arguments and the preset list are in the [commands reference](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/commands.md).
 
 - `/mlx-init`: create or update the local runtime (Python virtual environment and mlx-lm)
 - `/mlx-start`: start the server for a preset, a model id or a profile
@@ -84,7 +84,7 @@ Details, arguments and the preset list are in the [commands reference](./docs/re
 
 ## The default port
 
-The server listens on `127.0.0.1:8080` by default, not on 11434. Set `PI_MLX_MODELS_PORT` (or `server.port` in a config file) to change it.
+The server listens on `127.0.0.1:8080` by default, not on 11434. Set `PI_MLX_MODELS_PORT` (or `server.port` in a config file) to change it. The host, base URL and default model can be set the same way: see [How to set a connection value from the environment](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/configure-the-server.md#set-a-connection-value-from-the-environment).
 
 ## Configure it
 
@@ -94,39 +94,41 @@ Create `~/.pi/agent/pi-mlx-models/config.json` to set a port, allowed origins or
 { "server": { "port": 8090, "logLevel": "INFO" } }
 ```
 
+Every setting is in the [configuration reference](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/configuration.md), with an [example file](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/configuration.md#file-layout); the [precedence order](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/configuration.md#sources-from-highest-precedence-to-lowest) says which source wins when two of them set the same value.
+
 ## Security
 
-`--trust-remote-code` lets a model repository run Python on your machine, and a non-loopback `host` makes the server, which has no authentication, reachable from your network. Both ask for confirmation at every start, and a project file may not turn either on. See [How to allow remote code or network access](./docs/how-to/allow-remote-code-or-network-access.md).
+`--trust-remote-code` lets a model repository run Python on your machine, and a non-loopback `host` makes the server, which has no authentication, reachable from your network. Both ask for confirmation at every start, and a project file may not turn either on. See [How to allow remote code or network access](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/allow-remote-code-or-network-access.md).
 
 ## Documentation
 
 **Tutorials**
 
-- [Get started](./docs/tutorials/get-started.md): install, build the runtime, start a model and send a first prompt
+- [Get started](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/tutorials/get-started.md): install, build the runtime, start a model and send a first prompt
 
 **How-to guides**
 
-- [How to configure the MLX server](./docs/how-to/configure-the-server.md)
-- [How to edit the configuration from inside pi](./docs/how-to/edit-the-config-in-pi.md)
-- [How to set model options](./docs/how-to/set-model-options.md) (draft model, adapter, chat template)
-- [How to use profiles and sampling](./docs/how-to/use-profiles-and-sampling.md)
-- [How to set a model's context window, thinking flag and output limit](./docs/how-to/set-model-limits.md)
-- [How to restart, check and re-launch a model](./docs/how-to/restart-check-and-relaunch.md)
-- [How to start a model automatically when pi opens](./docs/how-to/start-a-model-automatically.md)
-- [How to allow remote code or network access](./docs/how-to/allow-remote-code-or-network-access.md)
-- [How to release a new version](./docs/how-to/release-a-new-version.md) (maintainers)
+- [How to configure the MLX server](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/configure-the-server.md)
+- [How to edit the configuration from inside pi](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/edit-the-config-in-pi.md)
+- [How to set model options](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/set-model-options.md) (draft model, adapter, chat template)
+- [How to use profiles and sampling](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/use-profiles-and-sampling.md)
+- [How to set a model's context window, thinking flag and output limit](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/set-model-limits.md)
+- [How to restart, check and re-launch a model](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/restart-check-and-relaunch.md)
+- [How to start a model automatically when pi opens](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/start-a-model-automatically.md)
+- [How to allow remote code or network access](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/allow-remote-code-or-network-access.md)
+- [How to release a new version](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/how-to/release-a-new-version.md) (maintainers)
 
 **Reference**
 
-- [Commands](./docs/reference/commands.md), including the presets
-- [Configuration](./docs/reference/configuration.md): files, settings, flags, environment variables and precedence
+- [Commands](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/commands.md), including the presets
+- [Configuration](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/configuration.md): files, settings, flags, environment variables and precedence
 
 **Explanation**
 
-- [About how a launch is built](./docs/explanation/how-a-launch-is-built.md)
-- [About layered configuration and trust](./docs/explanation/layered-configuration-and-trust.md)
+- [About how a launch is built](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/explanation/how-a-launch-is-built.md)
+- [About layered configuration and trust](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/explanation/layered-configuration-and-trust.md)
 
-See the [changelog](./CHANGELOG.md) for what changed in each release.
+See the [changelog](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/CHANGELOG.md) for what changed in each release.
 
 ## Development
 
@@ -142,16 +144,16 @@ The pi package manifest is in `package.json`: `pi.extensions` is `["dist/index.j
 
 ### Startup progress
 
-![Startup progress](./assets/start-progress.png)
+![Startup progress](https://raw.githubusercontent.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/main/assets/start-progress.png)
 
 ### Command menu
 
-![Commands](./assets/commands.png)
+![Commands](https://raw.githubusercontent.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/main/assets/commands.png)
 
 ### Model selection
 
-![Model selection](./assets/model-selection.png)
+![Model selection](https://raw.githubusercontent.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/main/assets/model-selection.png)
 
 ## License
 
-[MIT](./LICENSE). This project is a fork of [vmarinogg/pi-mlx-models](https://github.com/vmarinogg/pi-mlx-models); the original copyright notice is kept alongside The Artificer of Ciphers LLC's.
+[MIT](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/LICENSE). This project is a fork of [vmarinogg/pi-mlx-models](https://github.com/vmarinogg/pi-mlx-models); the original copyright notice is kept alongside The Artificer of Ciphers LLC's.
