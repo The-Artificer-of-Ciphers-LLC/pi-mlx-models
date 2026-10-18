@@ -2,7 +2,7 @@
 //
 // Accepts the same argv as the real server (--model, --host, --port) and
 // selects a behaviour through the STUB_MODE environment variable.
-import { writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, writeFileSync, writeSync } from "node:fs";
 import http from "node:http";
 
 function parseArgs(argv) {
@@ -39,12 +39,28 @@ function json(res, status, body) {
   res.end(payload);
 }
 
+// Collect the request body and resolve with its text.
 function drain(req) {
   return new Promise((resolve) => {
-    req.on("data", () => {});
-    req.on("end", resolve);
-    req.on("error", resolve);
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", () => resolve(Buffer.concat(chunks).toString("utf8")));
   });
+}
+
+// Optionally record every POST as one JSON line, { url, body }, so a test can prove what the server received.
+// The body is the parsed JSON when the text parses and the raw text otherwise. Off unless STUB_REQUEST_FILE is set.
+function record(url, text) {
+  const file = process.env.STUB_REQUEST_FILE;
+  if (!file) return;
+  let body = text;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    // keep the raw text
+  }
+  appendFileSync(file, `${JSON.stringify({ url, body })}\n`);
 }
 
 function okHandler(req, res) {
@@ -53,7 +69,8 @@ function okHandler(req, res) {
     return;
   }
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
-    drain(req).then(() => {
+    drain(req).then((text) => {
+      record(req.url, text);
       json(res, 200, {
         object: "chat.completion",
         model,
@@ -70,7 +87,8 @@ function okHandler(req, res) {
 function warmup400Handler(req, res) {
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
     const pad = Number(process.env.STUB_ERROR_PAD ?? 0);
-    drain(req).then(() => {
+    drain(req).then((text) => {
+      record(req.url, text);
       json(res, 400, { error: `stub: unsupported request${"x".repeat(Math.max(0, pad))}` });
     });
     return;

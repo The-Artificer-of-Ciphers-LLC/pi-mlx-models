@@ -269,6 +269,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
   async function stopServer(ctx: any) {
     cancelStarts(); // cancels an in-flight start or init, including one still waiting on the installer
+    active = null; // the values end with the launch (D-12)
     activeProgress?.clear();
     activeProgress = null;
     await server.stop();
@@ -641,6 +642,7 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
 
     pi.on("session_shutdown", async () => {
       cancelStarts(); // a start still waiting on the installer must not launch a server after shutdown
+      active = null; // the values end with the launch, before any await (D-12)
       activeProgress?.stop();
       // Wait for the child to exit so a quitting pi does not leave it holding the port, but never
       // let a stop that hangs (or rejects) hold up the exit or the provider clean-up below.
