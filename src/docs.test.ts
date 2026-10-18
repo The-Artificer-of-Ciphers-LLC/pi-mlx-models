@@ -12,9 +12,10 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, posix, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createExtension } from "./index.js";
 import { PI_FLAGS, SETTINGS, prepareSettings, readLayerFile } from "./settings.js";
 import { makeFakePi } from "./testkit.js";
@@ -286,4 +287,174 @@ test("docs check: the example config in the File layout section and each json bl
   const readmeBlocks = jsonBlocksOf(readRepo("README.md"));
   assert.ok(readmeBlocks.length >= 1, "no json block in README.md");
   assert.deepEqual([layout[0], ...readmeBlocks].flatMap((block) => configProblems(block)), []);
+});
+
+/** The GitHub repository the absolute links of the documentation point at. */
+interface RepoRef {
+  owner: string;
+  name: string;
+}
+
+/** A link target as a path from the repository root (empty when it leaves the repository) and its fragment (empty when none). */
+interface RepoTarget {
+  path: string;
+  fragment: string;
+}
+
+/** The anchor GitHub gives a heading. */
+function githubSlug(heading: string): string {
+  void heading;
+  return "";
+}
+
+/** The anchors a markdown text defines: one per heading outside code, repeats numbered -1, -2, and so on. */
+function anchorsOf(markdown: string): Set<string> {
+  void markdown;
+  return new Set();
+}
+
+/** Every link target in a markdown text, in order: links, images, HTML href and src, reference definitions; none from code. */
+function linkTargetsOf(markdown: string): string[] {
+  void markdown;
+  return [];
+}
+
+/** Where a link target points inside the repository, or null when it points elsewhere. */
+function repoPathOf(target: string, fromFile: string, repo: RepoRef): RepoTarget | null {
+  void target;
+  void fromFile;
+  void repo;
+  return null;
+}
+
+/** Owner and name of the GitHub repository, read from package.json. */
+function repoFromPackage(): RepoRef {
+  void readRepo;
+  return { owner: "", name: "" };
+}
+
+/** One line per link in the files (paths from rootDir) that does not resolve: no file, no anchor, or a path that leaves the repository. */
+function linkProblems(rootDir: string, files: readonly string[], repo: RepoRef): string[] {
+  void rootDir;
+  void files;
+  void repo;
+  void [existsSync, statSync, readFileSync, dirname, resolve, relative, posix];
+  return [];
+}
+
+/** The pages that no link reaches. */
+function unlinkedPages(pages: readonly string[], linkedPaths: ReadonlySet<string>): string[] {
+  void pages;
+  void linkedPaths;
+  return [];
+}
+
+const REPO: RepoRef = { owner: "OWNER", name: "REPO" };
+
+test("docs check: githubSlug follows GitHub's heading anchors", () => {
+  assert.equal(githubSlug("`/mlx-init` arguments"), "mlx-init-arguments");
+  assert.equal(githubSlug("/mlx-last"), "mlx-last");
+  assert.equal(githubSlug("Sources, from highest precedence to lowest"), "sources-from-highest-precedence-to-lowest");
+  assert.equal(githubSlug("File layout"), "file-layout");
+  assert.equal(githubSlug("Pin or float the mlx-lm version"), "pin-or-float-the-mlx-lm-version");
+  assert.equal(githubSlug("[Get started](x.md) now"), "get-started-now");
+  assert.equal(githubSlug("snake_case-name"), "snake_case-name");
+});
+
+test("docs check: anchorsOf numbers repeated headings and ignores code", () => {
+  assert.deepEqual([...anchorsOf("# A\n\n## A\n\n## A\n")].sort(), ["a", "a-1", "a-2"]);
+  assert.deepEqual([...anchorsOf("# Real\n\n```sh\n# a comment, not a heading\n```\n\n~~~\n## Also code\n~~~\n")], ["real"]);
+  assert.deepEqual([...anchorsOf("## Title ##\n")], ["title"]);
+});
+
+test("docs check: linkTargetsOf finds markdown links, images, HTML href and src and reference definitions, and skips code", () => {
+  const text = [
+    "[t](x.md#a) and ![i](a.png \"title\")",
+    '<a href="b.html"><img alt="x" src="c.png" /></a>',
+    "[![badge](d.svg)](e.md)",
+    "[ref]: z.md",
+    "",
+    "```md",
+    "[hidden](fenced.md) <a href=\"fenced.html\">",
+    "```",
+    "Inline `[hidden](inline.md)` code.",
+  ].join("\n");
+  assert.deepEqual(linkTargetsOf(text), ["x.md#a", "a.png", "b.html", "c.png", "d.svg", "e.md", "z.md"]);
+});
+
+test("docs check: repoPathOf maps a target to a repository path", () => {
+  assert.deepEqual(repoPathOf("../a.md#b", "docs/x/y.md", REPO), { path: "docs/a.md", fragment: "b" });
+  assert.deepEqual(repoPathOf("#only", "docs/x/y.md", REPO), { path: "docs/x/y.md", fragment: "only" });
+  assert.deepEqual(repoPathOf("./docs/a.md", "README.md", REPO), { path: "docs/a.md", fragment: "" });
+  assert.deepEqual(repoPathOf("https://github.com/OWNER/REPO/blob/main/docs/a.md#b", "README.md", REPO), { path: "docs/a.md", fragment: "b" });
+  assert.deepEqual(repoPathOf("https://raw.githubusercontent.com/OWNER/REPO/main/assets/a.png", "README.md", REPO), { path: "assets/a.png", fragment: "" });
+  assert.equal(repoPathOf("https://github.com/OTHER/REPO/blob/main/docs/a.md", "README.md", REPO), null);
+  assert.equal(repoPathOf("https://example.com/x", "README.md", REPO), null);
+  assert.equal(repoPathOf("mailto:a@b.c", "README.md", REPO), null);
+  assert.equal(repoPathOf("../../../etc/passwd", "docs/a.md", REPO)?.path, "");
+  assert.equal(repoPathOf("docs/my%20page.md", "README.md", REPO)?.path, "docs/my page.md");
+});
+
+test("docs check: linkProblems reports a missing file, a missing anchor and an escaping link", () => {
+  const parent = mkdtempSync(join(tmpdir(), "docs-check-tree-"));
+  try {
+    const root = join(parent, "repo");
+    mkdirSync(join(root, "docs"), { recursive: true });
+    // Outside the tree, so a link that climbs out would resolve to a real file if it were followed.
+    writeFileSync(join(parent, "outside.md"), "# Outside\n");
+    writeFileSync(join(root, "docs", "ok.md"), "# Real heading\n");
+    writeFileSync(
+      join(root, "README.md"),
+      [
+        "# Intro",
+        "[a](docs/ok.md)",
+        "[b](docs/missing.md)",
+        "[c](docs/ok.md#nope)",
+        "[d](#nope-here)",
+        "[e](../outside.md)",
+        "[f](docs/ok.md#real-heading)",
+        "[g](#intro)",
+        "",
+      ].join("\n"),
+    );
+    const problems = linkProblems(root, ["README.md"], REPO);
+    assert.equal(problems.length, 4, problems.join("\n"));
+    for (const target of ["docs/missing.md", "docs/ok.md#nope", "#nope-here", "../outside.md"]) {
+      assert.ok(problems.some((line) => line.includes("README.md") && line.includes(target)), `no problem names ${target}:\n${problems.join("\n")}`);
+    }
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("docs check: unlinkedPages reports a page no link reaches", () => {
+  assert.deepEqual(unlinkedPages(["docs/a.md", "docs/b.md"], new Set(["docs/a.md"])), ["docs/b.md"]);
+});
+
+/** README.md, CHANGELOG.md and every markdown page under docs outside docs/research, as paths from the repository root. */
+function documentationFiles(): { rootDir: string; files: string[]; pages: string[] } {
+  const rootDir = fileURLToPath(new URL("../", import.meta.url));
+  const pages = readdirSync(new URL("../docs/", import.meta.url), { recursive: true })
+    .map((entry) => String(entry).split("\\").join("/"))
+    .filter((entry) => entry.endsWith(".md") && !entry.startsWith("research/"))
+    .map((entry) => "docs/" + entry)
+    .sort();
+  return { rootDir, files: ["README.md", "CHANGELOG.md", ...pages], pages };
+}
+
+test("docs check: every relative link and anchor in the README, the changelog and the docs resolves", () => {
+  const { rootDir, files } = documentationFiles();
+  assert.ok(files.length >= 15, `only ${files.length} documentation files found`);
+  assert.deepEqual(linkProblems(rootDir, files, repoFromPackage()), []);
+});
+
+test("docs check: every docs page outside docs/research is linked from README.md", () => {
+  const { pages } = documentationFiles();
+  const repo = repoFromPackage();
+  const linked = new Set<string>();
+  for (const target of linkTargetsOf(readRepo("README.md"))) {
+    const found = repoPathOf(target, "README.md", repo);
+    if (found !== null && found.path !== "") linked.add(found.path);
+  }
+  assert.deepEqual(unlinkedPages(pages, linked), []);
 });
