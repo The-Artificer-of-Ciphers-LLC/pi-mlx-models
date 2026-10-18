@@ -132,6 +132,10 @@ async function setup(
     readModelConfig?: ReadModelConfig;
     /** What the health probe of /mlx-status finds; default: nothing accepts a connection. No test opens a socket. */
     probeHealth?: ProbeHealth;
+    /** What the port probe of auto-start finds (true: something answers); default: nothing does. No test opens a socket. */
+    probePort?: (host: string, port: number) => Promise<boolean>;
+    /** What the runtime precheck of auto-start finds; default: a usable runtime. */
+    runtimeInstalled?: () => Promise<boolean>;
   } = {},
 ) {
   const fakeModelConfig = makeFakeModelConfig();
@@ -145,6 +149,12 @@ async function setup(
   let discoveryCalls = 0;
   /** Every address and base URL the extension asked the health probe about. */
   const healthCalls: Array<{ address: { host: string; port: number }; baseUrl: string }> = [];
+  /** Every address the extension asked the port probe about. */
+  const portProbes: Array<{ host: string; port: number }> = [];
+  /** How many times the extension asked whether the runtime is installed. */
+  let runtimeChecks = 0;
+  /** The promises of the background work the session_start hook handed over; a test awaits them instead of a timer. */
+  const background: Promise<void>[] = [];
   const fakePi = makeFakePi();
   const fakeCtx = makeCtx(options.select, options.ctx);
   const extension = createExtension({
@@ -171,6 +181,17 @@ async function setup(
       healthCalls.push({ address: { host: address.host, port: address.port }, baseUrl });
       return options.probeHealth ? options.probeHealth(address, baseUrl) : { accepts: false, models: { answers: false } };
     },
+    probePort: async (host, port) => {
+      portProbes.push({ host, port });
+      return options.probePort ? options.probePort(host, port) : false;
+    },
+    runtimeInstalled: async () => {
+      runtimeChecks += 1;
+      return options.runtimeInstalled ? options.runtimeInstalled() : true;
+    },
+    trackBackground: (work) => {
+      background.push(work);
+    },
     ...(options.sleep ? { sleep: options.sleep } : {}),
   });
   await extension(fakePi.pi);
@@ -178,6 +199,11 @@ async function setup(
     server,
     installCalls,
     healthCalls,
+    portProbes,
+    background,
+    get runtimeChecks() {
+      return runtimeChecks;
+    },
     ...fakePi,
     ...fakeCtx,
     get probeCalls() {
@@ -5646,4 +5672,274 @@ test("mlx-config writes autoStart only after a yes from the ctx dialog", async (
   assert.equal(h.confirms.length, 1);
   assert.deepEqual(JSON.parse(readFileSync(settings.globalConfigPath, "utf8")), { server: { port: 18080 }, autoStart: true });
   assert.equal(savedNotices(h.notes).length, 1);
+});
+
+// ---- auto-start: opening pi starts the last model only when asked, and never without a clear reason (plan 06-11: CMD-05, D-24 to D-29) ----
+
+const AUTO_RECORD: Remembered = { model: QWEN_ID, profile: null };
+
+/**
+ * A harness for pi opening with a remembered launch: the global file (autoStart on unless the test writes its own) and the record
+ * (the default model with no profile, a raw text, or `null` for none) are on disk before the extension is built.
+ */
+async function autoSetup(
+  options: {
+    global?: unknown;
+    record?: Remembered | string | null;
+    env?: Record<string, string | undefined>;
+    setup?: Parameters<typeof setup>[0];
+  } = {},
+) {
+  const settings = freshSettings(options.env ?? {});
+  writeGlobal(settings, options.global ?? { autoStart: true });
+  const record = options.record === undefined ? AUTO_RECORD : options.record;
+  if (typeof record === "string") writeFileSync(recordFileOf(settings), record);
+  else if (record !== null) assert.deepEqual(writeLastLaunch(recordFileOf(settings), record), { ok: true });
+  const h = await setup({ ...options.setup, settings });
+  return { h, settings, recordFile: recordFileOf(settings) };
+}
+
+/** pi's session_start event, fired the way pi does. Returns what the handler returned, without waiting for the background work. */
+function fireSessionStart(h: Harness, reason = "startup") {
+  const handler = h.handlers.get("session_start");
+  assert.ok(handler, "the extension registers a session_start handler");
+  return handler({ type: "session_start", reason }, h.ctx);
+}
+
+/** Fire session_start and wait for the background work it started, through the promises it handed over (no timer). */
+async function sessionStart(h: Harness, reason = "startup") {
+  await fireSessionStart(h, reason);
+  while (h.background.length > 0) await h.background.shift();
+}
+
+/** Lets queued promise work run until `done` holds; a bounded number of event-loop turns, never a timer. */
+async function until(done: () => boolean) {
+  for (let turn = 0; turn < 200 && !done(); turn += 1) await flush();
+  assert.ok(done(), "the condition was not reached");
+}
+
+/** What auto-start must leave behind whenever it does not start: nothing installed, started, registered, switched, asked or shown. */
+function assertAutoStartIdle(h: Harness) {
+  assertNothingHappened(h);
+  assert.deepEqual(h.setModelCalls, [], "pi's selected model was not changed");
+  assert.deepEqual(h.confirms, [], "no confirmation dialog was opened");
+  assert.deepEqual(h.prompts, [], "nothing was asked");
+}
+
+/** A registry that knows the remembered model, so a model switch would be possible and a test can prove none was made. */
+const knownQwen = () => makeFakeRegistry([{ provider: PROVIDER_ID, id: QWEN_ID }]).registry;
+
+test("auto-start is off by default: with a remembered launch and no autoStart key, opening pi does nothing at all", async () => {
+  const { h } = await autoSetup({ global: {}, record: "this is not json\n" });
+
+  await sessionStart(h);
+
+  assert.deepEqual(h.notes, [], "no notice, so the remembered launch was not even read (it is corrupt here)");
+  assert.deepEqual(h.portProbes, [], "no port probe");
+  assert.equal(h.runtimeChecks, 0, "no runtime check");
+  assertAutoStartIdle(h);
+});
+
+test("auto-start is off with autoStart false, and PI_MLX_MODELS_AUTO_START=false beats a file that says true", async () => {
+  for (const [label, global, env] of [
+    ["the file says false", { autoStart: false }, {}],
+    ["the environment says false over a file that says true", { autoStart: true }, { PI_MLX_MODELS_AUTO_START: "false" }],
+  ] as const) {
+    const { h } = await autoSetup({ global, env, record: AUTO_RECORD });
+
+    await sessionStart(h);
+
+    assert.deepEqual(h.notes, [], label);
+    assert.deepEqual(h.portProbes, [], label);
+    assert.equal(h.runtimeChecks, 0, label);
+    assertAutoStartIdle(h);
+  }
+});
+
+test("auto-start from the environment: PI_MLX_MODELS_AUTO_START=true with no key in the file starts the remembered model", async () => {
+  const { h } = await autoSetup({ global: {}, env: { PI_MLX_MODELS_AUTO_START: "true" } });
+
+  await sessionStart(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [QWEN_ID]);
+});
+
+test("auto-start starts in the background: the hook returns at once, the launch equals a /mlx-start of the model, and pi's model is left alone", async () => {
+  const gate = deferred();
+  const reference = await setup();
+  await startMlx(reference, "qwen3_4b");
+  const { h, recordFile } = await autoSetup({
+    // Valid but not what the writer produces (no final newline), so a rewrite is visible.
+    record: `{"version":1,"model":"${QWEN_ID}","profile":null}`,
+    setup: {
+      ctx: { modelRegistry: knownQwen() },
+      server: {
+        start: async (_model, onEvent) => {
+          onEvent?.({ type: "launched" });
+          await gate.promise;
+          for (const type of ["loading", "warming", "ready"] as const) onEvent?.({ type });
+        },
+      },
+    },
+  });
+
+  const returned = fireSessionStart(h);
+
+  assert.equal(returned, undefined, "the handler returns at once with nothing to wait for");
+  await until(() => h.server.startCalls.length === 1);
+  assert.equal(h.background.length, 1, "the work was handed over for a test to wait on");
+  assert.deepEqual(h.server.startCalls, [QWEN_ID]);
+  assert.deepEqual(h.server.launches[0], reference.server.launches[0], "the same launch a /mlx-start of that model makes");
+  assert.ok(h.widgets.some((w) => w.lines !== undefined), "the progress widget is shown");
+  assert.equal(h.notes.some((n) => n.message === READY_NOTE), false, "still starting");
+  gate.resolve();
+  await Promise.all(h.background);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.ok(h.notes.some((n) => n.type === "info" && n.message === READY_NOTE), "the usual hint to pick the model with /model");
+  assert.deepEqual(h.setModelCalls, [], "pi.setModel was never called");
+  assert.equal(recordText(recordFile), `{"version":1,"model":"${QWEN_ID}","profile":null}\n`, "the record is written like every other start");
+});
+
+test("auto-start with the remembered profile starts it with the profile's flags and words it as the previous launch", async () => {
+  const { h } = await autoSetup({ global: { autoStart: true, ...FAST_AND_OTHER }, record: FAST_RECORD });
+
+  await sessionStart(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--temp=0.2"]);
+  assert.deepEqual(startingNotes(h.notes).map((message) => message.split("\n")[1]), ["profile: fast (previous launch)"]);
+});
+
+test("auto-start with nothing remembered is silent, probes nothing, and does not fall back to defaultModel", async () => {
+  const { h, recordFile } = await autoSetup({ global: { autoStart: true, defaultModel: "org/some-default-model" }, record: null });
+
+  await sessionStart(h);
+
+  assert.deepEqual(h.notes, []);
+  assert.deepEqual(h.portProbes, []);
+  assert.equal(h.runtimeChecks, 0);
+  assertAutoStartIdle(h);
+  assert.equal(existsSync(recordFile), false, "reading creates nothing");
+});
+
+test("auto-start with an unreadable remembered launch file shows one warning that points to /mlx-start and starts nothing", async () => {
+  const { h } = await autoSetup({ record: "this is not json\n" });
+
+  await sessionStart(h);
+
+  assert.equal(h.notes.length, 1);
+  assert.equal(h.notes[0].type, "warning");
+  assert.ok(h.notes[0].message.startsWith("auto-start skipped: the remembered launch file is not valid JSON"), h.notes[0].message);
+  assert.ok(h.notes[0].message.includes("/mlx-start"), h.notes[0].message);
+  assertAutoStartIdle(h);
+});
+
+test("auto-start with something answering on the port shows one info notice, and registers, adopts and starts nothing", async () => {
+  const { h } = await autoSetup({
+    global: { autoStart: true, server: { port: 9411 } },
+    setup: { probePort: async () => true, ctx: { modelRegistry: knownQwen() } },
+  });
+
+  await sessionStart(h);
+
+  assert.deepEqual(h.portProbes, [{ host: "127.0.0.1", port: 9411 }]);
+  assert.deepEqual(h.notes, [{ message: "auto-start skipped: something already answers on port 9411", type: "info" }]);
+  assert.equal(h.runtimeChecks, 0, "the runtime is not even looked at");
+  assertAutoStartIdle(h);
+});
+
+test("auto-start with the runtime missing shows one warning that names /mlx-init and /mlx-start, and installs nothing", async () => {
+  const { h } = await autoSetup({ setup: { runtimeInstalled: async () => false } });
+
+  await sessionStart(h);
+
+  assert.equal(h.runtimeChecks, 1);
+  assert.deepEqual(h.notes, [{ message: "auto-start skipped: the MLX runtime is not installed; run /mlx-init, then /mlx-start", type: "warning" }]);
+  assertAutoStartIdle(h);
+});
+
+test("auto-start never confirms for the user: a launch that needs a trust confirmation is not started and no dialog opens", async () => {
+  const remoteCode = await autoSetup({ global: { autoStart: true, server: { trustRemoteCode: true } } });
+  const wideHost = await autoSetup({ global: { autoStart: true, server: { host: "0.0.0.0" } } });
+
+  await sessionStart(remoteCode.h);
+  await sessionStart(wideHost.h);
+
+  assert.deepEqual(remoteCode.h.notes, [
+    { message: "auto-start skipped: --trust-remote-code needs your confirmation; run /mlx-start to confirm", type: "warning" },
+  ]);
+  assert.deepEqual(wideHost.h.notes, [
+    { message: "auto-start skipped: listening on 0.0.0.0 needs your confirmation; run /mlx-start to confirm", type: "warning" },
+  ]);
+  assertAutoStartIdle(remoteCode.h);
+  assertAutoStartIdle(wideHost.h);
+});
+
+test("auto-start with an invalid configuration shows one skipped notice with the usual report, and a project file asking for trustRemoteCode is refused", async () => {
+  const invalid = await autoSetup({ global: { autoStart: true, server: { port: 99999 } } });
+  const cwd = newCwd();
+  writeProject(cwd, { server: { trustRemoteCode: true } });
+  const project = await autoSetup({ setup: { ctx: { cwd } } });
+
+  await sessionStart(invalid.h);
+  await sessionStart(project.h);
+
+  assert.equal(invalid.h.notes.length, 1);
+  assert.equal(invalid.h.notes[0].type, "error");
+  assert.ok(invalid.h.notes[0].message.startsWith("auto-start skipped: invalid configuration"), invalid.h.notes[0].message);
+  assert.equal(project.h.notes.length, 1);
+  assert.equal(project.h.notes[0].type, "error");
+  assert.ok(
+    project.h.notes[0].message.startsWith("auto-start skipped: .pi/pi-mlx-models.json cannot enable settings that run code or open the network:"),
+    project.h.notes[0].message,
+  );
+  assertAutoStartIdle(invalid.h);
+  assertAutoStartIdle(project.h);
+});
+
+test("auto-start cannot be switched on by a project file, and a project value is a refusal when the option is on elsewhere", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { autoStart: true });
+  const off = await autoSetup({ global: {}, setup: { ctx: { cwd } } });
+  const on = await autoSetup({ global: { autoStart: true }, setup: { ctx: { cwd } } });
+
+  await sessionStart(off.h);
+  await sessionStart(on.h);
+
+  assert.deepEqual(off.h.notes, [], "the option is off, so the project file is not even looked at");
+  assertAutoStartIdle(off.h);
+  assert.equal(on.h.notes.length, 1);
+  assert.equal(on.h.notes[0].type, "error");
+  assert.ok(on.h.notes[0].message.startsWith("auto-start skipped: .pi/pi-mlx-models.json cannot set autoStart"), on.h.notes[0].message);
+  assertAutoStartIdle(on.h);
+});
+
+test("auto-start with a remembered profile the model no longer defines shows one note that lists the profiles and ends with the way to start by hand", async () => {
+  const { h, recordFile } = await autoSetup({
+    global: { autoStart: true, ...FAST_AND_OTHER },
+    record: { model: QWEN_ID, profile: "gone" },
+  });
+  const before = recordText(recordFile);
+
+  await sessionStart(h);
+
+  assert.equal(h.notes.length, 1);
+  assert.equal(h.notes[0].type, "error");
+  assert.ok(h.notes[0].message.startsWith("auto-start skipped: "), h.notes[0].message);
+  assert.ok(h.notes[0].message.includes("fast") && h.notes[0].message.includes("other"), h.notes[0].message);
+  assert.ok(h.notes[0].message.endsWith("Run /mlx-start to start by hand."), h.notes[0].message);
+  assert.equal(recordText(recordFile), before, "the record is unchanged");
+  assertAutoStartIdle(h);
+});
+
+test("auto-start without a UI (print or JSON mode) does nothing, silently", async () => {
+  const { h } = await autoSetup({ setup: { ctx: { hasUI: false } } });
+
+  await sessionStart(h);
+
+  assert.deepEqual(h.notes, []);
+  assert.deepEqual(h.portProbes, []);
+  assertAutoStartIdle(h);
 });
