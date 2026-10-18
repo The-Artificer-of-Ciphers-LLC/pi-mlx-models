@@ -710,3 +710,30 @@ test("before any /mlx-start in the session the hook leaves every request untouch
 
   assert.equal(result, undefined);
 });
+
+test("the hook never throws: a hostile payload, a missing ctx.model and a missing event all return undefined", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig(REQUEST_CONFIG(port));
+  await h.start();
+  const hook = hookOf(h);
+  const ctx = { model: { provider: PROVIDER_ID, id: QWEN.modelId } };
+  const hostile = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        throw new Error("hostile");
+      },
+      get() {
+        throw new Error("hostile");
+      },
+    },
+  );
+
+  assert.equal(await hook({ payload: hostile }, ctx), undefined);
+  assert.equal(await hook({ payload: null }, ctx), undefined);
+  assert.equal(await hook({ payload: "x" }, ctx), undefined);
+  assert.equal(await hook(undefined, ctx), undefined);
+  assert.equal(await hook({ payload: piPayload(QWEN.modelId) }, {}), undefined, "no ctx.model: nothing is applied");
+  assert.equal(await hook({ payload: piPayload(QWEN.modelId) }, undefined), undefined);
+});
