@@ -240,8 +240,11 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     return file.state === "ok" ? file.data : {};
   }
 
-  /** Run an edit and tell the user what happened. `saved` and `unchanged` are the sentences for the two good outcomes. */
-  function write(change: (draft: ConfigTree) => ConfigTree, saved: string, unchanged: string): Written {
+  /**
+   * Run an edit and tell the user what happened. `saved` and `unchanged` are the sentences for the two good outcomes; `after`
+   * is an extra sentence at the end of the saved notice.
+   */
+  function write(change: (draft: ConfigTree) => ConfigTree, saved: string, unchanged: string, after = ""): Written {
     const outcome: EditOutcome = editConfig(path, change);
     if (!outcome.ok) {
       report(`Not saved: ${outcome.message}`, "error");
@@ -253,7 +256,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     }
     const created = outcome.created ? ` The config file ${shown(path, 200)} was created.` : "";
     const running = options.serverRunning ? " A server is running: run /mlx-restart to apply it." : "";
-    report(`${saved} The change takes effect on the next /mlx-start.${running}${created}`, "info");
+    report(`${saved} The change takes effect on the next /mlx-start.${running}${created}${after}`, "info");
     return "saved";
   }
 
@@ -429,6 +432,8 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
           (draft) => setAt(draft, ["models", model, "profiles", profile], {}),
           `Created profile ${shown(profile)}${ofModel(model)}.`,
           `profile ${shown(profile)}${ofModel(model)} already exists.`,
+          // The empty profile is written before the action menu opens, so Back leaves it in the file.
+          " The profile is already saved and stays in the file if you choose Back.",
         );
         if (created !== "saved") return flowOf(created);
       }
