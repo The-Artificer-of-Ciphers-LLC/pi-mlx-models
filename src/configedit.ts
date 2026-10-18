@@ -357,7 +357,7 @@ export interface ModelEntrySummary {
 
 export function modelEntrySummary(tree: ConfigTree, model: string): ModelEntrySummary {
   const entry = getAt(tree, ["models", model]);
-  if (!isObject(entry)) return { profiles: [], options: [], defaultProfile: undefined, notAnObject: false };
+  if (!isObject(entry)) return { profiles: [], options: [], defaultProfile: undefined, notAnObject: entry !== undefined };
   const chosen = getAt(tree, ["models", model, "defaultProfile"]);
   return {
     profiles: profileNames(tree, model),

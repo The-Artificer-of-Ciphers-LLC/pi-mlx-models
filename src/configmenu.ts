@@ -320,8 +320,21 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     return checked.value;
   }
 
+  /**
+   * A model as a notice or title names it: the cleaned, clipped key, and "(entry N of M)" after it only when another key of
+   * the file shows the same text, so nothing changes for a key that is unique (WR-02c). A key not in the file yet is placed
+   * where the sorted list will put it once it is written.
+   */
+  function modelLabel(model: string): string {
+    const text = shown(model);
+    const keys = modelKeys(currentTree());
+    if (!keys.some((other) => other !== model && shown(other) === text)) return text;
+    const all = keys.includes(model) ? keys : [...keys, model].sort();
+    return `${text} (entry ${all.indexOf(model) + 1} of ${all.length})`;
+  }
+
   /** The words after a key name that say whose key it is. */
-  const ofModel = (model: string): string => ` of model ${shown(model)}`;
+  const ofModel = (model: string): string => ` of model ${modelLabel(model)}`;
   const ofProfile = (model: string, profile: string): string => ` of profile ${shown(profile)}${ofModel(model)}`;
 
   /**
@@ -452,6 +465,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   /** What deleting a model entry takes with it, as one sentence for the confirm; an entry that holds nothing says so. */
   function lostByEntry(model: string): string {
     const summary = modelEntrySummary(currentTree(), model);
+    if (summary.notAnObject) return "The entry is not an object, so it holds no settings; it is removed as it is.";
     const parts: string[] = [];
     if (summary.profiles.length > 0) parts.push(`the ${summary.profiles.length === 1 ? "profile" : "profiles"} ${listed(summary.profiles)}`);
     if (summary.defaultProfile !== undefined) parts.push(`the defaultProfile ${shownValue(summary.defaultProfile)}`);
