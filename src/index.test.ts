@@ -2858,3 +2858,224 @@ test("a bad mlxLm.version in the global file leaves the provider on the file's b
   assert.equal(loaded.installCalls.length, 0, "nothing was installed");
   assert.deepEqual(loaded.server.startCalls, []);
 });
+
+// ---- the before_provider_request hook (GEN-01, GEN-02): provider, model, context, launch, shape, notice (plan 04-03) ----
+
+/** A started qwen3_4b over a global file that sets one temperature, and the registered hook with a ctx that records its notices. */
+async function hookSetup(options: Parameters<typeof setup>[0] = {}, file: unknown = { model: { sampling: { temperature: 0.2 } } }) {
+  const settings = options.settings ?? freshSettings({});
+  writeGlobal(settings, file);
+  const h = await setup({ ...options, settings });
+  await startMlx(h, "qwen3_4b");
+  const hook = h.handlers.get("before_provider_request");
+  assert.ok(hook, "the extension registers a before_provider_request handler");
+  const hookNotes: Array<{ message: string; type: string | undefined }> = [];
+  const hookCtx = (overrides: Record<string, unknown> = {}) => ({
+    model: { provider: PROVIDER_ID, id: QWEN.modelId },
+    ui: {
+      notify(message: string, type?: string) {
+        hookNotes.push({ message, type });
+      },
+    },
+    ...overrides,
+  });
+  return { h, hook, hookNotes, hookCtx };
+}
+
+const hookPayload = (extra: Record<string, unknown> = {}) => ({
+  model: QWEN.modelId,
+  messages: [{ role: "user", content: "hi" }],
+  temperature: 0.9,
+  ...extra,
+});
+
+test("the extension registers exactly the handlers session_shutdown and before_provider_request", async () => {
+  const { handlers } = await setup();
+
+  assert.deepEqual([...handlers.keys()].sort(), ["before_provider_request", "session_shutdown"]);
+});
+
+test("the hook rewrites a matching request and shows no notice when it does (D-14)", async () => {
+  const { hook, hookNotes, hookCtx } = await hookSetup();
+  const payload = hookPayload();
+
+  const result = (await hook({ payload }, hookCtx())) as Record<string, unknown>;
+
+  assert.ok(result !== undefined && result !== payload);
+  assert.equal(result.temperature, 0.2);
+  assert.equal(payload.temperature, 0.9, "pi's object is not mutated");
+  assert.deepEqual(hookNotes, []);
+});
+
+test("the hook leaves a request for another provider with the same model id untouched", async () => {
+  const { hook, hookCtx } = await hookSetup();
+
+  const result = await hook({ payload: hookPayload() }, hookCtx({ model: { provider: "openai", id: QWEN.modelId } }));
+
+  assert.equal(result, undefined);
+});
+
+test("the hook leaves a request alone when ctx is undefined", async () => {
+  const { hook } = await hookSetup();
+
+  assert.equal(await hook({ payload: hookPayload() }, undefined), undefined);
+});
+
+test("the hook leaves a request alone when ctx has no model", async () => {
+  const { hook, hookNotes } = await hookSetup();
+
+  assert.equal(await hook({ payload: hookPayload() }, { ui: { notify: () => {} } }), undefined);
+  assert.deepEqual(hookNotes, []);
+});
+
+test("the hook leaves a request alone when ctx.model has no provider", async () => {
+  const { hook, hookCtx } = await hookSetup();
+
+  assert.equal(await hook({ payload: hookPayload() }, hookCtx({ model: { id: QWEN.modelId } })), undefined);
+});
+
+test("before any /mlx-start the hook leaves every request untouched", async () => {
+  const h = await setup();
+  const hook = h.handlers.get("before_provider_request")!;
+
+  const result = await hook({ payload: hookPayload() }, { model: { provider: PROVIDER_ID, id: QWEN.modelId } });
+
+  assert.equal(result, undefined);
+});
+
+test("after a start whose server.start rejects the hook leaves every request untouched", async () => {
+  const { hook, hookCtx, h } = await hookSetup({
+    server: {
+      start: async () => {
+        throw new Error("boom");
+      },
+    },
+  });
+
+  assert.equal(errors(h.notes).length, 1, errors(h.notes).join("|"));
+  assert.equal(await hook({ payload: hookPayload() }, hookCtx()), undefined);
+});
+
+test("a payload for another model id is left alone and shows no notice", async () => {
+  const { hook, hookNotes, hookCtx } = await hookSetup();
+
+  const result = await hook({ payload: hookPayload({ model: "some/other-model" }) }, hookCtx());
+
+  assert.equal(result, undefined);
+  assert.deepEqual(hookNotes, []);
+});
+
+const throwing = (): never => {
+  throw new Error("hostile");
+};
+const hostileInputs: Array<[string, () => { event: unknown; ctx: (base: (o?: Record<string, unknown>) => any) => unknown }]> = [
+  ["a null payload", () => ({ event: { payload: null }, ctx: (c) => c() })],
+  ["an array payload", () => ({ event: { payload: [1, 2] }, ctx: (c) => c() })],
+  ["a string payload", () => ({ event: { payload: "text" }, ctx: (c) => c() })],
+  ["a number payload", () => ({ event: { payload: 42 }, ctx: (c) => c() })],
+  [
+    "a payload whose model getter throws",
+    () => ({
+      event: {
+        payload: {
+          get model() {
+            return throwing();
+          },
+          messages: [],
+        },
+      },
+      ctx: (c) => c(),
+    }),
+  ],
+  [
+    "a proxy whose get trap throws",
+    () => ({
+      event: { payload: new Proxy({}, { get: throwing, getPrototypeOf: throwing, has: throwing, ownKeys: throwing }) },
+      ctx: (c) => c(),
+    }),
+  ],
+  [
+    "a ctx whose model getter throws",
+    () => ({
+      event: { payload: hookPayload() },
+      ctx: () => ({
+        get model() {
+          return throwing();
+        },
+      }),
+    }),
+  ],
+];
+for (const [name, build] of hostileInputs) {
+  test(`the hook never throws on ${name}`, async () => {
+    const { hook, hookCtx } = await hookSetup();
+    const { event, ctx } = build();
+
+    let result: unknown = "not called";
+    await assert.doesNotReject(async () => {
+      result = await hook(event, ctx(hookCtx));
+    });
+    assert.equal(result, undefined);
+  });
+}
+
+test("a malformed payload for this provider's launched model shows one warning per session, however many follow", async () => {
+  const { hook, hookNotes, hookCtx } = await hookSetup();
+
+  assert.equal(await hook({ payload: [1] }, hookCtx()), undefined);
+  assert.equal(await hook({ payload: "x" }, hookCtx()), undefined);
+
+  assert.equal(hookNotes.length, 1);
+  assert.equal(hookNotes[0].type, "warning");
+});
+
+test("the bad-shape warning is a bounded constant that never contains payload text", async () => {
+  const marker = "SECRET-MARKER-7f3a";
+  const { hook, hookNotes, hookCtx } = await hookSetup();
+
+  await hook({ payload: [marker, { content: marker }] }, hookCtx());
+
+  assert.equal(hookNotes.length, 1);
+  const text = hookNotes[0].message;
+  assert.ok(text.startsWith("pi-mlx-models:"), text);
+  assert.ok(/unexpected shape/.test(text), text);
+  assert.ok(text.length <= 200, `${text.length} characters`);
+  assert.ok(!text.includes(marker), text);
+});
+
+test("an object for the launched model without a messages array triggers the same warning", async () => {
+  const marker = "SECRET-MARKER-91bc";
+  const { hook, hookNotes, hookCtx } = await hookSetup();
+
+  const result = await hook({ payload: { model: QWEN.modelId, messages: marker, temperature: 0.9 } }, hookCtx());
+
+  assert.equal(result, undefined);
+  assert.equal(hookNotes.length, 1);
+  assert.equal(hookNotes[0].type, "warning");
+  assert.ok(!hookNotes[0].message.includes(marker));
+});
+
+test("a bad payload with a ctx that has no ui does not throw", async () => {
+  const { hook, hookCtx } = await hookSetup();
+
+  const result = await hook({ payload: [1] }, { model: hookCtx().model });
+
+  assert.equal(result, undefined);
+});
+
+test("the template arguments still reach the requests when the probe skips --chat-template-args on mlx-lm 0.24.0 (D-15)", async () => {
+  const settings = freshSettings({});
+  const { h, hook, hookCtx } = await hookSetup(
+    { settings, probe: async () => probeFromHelp("0.24.0", "mlx-server-help-0.24.0.txt") },
+    { model: { chatTemplateArgs: { enable_thinking: false } } },
+  );
+
+  assert.equal(h.server.launches[0]?.extraArgs.some((arg) => arg.startsWith("--chat-template-args")), false);
+  const result = (await hook(
+    { payload: hookPayload({ reasoning_effort: "high", chat_template_kwargs: { enable_thinking: true, preserve_thinking: true } }) },
+    hookCtx(),
+  )) as Record<string, unknown>;
+
+  assert.deepEqual(result.chat_template_kwargs, { enable_thinking: false });
+  assert.equal("reasoning_effort" in result, false);
+});
