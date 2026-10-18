@@ -14,8 +14,10 @@ import {
   formatProjectRefusal,
   initFlagSpecs,
   kvNotices,
+  pinNotice,
   prepareSettings,
   readLayerFile,
+  sameVersion,
   toLaunchSpec,
   trustRisks,
   type LayerFile,
@@ -2808,4 +2810,56 @@ test("formatProjectRefusal for the four older violations alone keeps its exact t
 
 test("a typo of pipIndex inside the mlxLm block is an unknown key that names mlxLm.pipIndex", () => {
   assert.equal(unknownLine({ mlxLm: { pipindex: "https://mirror.example/simple/" } }), `mlxLm.pipindex (${GLOBAL}): unknown key (did you mean mlxLm.pipIndex?)`);
+});
+
+// ---- the pin comparison and its notice (plan 03-05, D-07, D-08) ----
+
+test("sameVersion: identical texts are the same version", () => {
+  assert.equal(sameVersion("0.32.2", "0.32.2"), true);
+});
+
+test("sameVersion: a missing trailing .0 part makes no difference (0.32 and 0.32.0, 1.0 and 1.0.0)", () => {
+  assert.equal(sameVersion("0.32", "0.32.0"), true);
+  assert.equal(sameVersion("0.32.0", "0.32"), true);
+  assert.equal(sameVersion("1.0", "1.0.0"), true);
+});
+
+test("sameVersion: another release part is another version", () => {
+  assert.equal(sameVersion("0.32.2", "0.32.3"), false);
+  assert.equal(sameVersion("0.32", "0.32.1"), false);
+});
+
+test("sameVersion: a pre-release is not the release it precedes, and equals itself", () => {
+  assert.equal(sameVersion("0.33.0rc1", "0.33.0"), false);
+  assert.equal(sameVersion("0.33.0rc1", "0.33.0rc1"), true);
+});
+
+test("sameVersion: the suffix after the release number is compared exactly, with the release padded", () => {
+  assert.equal(sameVersion("0.32.0.post1", "0.32.post1"), true);
+  assert.equal(sameVersion("0.32.0.post1", "0.32.post2"), false);
+});
+
+test("sameVersion: case does not matter and text with no release number only equals itself", () => {
+  assert.equal(sameVersion("0.33.0RC1", "0.33.0rc1"), true);
+  assert.equal(sameVersion("abc", "ABC"), true);
+  assert.equal(sameVersion("abc", "0.32"), false);
+});
+
+test("pinNotice: a floating policy and an equal pin give no notice", () => {
+  assert.equal(pinNotice({ version: "latest", pipIndex: DEFAULT_PIP_INDEX }, "0.32.2"), undefined);
+  assert.equal(pinNotice({ version: "0.32", pipIndex: DEFAULT_PIP_INDEX, versionSource: "global file" }, "0.32.0"), undefined);
+});
+
+test("pinNotice: a mismatch names the pin, its source, the installed version and the command that applies it", () => {
+  assert.equal(
+    pinNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX, versionSource: "project file" }, "0.32.2"),
+    "mlx-lm pinned 0.31.1 (project file), installed 0.32.2; run /mlx-init to apply",
+  );
+});
+
+test("pinNotice: with no known source the parenthesised part is left out, and untrusted parts are cleaned and clipped", () => {
+  assert.equal(pinNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, "0.32.2"), "mlx-lm pinned 0.31.1, installed 0.32.2; run /mlx-init to apply");
+  const shown = pinNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, `0.32.2\u001b[31m${"9".repeat(100)}`) ?? "";
+  assert.ok(!shown.includes("\u001b"), "no control character reaches the notification");
+  assert.ok(shown.length < 160, `clipped: ${shown.length}`);
 });

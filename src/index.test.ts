@@ -2278,6 +2278,10 @@ async function setupRealInstall(
     cwd?: string;
     /** The text a pip step fails with, for the step whose argv this returns text for. */
     failWith?: (args: string[]) => string | undefined;
+    /** Whether the venv's python exists; default true. False scripts a first run with no virtual environment yet. */
+    venvExists?: boolean;
+    /** What the cheap installed-version query answers; default: mlx-lm 0.32.2. */
+    installed?: VersionResult;
   } = {},
 ) {
   const settings = freshSettings(extra.env ?? {});
@@ -2285,7 +2289,7 @@ async function setupRealInstall(
   const hostCalls: string[][] = [];
   const host: RuntimeHost = {
     findPython: () => "/py3",
-    exists: () => true,
+    exists: () => extra.venvExists ?? true,
     run: async (cmd, args, onLine) => {
       hostCalls.push([cmd, ...args]);
       if (args[0] === "--version") onLine?.("Python 3.13.1");
@@ -2301,6 +2305,7 @@ async function setupRealInstall(
     ensureInstalled: ((opts?: any) => ensureInstalled({ ...opts, host })) as any,
     discoverModelIds: async () => [],
     settings,
+    installedVersion: async () => extra.installed ?? { ok: true, version: "0.32.2" },
   });
   await extension(fakePi.pi);
   return { hostCalls, server, settings, ...fakePi, ...fakeCtx };
@@ -2681,5 +2686,63 @@ test("when the installed version cannot be read there is no warning and the star
   assert.equal(h.installedCalls, 1);
   assert.deepEqual(warningTexts(h.notes), []);
   assert.deepEqual(errors(h.notes), []);
+  assert.equal(h.server.startCalls.length, 1);
+});
+
+// ---- under a pin: the skip notice names the pin, the first install honours the policy, an existing install is left alone (plan 03-05) ----
+
+test("a project pin of 0.30.7 makes the skip notice name the pin, and shows no pin-mismatch notice for the matching install", async () => {
+  const cwd = newCwd();
+  writeProject(cwd, { mlxLm: { version: "0.30.7" } });
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: { prefillStepSize: 1024 } });
+  const h = await setup({
+    settings,
+    ctx: { cwd },
+    probe: async () => probeFromHelp("0.30.7", "mlx-server-help-0.30.7.txt"),
+    installed: async () => ({ ok: true, version: "0.30.7" }),
+  });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), [
+    "Skipped --prefill-step-size: not supported by mlx-lm 0.30.7 (mlx-lm is pinned to 0.30.7 by project file; raise or remove the pin, then run /mlx-init)",
+  ]);
+  assert.equal(h.server.startCalls.length, 1);
+});
+
+test("the first launch with no virtual environment installs at the configured pin from the configured index", async () => {
+  const mirror = "https://mirror.example/simple/";
+  const settings = freshSettings({});
+  writeGlobal(settings, { mlxLm: { version: "0.31.1", pipIndex: mirror } });
+  const recorded = await setup({ settings });
+
+  await startMlx(recorded, "qwen3_4b");
+
+  assert.equal(recorded.installCalls.length, 1);
+  assert.deepEqual(recorded.installCalls[0].policy, { version: "0.31.1", pipIndex: mirror });
+  assert.ok(!("upgrade" in recorded.installCalls[0]), "a start never asks for an upgrade");
+
+  const h = await setupRealInstall({ mlxLm: { version: "0.31.1", pipIndex: mirror } }, { venvExists: false, installed: { ok: true, version: "0.31.1" } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  const pipCalls = h.hostCalls.filter((call) => call.includes("pip"));
+  const indexArg = `--index-url=${mirror}`;
+  assert.deepEqual(pipCalls, [
+    [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "pip", indexArg],
+    [VENV_PYTHON, "-m", "pip", "install", "--upgrade", "mlx-lm==0.31.1", indexArg],
+  ]);
+  assert.deepEqual(errors(h.notes), []);
+  assert.equal(h.server.startCalls.length, 1);
+});
+
+test("an existing install makes exactly one host call, the import check, even when the pin differs from what is installed", async () => {
+  const h = await setupRealInstall({ mlxLm: { version: "0.31.1" } }, { venvExists: true, installed: { ok: true, version: "0.32.2" } });
+
+  await h.commands.get("mlx-start")!("qwen3_4b", h.ctx);
+
+  assert.deepEqual(h.hostCalls, [[VENV_PYTHON, "-c", "import mlx_lm"]]);
+  assert.deepEqual(warningTexts(h.notes), ["mlx-lm pinned 0.31.1 (global file), installed 0.32.2; run /mlx-init to apply"]);
   assert.equal(h.server.startCalls.length, 1);
 });

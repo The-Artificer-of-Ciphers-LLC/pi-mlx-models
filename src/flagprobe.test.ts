@@ -445,6 +445,55 @@ test("skippedNotice names every flag and the version, with the fix", () => {
   assert.equal(skippedNotice(["--kv-bits"], "0.31.3"), "Skipped --kv-bits: not supported by mlx-lm 0.31.3 (run /mlx-init to upgrade)");
 });
 
+test("under a pin the skip notice says the pin is the reason and how to change it", () => {
+  assert.equal(
+    skippedNotice(["--kv-bits"], "0.31.1", { version: "0.31.1", source: "project file" }),
+    "Skipped --kv-bits: not supported by mlx-lm 0.31.1 (mlx-lm is pinned to 0.31.1 by project file; raise or remove the pin, then run /mlx-init)",
+  );
+});
+
+test("a pin with no known source leaves the source out, and a call without a pin keeps today's text", () => {
+  assert.equal(
+    skippedNotice(["--kv-bits"], "0.31.1", { version: "0.31.1" }),
+    "Skipped --kv-bits: not supported by mlx-lm 0.31.1 (mlx-lm is pinned to 0.31.1; raise or remove the pin, then run /mlx-init)",
+  );
+  assert.equal(
+    skippedNotice(["--allowed-origins", "--num-draft-tokens"], "0.24.0"),
+    "Skipped --allowed-origins, --num-draft-tokens: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)",
+  );
+});
+
+// ---- installedVersion: the cheap version query on its own (plan 03-05) ----
+
+test("installedVersion returns the version after exactly one call, the version query, and never asks for --help", async () => {
+  const p = probeWith({ version: done("0.32.2\n") });
+
+  const result = await p.probe.installedVersion();
+
+  assert.deepEqual(result, { ok: true, version: "0.32.2" });
+  assert.equal(p.calls.length, 1);
+  assert.deepEqual(p.calls[0].args, VERSION_ARGS);
+  assert.equal(p.count("-m"), 0, "the --help command was never run");
+});
+
+test("installedVersion gives a reason when python exits with an error", async () => {
+  const p = probeWith({ version: done("", { code: 1 }) });
+
+  const result = await p.probe.installedVersion();
+
+  assert.equal(result.ok, false);
+  assert.match(!result.ok ? result.reason : "", /could not read the mlx-lm version/);
+});
+
+test("installedVersion gives a reason when the version query times out", async () => {
+  const p = probeWith({ version: done("", { code: null, timedOut: true }) });
+
+  const result = await p.probe.installedVersion();
+
+  assert.equal(result.ok, false);
+  assert.match(!result.ok ? result.reason : "", /timed out/);
+});
+
 // ---- the real runner ----
 
 const NODE = process.execPath;
