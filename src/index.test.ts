@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROVIDER_ID } from "./config.js";
 import { createExtension } from "./index.js";
-import type { ProbeResult } from "./flagprobe.js";
+import { parseHelpFlags, type ProbeResult } from "./flagprobe.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { SETTINGS } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
@@ -2049,6 +2049,70 @@ test("an install that lists every flag adds no warning and passes everything", a
     "--log-level=DEBUG",
     "--num-draft-tokens=4",
   ]);
+});
+
+const helpFixture = (name: string): string => readFileSync(new URL(`../test/fixtures/${name}`, import.meta.url), "utf8");
+const probeFromHelp = (version: string, fixtureName: string): ProbeResult => ({
+  ok: true,
+  version,
+  flags: parseHelpFlags(helpFixture(fixtureName)),
+});
+const ALL_PERFORMANCE = {
+  decodeConcurrency: 2,
+  promptConcurrency: 4,
+  prefillStepSize: 1024,
+  promptCacheSize: 5,
+  promptCacheBytes: 8589934592,
+};
+const PERFORMANCE_ELEMENTS = [
+  "--decode-concurrency=2",
+  "--prompt-concurrency=4",
+  "--prefill-step-size=1024",
+  "--prompt-cache-size=5",
+  "--prompt-cache-bytes=8589934592",
+];
+
+test("mlx-lm 0.30.7 passes the two concurrency flags, skips the other three performance flags with one warning, and still starts", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: ALL_PERFORMANCE });
+  const h = await setup({ settings, probe: async () => probeFromHelp("0.30.7", "mlx-server-help-0.30.7.txt") });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), [
+    "Skipped --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes: not supported by mlx-lm 0.30.7 (run /mlx-init to upgrade)",
+  ]);
+  assert.equal(h.server.startCalls.length, 1);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, ["--decode-concurrency=2", "--prompt-concurrency=4"]);
+  assert.equal(
+    startingNotes(h.notes)[0].split("\n")[1],
+    "flags: --decode-concurrency 2 (global file), --prompt-concurrency 4 (global file), --prefill-step-size 1024 (global file, skipped), --prompt-cache-size 5 (global file, skipped), --prompt-cache-bytes 8589934592 (global file, skipped)",
+  );
+});
+
+test("mlx-lm 0.31.1 passes all five performance flags with no warning", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: ALL_PERFORMANCE });
+  const h = await setup({ settings, probe: async () => probeFromHelp("0.31.1", "mlx-server-help-0.31.1.txt") });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), []);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, PERFORMANCE_ELEMENTS);
+});
+
+test("mlx-lm 0.24.0 skips all five performance flags with one warning naming them in row order", async () => {
+  const settings = freshSettings({});
+  writeGlobal(settings, { server: ALL_PERFORMANCE });
+  const h = await setup({ settings, probe: async () => probeFromHelp("0.24.0", "mlx-server-help-0.24.0.txt") });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.deepEqual(warningTexts(h.notes), [
+    "Skipped --decode-concurrency, --prompt-concurrency, --prefill-step-size, --prompt-cache-size, --prompt-cache-bytes: not supported by mlx-lm 0.24.0 (run /mlx-init to upgrade)",
+  ]);
+  assert.equal(h.server.startCalls.length, 1);
+  assert.deepEqual(h.server.launches[0]?.extraArgs, []);
 });
 
 test("a failed probe warns, passes every configured flag, and the start goes on", async () => {

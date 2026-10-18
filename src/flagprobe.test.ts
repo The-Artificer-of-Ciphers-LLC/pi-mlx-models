@@ -16,7 +16,7 @@ import {
 } from "./flagprobe.js";
 
 /**
- * Provenance of the three `--help` fixtures in test/fixtures (plan 02-07, decision 3).
+ * Provenance of the five `--help` fixtures in test/fixtures (plan 02-07, decision 3; plan 03-01 adds two).
  *
  * - mlx-server-help-0.32.2.txt is raw captured stdout of `python -m mlx_lm.server --help` from a venv holding
  *   mlx-lm 0.32.2 (Python 3.13), run as `env -u FORCE_COLOR NO_COLOR=1 PYTHONSAFEPATH=1 python -m mlx_lm.server
@@ -29,12 +29,37 @@ import {
  *   according to the "Added in" column of docs/research/mlx-config-gap-analysis.md section 1.1: 0.24.0 keeps the
  *   nine flags marked "old" plus --help, 0.28.1 adds the flags that arrived in 0.28.0. The usage block was
  *   re-wrapped to the same 17-column continuation layout. A real older wheel may lay out its help differently.
+ * - mlx-server-help-0.31.1.txt is REAL (plan 03-01): raw captured stdout of the same command from a throwaway venv
+ *   holding mlx-lm 0.31.1, unedited. 0.31.1 is the first usable release for --prefill-step-size and the three
+ *   prompt-cache flags: they first appear in 0.31.0, which is yanked. It has the five performance flags and --pipeline
+ *   but no --allowed-origins and none of the three KV quantization flags (those arrive after 0.31.1).
+ * - mlx-server-help-0.30.7.txt is SYNTHETIC (plan 03-01): the 0.28.1 text plus the usage tokens and option entries of
+ *   --decode-concurrency and --prompt-concurrency exactly as the 0.32.2 text prints them. The two concurrency flags
+ *   first appear in 0.30.6, so this fixture proves a per-flag partial skip (the other three performance flags are
+ *   missing). A real 0.30.7 wheel may lay out its help differently.
  */
 
 const fixture = (name: string): string => readFileSync(new URL(`../test/fixtures/${name}`, import.meta.url), "utf8");
 const HELP_0_32_2 = fixture("mlx-server-help-0.32.2.txt");
 const HELP_0_28_1 = fixture("mlx-server-help-0.28.1.txt");
 const HELP_0_24_0 = fixture("mlx-server-help-0.24.0.txt");
+const HELP_0_30_7 = fixture("mlx-server-help-0.30.7.txt");
+const HELP_0_31_1 = fixture("mlx-server-help-0.31.1.txt");
+
+const PERFORMANCE_FLAGS = [
+  "--decode-concurrency",
+  "--prompt-concurrency",
+  "--prefill-step-size",
+  "--prompt-cache-size",
+  "--prompt-cache-bytes",
+];
+const KV_FLAGS = ["--kv-bits", "--kv-group-size", "--quantized-kv-start"];
+/** Core host and port, then the five performance flags in schema order. */
+const PERFORMANCE_ROWS = [
+  { flag: "--host", core: true },
+  { flag: "--port", core: true },
+  ...PERFORMANCE_FLAGS.map((flag) => ({ flag, core: false })),
+];
 
 const FLAGS_0_24_0 = [
   "--help",
@@ -123,6 +148,41 @@ test("the 0.24.0 fixture additionally lacks the 0.28.0 flags", () => {
   for (const gone of ["--num-draft-tokens", "--temp", "--top-p", "--top-k", "--min-p", "--max-tokens", "--chat-template-args"]) {
     assert.equal(flags.has(gone), false, gone);
   }
+});
+
+test("the real 0.31.1 help lists the five performance flags and none of the three KV flags", () => {
+  const flags = parseHelpFlags(HELP_0_31_1);
+  assert.ok(flags.has("--model"));
+  for (const flag of PERFORMANCE_FLAGS) assert.equal(flags.has(flag), true, flag);
+  for (const flag of KV_FLAGS) assert.equal(flags.has(flag), false, flag);
+});
+
+test("the 0.30.7 fixture parses to the 0.28.1 flags plus the two concurrency flags", () => {
+  assert.deepEqual(
+    sorted(parseHelpFlags(HELP_0_30_7)),
+    sorted([...FLAGS_0_28_1, "--decode-concurrency", "--prompt-concurrency"]),
+  );
+});
+
+test("a probe of 0.24.0 skips all five performance flags in row order", () => {
+  const probe: ProbeResult = { ok: true, version: "0.24.0", flags: parseHelpFlags(HELP_0_24_0) };
+  const { passed, skipped } = partitionFlags(PERFORMANCE_ROWS, probe);
+  assert.deepEqual(passed.map((f) => f.flag), ["--host", "--port"]);
+  assert.deepEqual(skipped.map((f) => f.flag), PERFORMANCE_FLAGS);
+});
+
+test("a probe of 0.30.7 passes the two concurrency flags and skips the other three in row order", () => {
+  const probe: ProbeResult = { ok: true, version: "0.30.7", flags: parseHelpFlags(HELP_0_30_7) };
+  const { passed, skipped } = partitionFlags(PERFORMANCE_ROWS, probe);
+  assert.deepEqual(passed.map((f) => f.flag), ["--host", "--port", "--decode-concurrency", "--prompt-concurrency"]);
+  assert.deepEqual(skipped.map((f) => f.flag), ["--prefill-step-size", "--prompt-cache-size", "--prompt-cache-bytes"]);
+});
+
+test("a probe of 0.31.1 skips none of the performance flags", () => {
+  const probe: ProbeResult = { ok: true, version: "0.31.1", flags: parseHelpFlags(HELP_0_31_1) };
+  const { passed, skipped } = partitionFlags(PERFORMANCE_ROWS, probe);
+  assert.deepEqual(skipped, []);
+  assert.deepEqual(passed.map((f) => f.flag), ["--host", "--port", ...PERFORMANCE_FLAGS]);
 });
 
 test("an ANSI-coloured copy of the 0.32.2 help parses to the same set", () => {
