@@ -4928,3 +4928,158 @@ test("mlx-status is read only: it registers nothing, sets no status and reads no
   assert.equal(h.server.stopCalls, 0);
   assert.deepEqual(h.widgets, []);
 });
+
+// ---- the launch record's lifecycle: made by every start, ended with its server (plan 06-08: D-10, D-11, Pattern 3) ----
+
+/** The status of a server this session no longer owns: the foreign view, with the profile and flags unknown. */
+const assertNoSessionLines = (block: string) => {
+  assert.equal(block.includes("a start is under way"), false, block);
+  assert.equal(linesOf(block).some((line) => line.startsWith("server: ") && !line.includes("not started by this session")), false, block);
+  assert.equal(linesOf(block).some((line) => line.startsWith("flags: ") && line !== "flags: unknown"), false, block);
+  assert.equal(linesOf(block).some((line) => line.startsWith("profile: ") && line !== "profile: unknown"), false, block);
+};
+
+test("mlx-status record cleared by stop: the status shows no session lines afterwards", async () => {
+  const { h } = await lastSetup({ global: FAST_REQUEST_ONLY, setup: { probeHealth: async () => PROBE_NOTHING } });
+  await startMlx(h, "qwen3_4b --profile fast");
+  assert.ok((await statusBlock(h)).startsWith("status: down (the server this session started"), "premise: the record exists while the server runs");
+
+  await h.commands.get("mlx-stop")!("", h.ctx);
+  const block = await statusBlock(h);
+
+  assert.ok(block.startsWith("status: down (nothing is listening"), block);
+  assert.equal(block.includes("profile:"), false, block);
+  assert.equal(block.includes("flags:"), false, block);
+  assert.equal(block.includes("started by this session"), false, block);
+});
+
+test("mlx-status record cleared by a failed start: the next status does not say loading", async () => {
+  const { h } = await lastSetup({
+    setup: {
+      probeHealth: async () => PROBE_NOTHING,
+      server: {
+        start: async () => {
+          throw new Error("boom");
+        },
+      },
+    },
+  });
+  await startMlx(h, "qwen3_4b");
+  assert.deepEqual(errors(h.notes), ["mlx-start failed: boom"]);
+
+  const block = await statusBlock(h);
+
+  assert.ok(block.startsWith("status: down"), block);
+  assert.equal(block.includes("loading"), false, block);
+});
+
+test("mlx-status record cleared by an exit: the status no longer shows this session's lines", async () => {
+  let emit: ((event: { type: "exited" }) => void) | undefined;
+  const { h } = await lastSetup({
+    global: FAST_REQUEST_ONLY,
+    setup: {
+      probeHealth: async () => PROBE_ANSWERS(["org/other"]),
+      server: {
+        start: async (_model, onEvent) => {
+          for (const type of ["launched", "loading", "warming", "ready"] as const) onEvent?.({ type });
+          emit = (event) => onEvent?.(event);
+        },
+      },
+    },
+  });
+  await startMlx(h, "qwen3_4b --profile fast");
+  assert.ok((await statusBlock(h)).includes("--temp 0.2 (profile fast)"), "premise: the session's lines are shown while the server runs");
+
+  emit?.({ type: "exited" });
+  const block = await statusBlock(h);
+
+  assert.equal(block.includes("--temp 0.2"), false, block);
+  assert.ok(block.includes("not started by this session"), block);
+  assertNoSessionLines(block);
+});
+
+test("mlx-status record cleared by shutdown: the status shows no session lines afterwards", async () => {
+  const { h } = await lastSetup({ global: FAST_REQUEST_ONLY, setup: { probeHealth: async () => PROBE_ANSWERS(["org/other"]) } });
+  await startMlx(h, "qwen3_4b --profile fast");
+  assert.ok((await statusBlock(h)).includes("--temp 0.2 (profile fast)"), "premise: the session's lines are shown while the server runs");
+
+  await h.handlers.get("session_shutdown")!();
+  const block = await statusBlock(h);
+
+  assert.equal(block.includes("--temp 0.2"), false, block);
+  assertNoSessionLines(block);
+});
+
+test("mlx-status record survives a stale start: a superseded start that finishes late leaves the newer record", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const { h } = await lastSetup({
+    setup: {
+      probeHealth: async () => PROBE_ANSWERS(),
+      server: {
+        start: async () => {
+          calls += 1;
+          if (calls === 1) await gate.promise;
+        },
+      },
+    },
+  });
+
+  const first = startMlx(h, "qwen3_4b");
+  await flush();
+  assert.equal(calls, 1, "premise: the first server.start is in flight");
+  await startMlx(h, OTHER_PRESET.key);
+  gate.resolve();
+  await first;
+  const block = await statusBlock(h);
+
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes(OTHER_PRESET.modelId), block);
+  assert.equal(block.includes(QWEN_ID), false, block);
+});
+
+test("mlx-status record survives a stale start that fails late: the newer record is not cleared", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const { h } = await lastSetup({
+    setup: {
+      probeHealth: async () => PROBE_ANSWERS(),
+      server: {
+        start: async () => {
+          calls += 1;
+          if (calls === 1) {
+            await gate.promise;
+            throw new Error("late");
+          }
+        },
+      },
+    },
+  });
+
+  const first = startMlx(h, "qwen3_4b");
+  await flush();
+  await startMlx(h, OTHER_PRESET.key);
+  gate.resolve();
+  await first;
+  const block = await statusBlock(h);
+
+  assert.deepEqual(errors(h.notes), [], "the stale start's failure is not reported");
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes(OTHER_PRESET.modelId), block);
+});
+
+test("mlx-status record shows flags marked skipped, as the start message showed them", async () => {
+  const { h } = await lastSetup({
+    setup: {
+      probeHealth: async () => PROBE_ANSWERS(),
+      probe: async () => ({ ok: true, version: "0.20.0", flags: new Set<string>() }),
+    },
+  });
+
+  await startMlx(h, "qwen3_4b --prefill-step-size 1024");
+  const startFlags = linesOf(startingNotes(h.notes)[0]).find((line) => line.startsWith("flags: "));
+  assert.ok(startFlags !== undefined && startFlags.includes(", skipped"), `premise: the start marks the flag as skipped: ${startFlags}`);
+  const block = await statusBlock(h);
+
+  assert.ok(linesOf(block).includes(startFlags), block);
+});

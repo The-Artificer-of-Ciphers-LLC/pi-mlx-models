@@ -104,6 +104,8 @@ async function harness(
     ...fakePi,
     ...fakeCtx,
     dir,
+    /** Every child process the real server spawned, oldest first, so a test can kill one from outside. */
+    children,
     globalConfigPath,
     argvFile,
     requestFile,
@@ -1694,4 +1696,28 @@ test("mlx-status e2e: with nothing ever started the status is down and does not 
   assert.ok(block.includes("nothing is listening"), block);
   assert.equal(block.includes("started by this session"), false, block);
   assert.equal(existsSync(h.argvFile), false, "no child was started");
+});
+
+test("mlx-status e2e crash: after the child is killed from outside the status is down and claims no running session", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port }, models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } } });
+  await h.start("qwen3_4b --profile fast");
+  assert.deepEqual(errorNotes(h.notes), []);
+  const child = h.children.at(-1);
+  assert.ok(child, "premise: the real server spawned a child");
+
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.kill("SIGKILL");
+  await exited;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const before = h.notes.length;
+  await h.status();
+
+  const block = h.notes.slice(before)[0].message;
+  assert.ok(block.startsWith("status: down"), block);
+  assert.equal(block.includes("profile:"), false, block);
+  assert.equal(block.includes("flags:"), false, block);
+  assert.equal(block.includes("a start is under way"), false, block);
 });
