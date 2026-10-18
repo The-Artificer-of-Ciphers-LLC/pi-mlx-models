@@ -3033,3 +3033,50 @@ test("ignoreInstall still reports a typo inside the mlxLm block as an unknown ke
   assert.equal(result.ok, false);
   assert.ok(!result.ok && result.errors.some((line) => line.includes("unknown key") && line.includes("mlxLm.pipIndex")), JSON.stringify(result));
 });
+
+// ---- sampling to the server (SRV-03: D-07, D-08, D-09) ----
+
+test("a temperature in the sampling object of the global file becomes one --temp flag labelled with its layer", () => {
+  const launch = launchOf({ global: ok({ model: { sampling: { temperature: 0.2 } } }) });
+  assert.deepEqual(
+    launch.flags.filter((flag) => flag.flag === "--temp"),
+    [{ path: "model.sampling.temperature", flag: "--temp", args: ["--temp=0.2"], display: "0.2", label: "global file", core: false }],
+  );
+});
+
+test("a temperature of 0 is accepted and emitted, because the row has no default", () => {
+  assert.deepEqual(extraOf({ global: ok({ model: { sampling: { temperature: 0 } } }) }), ["--temp=0"]);
+});
+
+for (const [name, value] of [
+  ["-1", -1],
+  ['the string "0.2"', "0.2"],
+  ["true", true],
+  ["null", null],
+  ["an empty list", []],
+] as const) {
+  test(`model.sampling.temperature with ${name} is refused with the range, the OpenAI field and the flag`, () => {
+    const lines = refused({ global: ok({ model: { sampling: { temperature: value } } }) });
+    assert.deepEqual(lines, [
+      `model.sampling.temperature (${GLOBAL}): ${JSON.stringify(value)} is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+    ]);
+  });
+}
+
+test("model.sampling.temperature with a value that parses to Infinity is refused", () => {
+  const data = JSON.parse('{"model":{"sampling":{"temperature":1e999}}}') as Record<string, unknown>;
+  const lines = refused({ global: ok(data) });
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  assert.ok(lines[0].startsWith(`model.sampling.temperature (${GLOBAL}): `), lines[0]);
+  assert.ok(lines[0].endsWith("is not a number of at least 0 (OpenAI field temperature, flag --temp)"), lines[0]);
+});
+
+test("a sampling value that is not an object is one line", () => {
+  assert.deepEqual(refused({ global: ok({ model: { sampling: "x" } }) }), [`model.sampling (${GLOBAL}): "x" must be a JSON object`]);
+});
+
+test("a mistyped key inside the sampling object is reported with the key it was probably meant for", () => {
+  assert.deepEqual(refused({ global: ok({ model: { sampling: { temprature: 0.2 } } }) }), [
+    `model.sampling.temprature (${GLOBAL}): unknown key (did you mean temperature?)`,
+  ]);
+});

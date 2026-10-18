@@ -577,3 +577,41 @@ test("all three KV flags typed on /mlx-start reach the process in schema order, 
   );
   assert.equal(h.notes.filter((n) => n.type === "warning").length, 1);
 });
+
+// ---- sampling to the server (SRV-03): a temperature in the sampling object reaches the argv and the flags line ----
+
+test("a temperature in the sampling object of the global file reaches the process and the flags line", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port }, model: { sampling: { temperature: 0.2 } } });
+
+  await h.start();
+
+  assert.deepEqual(h.argv(), ["--model", QWEN.modelId, "--host", "127.0.0.1", "--port", String(port), "--temp=0.2"]);
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  assert.equal(
+    starting[0].message,
+    `Starting MLX server with ${QWEN.modelId} (preset: qwen3_4b)...\nflags: --port ${port} (global file), --temp 0.2 (global file)`,
+  );
+
+  await h.stop();
+  assert.equal(await connectRefused(port), true, "stop must wait on the launch's own port");
+});
+
+test("a negative temperature in the global file stops the start before any side effect", { timeout: 30_000 }, async (t) => {
+  const h = await harness(t);
+  h.writeConfig({ model: { sampling: { temperature: -1 } } });
+
+  await h.start();
+
+  const errors = h.notes.filter((n) => n.type === "error");
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0].message.startsWith("mlx-start failed: invalid configuration"), errors[0].message);
+  assert.ok(
+    errors[0].message.includes("model.sampling.temperature (global config.json): -1 is not a number of at least 0 (OpenAI field temperature, flag --temp)"),
+    errors[0].message,
+  );
+  assert.equal(h.installCalls, 0);
+  assert.equal(existsSync(h.argvFile), false, "nothing may be spawned");
+});
