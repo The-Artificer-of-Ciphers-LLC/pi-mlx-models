@@ -5122,6 +5122,38 @@ test("mlx-status record replaced during the probe: the status describes the newe
   assert.equal(block.includes("not started by this session"), false, block);
 });
 
+test("mlx-status record replaced again during the second look: the status still describes the newest launch", async () => {
+  const gates = [deferred(), deferred()];
+  let probes = 0;
+  const { h } = await lastSetup({
+    setup: {
+      probeHealth: async () => {
+        probes += 1;
+        const gate = gates[probes - 1];
+        if (gate !== undefined) await gate.promise;
+        return PROBE_ANSWERS();
+      },
+    },
+  });
+  await startMlx(h, "qwen3_4b");
+
+  const status = statusCommand(h);
+  await flush();
+  assert.equal(probes, 1, "premise: the first probe of the status is in flight");
+  await startMlx(h, OTHER_PRESET.key);
+  gates[0].resolve();
+  await flush();
+  assert.equal(probes, 2, "premise: the second look is in flight");
+  await startMlx(h, "qwen3_4b");
+  gates[1].resolve();
+  await status;
+  const block = h.notes[h.notes.length - 1].message;
+
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes(QWEN_ID), block);
+  assert.equal(block.includes("not started by this session"), false, block);
+});
+
 test("mlx-status record shows flags marked skipped, as the start message showed them", async () => {
   const { h } = await lastSetup({
     setup: {
