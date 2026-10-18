@@ -301,52 +301,145 @@ interface RepoTarget {
   fragment: string;
 }
 
+/** A line that opens or closes a fenced code block. */
+const FENCE = /^\s*(```|~~~)/;
+
 /** The anchor GitHub gives a heading. */
 function githubSlug(heading: string): string {
-  void heading;
-  return "";
+  return heading
+    .replace(/`/g, "")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\*/g, "")
+    .replace(/(?<![\p{L}\p{N}])_+|_+(?![\p{L}\p{N}])/gu, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s_-]/gu, "")
+    .trim()
+    .replace(/\s/g, "-");
 }
 
 /** The anchors a markdown text defines: one per heading outside code, repeats numbered -1, -2, and so on. */
 function anchorsOf(markdown: string): Set<string> {
-  void markdown;
-  return new Set();
+  const anchors = new Set<string>();
+  const seen = new Map<string, number>();
+  let fenced = false;
+  for (const line of markdown.split("\n")) {
+    if (FENCE.test(line)) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced) continue;
+    const match = /^ {0,3}#{1,6}[ \t]+(.*)$/.exec(line);
+    if (match === null) continue;
+    const slug = githubSlug(match[1].replace(/[ \t]+#+[ \t]*$/, "").trim());
+    const count = seen.get(slug) ?? 0;
+    seen.set(slug, count + 1);
+    anchors.add(count === 0 ? slug : `${slug}-${count}`);
+  }
+  return anchors;
+}
+
+/** The text without fenced blocks and inline code spans. */
+function withoutCode(markdown: string): string {
+  const kept: string[] = [];
+  let fenced = false;
+  for (const line of markdown.split("\n")) {
+    if (FENCE.test(line)) fenced = !fenced;
+    else if (!fenced) kept.push(line.replace(/`[^`\n]*`/g, ""));
+  }
+  return kept.join("\n");
 }
 
 /** Every link target in a markdown text, in order: links, images, HTML href and src, reference definitions; none from code. */
 function linkTargetsOf(markdown: string): string[] {
-  void markdown;
-  return [];
+  // `](` rather than a whole link, so the link around a badge image ([![alt](img)](url)) is found as well as the image.
+  const pattern = /\]\([ \t]*(<[^>\n]*>|[^\s)]*)|\b(?:href|src)=(?:"([^"]*)"|'([^']*)')|^ {0,3}\[[^\]\n]+\]:[ \t]*(<[^>\n]*>|\S+)/gm;
+  const targets: string[] = [];
+  for (const match of withoutCode(markdown).matchAll(pattern)) {
+    const raw = match[1] ?? match[2] ?? match[3] ?? match[4] ?? "";
+    const target = raw.startsWith("<") && raw.endsWith(">") ? raw.slice(1, -1) : raw;
+    if (target !== "") targets.push(target);
+  }
+  return targets;
+}
+
+const URL_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+/** Percent-decoding that leaves a malformed sequence as written. */
+function decoded(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
 }
 
 /** Where a link target points inside the repository, or null when it points elsewhere. */
 function repoPathOf(target: string, fromFile: string, repo: RepoRef): RepoTarget | null {
-  void target;
-  void fromFile;
-  void repo;
-  return null;
+  let local = target;
+  if (URL_SCHEME.test(target)) {
+    const own = `https://github.com/${repo.owner}/${repo.name}/`;
+    const raw = `https://raw.githubusercontent.com/${repo.owner}/${repo.name}/main/`;
+    if (target.startsWith(own + "blob/main/")) local = "/" + target.slice((own + "blob/main/").length);
+    else if (target.startsWith(own + "tree/main/")) local = "/" + target.slice((own + "tree/main/").length);
+    else if (target.startsWith(raw)) local = "/" + target.slice(raw.length);
+    else return null;
+  }
+  const hash = local.indexOf("#");
+  const pathPart = hash === -1 ? local : local.slice(0, hash);
+  const fragment = hash === -1 ? "" : decoded(local.slice(hash + 1));
+  if (pathPart === "") return { path: fromFile, fragment };
+  const text = decoded(pathPart);
+  const joined = text.startsWith("/") ? posix.normalize(text.slice(1)) : posix.normalize(posix.join(posix.dirname(fromFile), text));
+  // A target that climbs out of the repository has no path; the caller reports it and never reads it.
+  if (joined === ".." || joined.startsWith("../")) return { path: "", fragment };
+  return { path: joined === "." ? "" : joined.replace(/\/$/, ""), fragment };
 }
 
 /** Owner and name of the GitHub repository, read from package.json. */
 function repoFromPackage(): RepoRef {
-  void readRepo;
-  return { owner: "", name: "" };
+  const url = (JSON.parse(readRepo("package.json")) as { repository?: { url?: string } }).repository?.url ?? "";
+  const match = /github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?$/.exec(url);
+  assert.ok(match !== null, `package.json repository.url is not a GitHub URL: ${url}`);
+  return { owner: match[1], name: match[2] };
 }
 
 /** One line per link in the files (paths from rootDir) that does not resolve: no file, no anchor, or a path that leaves the repository. */
 function linkProblems(rootDir: string, files: readonly string[], repo: RepoRef): string[] {
-  void rootDir;
-  void files;
-  void repo;
-  void [existsSync, statSync, readFileSync, dirname, resolve, relative, posix];
-  return [];
+  const problems: string[] = [];
+  const anchorCache = new Map<string, Set<string>>();
+  const anchorsIn = (path: string, absolute: string): Set<string> => {
+    let anchors = anchorCache.get(path);
+    if (anchors === undefined) {
+      anchors = anchorsOf(readFileSync(absolute, "utf8"));
+      anchorCache.set(path, anchors);
+    }
+    return anchors;
+  };
+  for (const file of files) {
+    for (const target of linkTargetsOf(readFileSync(resolve(rootDir, file), "utf8"))) {
+      const found = repoPathOf(target, file, repo);
+      if (found === null) continue;
+      const absolute = found.path === "" ? "" : resolve(rootDir, found.path);
+      const inside = absolute !== "" && !relative(rootDir, absolute).startsWith("..");
+      if (!inside) {
+        problems.push(`${file}: ${target}: escapes the repository`);
+        continue;
+      }
+      if (!existsSync(absolute)) {
+        problems.push(`${file}: ${target}: no such file`);
+        continue;
+      }
+      if (found.fragment !== "" && found.path.endsWith(".md") && statSync(absolute).isFile()) {
+        if (!anchorsIn(found.path, absolute).has(found.fragment.toLowerCase())) problems.push(`${file}: ${target}: no such anchor`);
+      }
+    }
+  }
+  return problems;
 }
 
 /** The pages that no link reaches. */
 function unlinkedPages(pages: readonly string[], linkedPaths: ReadonlySet<string>): string[] {
-  void pages;
-  void linkedPaths;
-  return [];
+  return pages.filter((page) => !linkedPaths.has(page));
 }
 
 const REPO: RepoRef = { owner: "OWNER", name: "REPO" };
