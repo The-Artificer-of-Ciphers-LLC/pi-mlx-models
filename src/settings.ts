@@ -449,6 +449,12 @@ export const SETTINGS: readonly SettingDef[] = [
     mlxFlag: "--kv-bits",
     emit: valued("--kv-bits"),
   },
+  // The bounds below are sanity bounds only (D-17); the limits MLX enforces are in the wording.
+  integerFlagRow("kvGroupSize", "--kv-group-size", { expected: "an integer of at least 1 (MLX supports 32, 64 and 128)" }),
+  integerFlagRow("quantizedKvStart", "--quantized-kv-start", {
+    min: 0,
+    expected: "an integer of at least 0 (quantization starts after this many tokens)",
+  }),
   {
     path: "model.adapterPath",
     kind: "path",
@@ -1213,12 +1219,29 @@ export interface KvNotices {
   info?: string;
 }
 
+/** `--flag value`, `--flag value and --flag value`: the flags of a notice with their cleaned values. */
+const flagList = (flags: readonly LaunchFlag[]): string => flags.map((flag) => `${flag.flag} ${flag.display}`).join(" and ");
+
 /**
- * The words after the batching sentence when a concurrency setting is also set. Nothing is dropped from the launch
- * (D-10); the user is only told those settings do nothing while kvBits is set. Filled in by the interaction task.
+ * "{list} has no effect {tail}", or "have" for two. The values are the `display` of validated safe integers; no
+ * argv element is parsed again.
  */
-function concurrencyClause(_launch: ResolvedLaunch, _skipped: ReadonlySet<string> | undefined): string {
-  return "";
+const noEffect = (flags: readonly LaunchFlag[], tail: string): string =>
+  `${flagList(flags)} ${flags.length === 1 ? "has" : "have"} no effect ${tail}`;
+
+/** The flags of `paths` that the launch sets and the install can do, in launch (schema) order. */
+const setFlags = (launch: ResolvedLaunch, skipped: ReadonlySet<string> | undefined, paths: readonly string[]): LaunchFlag[] =>
+  launch.flags.filter((flag) => paths.includes(flag.path) && !skipped?.has(flag.flag));
+
+/**
+ * The words after the batching sentence when a concurrency setting above 1 is also set. Nothing is dropped from the
+ * launch (D-10); the user is only told those settings do nothing while kvBits is set.
+ */
+function concurrencyClause(launch: ResolvedLaunch, skipped: ReadonlySet<string> | undefined): string {
+  const above = setFlags(launch, skipped, ["server.decodeConcurrency", "server.promptConcurrency"]).filter(
+    (flag) => /^\d+$/.test(flag.display) && Number(flag.display) > 1,
+  );
+  return above.length === 0 ? "" : noEffect(above, "while --kv-bits is set.");
 }
 
 /**
@@ -1227,12 +1250,16 @@ function concurrencyClause(_launch: ResolvedLaunch, _skipped: ReadonlySet<string
  * `label` of validated flags (T-03-04), and no state is kept, so every launch gets its own notices.
  */
 export function kvNotices(launch: ResolvedLaunch, skipped?: ReadonlySet<string>): KvNotices {
-  const bits = launch.flags.find((flag) => flag.path === "server.kvBits" && !skipped?.has(flag.flag));
-  if (bits === undefined) return {};
-  const clause = concurrencyClause(launch, skipped);
-  return {
-    warning: `KV quantization (${bits.flag} ${bits.display}, ${bits.label}): Disables batching, so requests are served one at a time.${clause ? ` ${clause}` : ""}`,
-  };
+  const bits = launch.flags.find((flag) => flag.path === "server.kvBits");
+  if (bits !== undefined) {
+    if (skipped?.has(bits.flag)) return {};
+    const clause = concurrencyClause(launch, skipped);
+    return {
+      warning: `KV quantization (${bits.flag} ${bits.display}, ${bits.label}): Disables batching, so requests are served one at a time.${clause ? ` ${clause}` : ""}`,
+    };
+  }
+  const idle = setFlags(launch, skipped, ["server.kvGroupSize", "server.quantizedKvStart"]);
+  return idle.length === 0 ? {} : { info: noEffect(idle, "without --kv-bits.") };
 }
 
 /** The most problem lines one refusal shows; the rest are counted. */
