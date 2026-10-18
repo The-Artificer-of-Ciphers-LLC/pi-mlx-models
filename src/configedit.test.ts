@@ -453,6 +453,23 @@ test("editConfig never overwrites what it cannot read: six unreadable shapes com
   assert.equal(statSync(directory).isDirectory(), true);
 });
 
+test("editConfig too deeply nested: a file nested past the stack comes back unreadable and stays as it was, never a thrown error", (t) => {
+  const dir = tempDir(t);
+  const path = join(dir, "config.json");
+  const depth = 100000;
+  const text = `{"x":${"[".repeat(depth)}${"]".repeat(depth)}}`;
+  writeFileSync(path, text);
+  const outcome = editConfig(path, (draft) => setAt(draft, ["server", "port"], 8081));
+  assert.equal(outcome.ok, false);
+  if (!outcome.ok) {
+    assert.equal(outcome.kind, "unreadable");
+    assert.ok(outcome.message.includes(path));
+    assert.match(outcome.message, /nested too deeply/);
+    assert.match(outcome.message, /not changed/);
+  }
+  assert.equal(readFileSync(path, "utf8"), text);
+});
+
 /** A valid file made of one long model key, so its size is set by the key's length. */
 function paddedTree(size: number): ConfigTree {
   const overhead = Buffer.byteLength(pretty({ models: { "": {} } }));
