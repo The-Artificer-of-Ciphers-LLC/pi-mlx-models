@@ -5287,3 +5287,131 @@ test("mlx-restart with nothing running and an unreadable record says the file is
   assertNothingHappened(h);
   assert.equal(readFileSync(recordFile, "utf8"), "this is not json\n", "the file is left as it was");
 });
+
+// ---- /mlx-restart: the kept selection, flags never kept, the remembered launch, a restart during a start (plan 06-09: D-04, D-13, D-14) ----
+
+const A_AND_B = (defaultProfile?: string) => ({
+  models: {
+    qwen3_4b: {
+      ...(defaultProfile === undefined ? {} : { defaultProfile }),
+      profiles: { a: { sampling: { temperature: 0.2 } }, b: { sampling: { temperature: 0.9 } } },
+    },
+  },
+});
+const profileLineOf = (message: string) => message.split("\n")[1];
+const lastStartingNote = (notes: Note[]) => startingNotes(notes).at(-1) ?? "";
+const tempArgs = (h: Harness, index: number) => (h.server.launches[index]?.extraArgs ?? []).filter((arg) => arg.startsWith("--temp"));
+
+test("mlx-restart keeps a typed profile: changing defaultProfile in the file does not change it", async () => {
+  const { h, settings } = await lastSetup({ global: A_AND_B("b") });
+  await startMlx(h, "qwen3_4b --profile a");
+  assert.deepEqual(tempArgs(h, 0), ["--temp=0.2"], "premise: the typed profile won over defaultProfile");
+
+  await restartCommand(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(tempArgs(h, 1), ["--temp=0.2"]);
+  assert.equal(profileLineOf(lastStartingNote(h.notes)), "profile: a (previous launch)");
+  assert.equal(readFileSync(recordFileOf(settings), "utf8").includes('"profile":"a"'), true);
+});
+
+test("mlx-restart follows defaultProfile when nothing was selected: a changed default takes effect", async () => {
+  const { h, settings } = await lastSetup({ global: A_AND_B("a") });
+  await startMlx(h, "qwen3_4b");
+  assert.deepEqual(tempArgs(h, 0), ["--temp=0.2"], "premise: defaultProfile a decided the first start");
+
+  writeGlobal(settings, A_AND_B("b"));
+  await restartCommand(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(tempArgs(h, 1), ["--temp=0.9"]);
+  assert.ok(lastStartingNote(h.notes).includes("profile: b"), lastStartingNote(h.notes));
+});
+
+test("mlx-restart --profile switches the profile and the switch sticks for the next restart", async () => {
+  const { h } = await lastSetup({ global: A_AND_B() });
+  await startMlx(h, "qwen3_4b --profile a");
+
+  await restartCommand(h, "--profile b");
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(tempArgs(h, 1), ["--temp=0.9"]);
+  assert.equal(profileLineOf(lastStartingNote(h.notes)), "profile: b (/mlx-restart)");
+
+  await restartCommand(h);
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(tempArgs(h, 2), ["--temp=0.9"]);
+  assert.equal(profileLineOf(lastStartingNote(h.notes)), "profile: b (previous launch)");
+});
+
+test("mlx-restart overrides apply once and the status shows them", async () => {
+  const { h } = await lastSetup({ global: A_AND_B(), setup: RESTART_PROBE });
+  await startMlx(h, "qwen3_4b --profile a");
+
+  await restartCommand(h, "--log-level DEBUG");
+  assert.deepEqual(errors(h.notes), []);
+  assert.ok(h.server.launches[1]?.extraArgs.includes("--log-level=DEBUG"), JSON.stringify(h.server.launches[1]?.extraArgs));
+  const shown = linesOf(await statusBlock(h)).find((line) => line.startsWith("flags: "));
+  assert.ok(shown !== undefined && shown.includes("--log-level DEBUG"), String(shown));
+
+  await restartCommand(h);
+  assert.equal(h.server.launches[2]?.extraArgs.some((arg) => arg.startsWith("--log-level")), false, JSON.stringify(h.server.launches[2]?.extraArgs));
+  const later = linesOf(await statusBlock(h)).find((line) => line.startsWith("flags: "));
+  assert.equal((later ?? "").includes("--log-level"), false, String(later));
+});
+
+test("mlx-restart replays the model by its id: the overlay of the preset it was started by still applies", async () => {
+  const { h } = await lastSetup({ global: { models: { [OTHER_PRESET.key]: { draftModel: "by-key", numDraftTokens: 3 } } } });
+  await startMlx(h, OTHER_PRESET.key);
+  const first = h.server.launches[0]?.extraArgs ?? [];
+  assert.ok(first.some((arg) => arg.includes("by-key")), `premise: the preset overlay reaches the first start: ${JSON.stringify(first)}`);
+
+  await restartCommand(h);
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(h.server.startCalls, [OTHER_PRESET.modelId, OTHER_PRESET.modelId], "a model other than the default is restarted");
+  assert.deepEqual(h.server.launches[1]?.extraArgs, first, "the same overlay, so the id was mapped back to the preset");
+  assert.ok(lastStartingNote(h.notes).includes(`(preset: ${OTHER_PRESET.key})`), lastStartingNote(h.notes));
+});
+
+test("mlx-restart updates the remembered launch: the record holds the model and the profile of the restart", async () => {
+  const { h, settings } = await lastSetup({ global: A_AND_B() });
+  await startMlx(h, "qwen3_4b --profile a");
+
+  await restartCommand(h, "--profile b");
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(JSON.parse(readFileSync(recordFileOf(settings), "utf8")), { version: 1, model: QWEN_ID, profile: "b" });
+});
+
+test("mlx-restart during a start in flight starts again, and the first start finishing late neither writes the record nor replaces the newer launch", async () => {
+  const gate = deferred();
+  let calls = 0;
+  const { h, settings } = await lastSetup({
+    global: A_AND_B(),
+    setup: {
+      probeHealth: async () => PROBE_ANSWERS(),
+      server: {
+        start: async () => {
+          calls += 1;
+          if (calls === 1) await gate.promise;
+        },
+      },
+    },
+  });
+
+  const first = startMlx(h, "qwen3_4b --profile a");
+  await flush();
+  assert.equal(calls, 1, "premise: the first server.start is in flight");
+  await restartCommand(h, "--profile b");
+  assert.equal(calls, 2);
+  assert.deepEqual(h.server.startCalls, [QWEN_ID, QWEN_ID]);
+  gate.resolve();
+  await first;
+
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(JSON.parse(readFileSync(recordFileOf(settings), "utf8")), { version: 1, model: QWEN_ID, profile: "b" }, "the late first start did not write");
+  const block = await statusBlock(h);
+  assert.ok(block.startsWith("status: ready"), block);
+  assert.ok(block.includes("profile: b (/mlx-restart)"), block);
+  assert.equal(block.includes("profile: a"), false, block);
+});
