@@ -605,7 +605,7 @@ test("renderConfig unusable: says the file cannot be used, gives the reason and 
   assert.equal(existsSync("/cfg"), false);
 });
 
-test("isPlausibleModelKey: a preset key, an id with a slash and a local path can match a start; a bare name or a profile name cannot", () => {
+test("isPlausibleModelKey: a preset key and an id with a slash (a path has one) are plausible; a bare name or a profile name is not, though a start given exactly that name still uses it", () => {
   for (const preset of MODEL_PRESETS) assert.equal(isPlausibleModelKey(preset.key), true, preset.key);
   for (const key of ["org/name", "mlx-community/Qwen3-4B-Instruct-2507-4bit", "/abs/path/model", "./rel/model", "../up/model"]) {
     assert.equal(isPlausibleModelKey(key), true, key);
@@ -638,15 +638,25 @@ test("isPlausibleModelKey WR-01: a bare id such as gpt2 is classified as unlikel
   assert.equal(isPlausibleModelKey("gpt2"), false);
 });
 
-test("configedit the validateModelKey comment tells the truth: it names isPlausibleModelKey and no longer credits the shape rules to the settings module", () => {
-  const text = readFileSync(new URL("../src/configedit.ts", import.meta.url), "utf8");
-  const end = text.indexOf("export function validateModelKey");
-  assert.ok(end > 0, "validateModelKey not found in src/configedit.ts");
-  const start = text.lastIndexOf("/**", end);
-  assert.ok(start >= 0 && text.indexOf("*/", start) < end, "no doc comment above validateModelKey");
-  const block = text.slice(start, end);
-  assert.ok(block.includes("isPlausibleModelKey"), block);
-  assert.equal(block.includes("rule the settings module puts on a model id"), false, block);
+test("isPlausibleModelKey IN-02: every absolute or relative path contains a slash, so the plausibility check needs no local-path test", () => {
+  for (const key of ["/", "./", "../", "/a", "./a", "../a", "~/a", "/abs/path/model", "./rel/model", "../up/model"]) {
+    assert.equal(isPlausibleModelKey(key), true, key);
+  }
+  for (const key of [".", "..", "", "gpt2"]) {
+    assert.equal(isPlausibleModelKey(key), false, JSON.stringify(key));
+  }
+});
+
+test("configedit IN-03: the settings layer accepts any text as a models key, so only the menu can tell a stray key from a usable one", (t) => {
+  const dir = tempDir(t);
+  for (const key of ["gpt2", "careful", "__proto__", "toString", "has space", "a@b"]) {
+    const path = join(dir, `config-${Buffer.from(key).toString("hex")}.json`);
+    writeFileSync(path, `{"models": {${JSON.stringify(key)}: {}}}`);
+    const result = resolved(path);
+    assert.ok(result.ok, `${key}: ${JSON.stringify(result)}`);
+    assert.equal(validateModelKey(key).ok, true, key);
+    assert.equal(typeof isPlausibleModelKey(key), "boolean", key);
+  }
 });
 
 test("modelEntrySummary: the sorted profile names, option keys and default profile of one entry; anything else is the empty summary", () => {
