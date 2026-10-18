@@ -690,6 +690,10 @@ const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
 const MODELS_KEY = "models";
 /** The block the entries of `models` are written in: an entry holds the keys of the `model` block. */
 const MODEL_BLOCK = "model";
+/** The block of the install rows: which mlx-lm /mlx-init installs and where from (D-04). */
+const INSTALL_BLOCK = "mlxLm";
+/** True for the install rows, so the extension-load resolution can leave them out (`PrepareInput.ignoreInstall`). */
+const isInstallRow = (row: SettingDef): boolean => row.path.startsWith(`${INSTALL_BLOCK}.`);
 /** The block names of nested keys, e.g. "server". */
 const BLOCKS = new Set(SETTINGS.filter((row) => row.path.includes(".")).map((row) => row.path.split(".")[0]));
 
@@ -931,7 +935,7 @@ const showKey = (path: string): string => clipDiagnostic(cleanLabel(path), 80, "
  * Keys are compared against the schema with Map and Set lookups only, and parsed keys are never assigned onto
  * another object, so a key such as `__proto__` is just an unknown key (T-02-08).
  */
-function readFileLayer(file: LayerFile | undefined, layer: "global" | "project", problems: string[]): FileLayerData {
+function readFileLayer(file: LayerFile | undefined, layer: "global" | "project", problems: string[], ignoreInstall: boolean): FileLayerData {
   const data: FileLayerData = { values: new Map(), models: new Map() };
   const label = FILE_LABEL[layer];
   if (file === undefined || file.state === "absent") return data;
@@ -947,6 +951,8 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
       problems.push(`${showKey(path)} (${label}): unknown key${unknownKeyHint(key, block, `"${block}"`)}`);
       return;
     }
+    // An install row is not read at all when the caller leaves the install settings out; an unknown key was reported above.
+    if (ignoreInstall && isInstallRow(row)) return;
     const result = row.check(value);
     if (result.ok) data.values.set(path, result.value);
     else problems.push(`${path} (${label}): ${(result.problem ?? row.problem)(showValue(value))}${flagSuffix(row)}`);
@@ -1045,11 +1051,12 @@ function projectViolationsOf(project: ReadonlyMap<string, SettingValue>): Projec
  */
 export function prepareSettings(input: PrepareInput): PrepareResult {
   const warnings: string[] = [];
+  const ignoreInstall = input.ignoreInstall === true;
   // Problems are collected per layer and reported highest precedence first (the environment only warns).
   const problems: Record<LayerName, string[]> = { args: [], piFlags: [], env: [], project: [], global: [] };
   const files = {
-    global: readFileLayer(input.global, "global", problems.global),
-    project: readFileLayer(input.project, "project", problems.project),
+    global: readFileLayer(input.global, "global", problems.global, ignoreInstall),
+    project: readFileLayer(input.project, "project", problems.project, ignoreInstall),
   };
   const fileValues = { global: files.global.values, project: files.project.values };
 
@@ -1096,6 +1103,8 @@ export function prepareSettings(input: PrepareInput): PrepareResult {
   };
   for (const row of SETTINGS) {
     if (row.perModel === true) continue;
+    // One skip before any layer is consulted: no environment line, no environment warning, no flag, no file value.
+    if (ignoreInstall && isInstallRow(row)) continue;
     for (const layer of PRECEDENCE) {
       const value = candidate(row, layer);
       if (value !== undefined) {

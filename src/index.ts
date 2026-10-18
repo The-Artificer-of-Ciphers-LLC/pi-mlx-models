@@ -153,12 +153,15 @@ export function createExtension(overrides: Partial<ExtensionDeps> = {}) {
   /**
    * The settings in effect outside any /mlx-start: the global file plus the environment, or the environment
    * alone when the file is unusable. Never throws; it only supplies the initial provider URL and model.
+   * It deliberately ignores the install settings (the pip index and the version pin): they decide nothing about the
+   * provider, so a bad value must not replace the valid base URL and default model. `/mlx-init` and `/mlx-start`
+   * resolve without this option and are the ones that report such a value. Nothing is ever installed from this result.
    */
   function ambientSettings(): Pick<Prepared, "baseUrl" | "defaultModel"> {
     const env = deps.settings.env;
-    const withFile = prepareSettings({ global: readLayerFile(deps.settings.globalConfigPath), env });
+    const withFile = prepareSettings({ global: readLayerFile(deps.settings.globalConfigPath), env, ignoreInstall: true });
     if (withFile.ok) return withFile.prepared;
-    const envOnly = prepareSettings({ global: { state: "absent" }, env });
+    const envOnly = prepareSettings({ global: { state: "absent" }, env, ignoreInstall: true });
     if (envOnly.ok) return envOnly.prepared;
     return { baseUrl: deriveBaseUrl(DEFAULT_HOST, DEFAULT_PORT), defaultModel: DEFAULT_MODEL_ID };
   }
