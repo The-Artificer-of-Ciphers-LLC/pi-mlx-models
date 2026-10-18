@@ -2,8 +2,8 @@
  * What pi is told about a model: its context window, output limit, reasoning flag and input kinds, and where each value
  * came from (MOD-01). The context window is read from the model's own `config.json`.
  */
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { HF_HOME } from "./config.js";
 
 /** The context window registered for a model whose `config.json` cannot be read or holds no usable value (D-03). */
@@ -89,46 +89,121 @@ export function resolveCacheRoot(env: Record<string, string | undefined>, hfHome
 
 const NOT_AN_ID = "not a Hugging Face repository id or an absolute path";
 const NOT_IN_CACHE = "not in the Hugging Face cache";
+const NO_CONFIG_IN_DIRECTORY = "no config.json in that directory";
+const NOT_A_FILE = "config.json is not a regular file";
+const TOO_LARGE = "config.json is larger than 2 MiB";
 const NOT_JSON = "config.json is not valid JSON";
 const NOT_AN_OBJECT = "config.json is not a JSON object";
 const UNREADABLE = "config.json could not be read";
 
-const parseConfig = (text: string, source: "cache" | "hub" | "path"): ModelConfigRead => {
+/** What looking at one `config.json` path found: nothing there, a file that is refused, or its text. */
+type FileOutcome = { kind: "missing" } | { kind: "refused"; reason: string } | { kind: "text"; text: string };
+
+/**
+ * Read `file` only when it is a regular file of at most `MAX_CONFIG_BYTES` (T-05-06). `statSync` follows a symlink, so the
+ * snapshot files of the Hugging Face cache, which are links into `blobs/`, are checked as the files they point to. The size
+ * is checked again on the bytes read, in case the file grew after the first check.
+ */
+function readConfigFile(file: string): FileOutcome {
+  let stat;
+  try {
+    stat = statSync(file);
+  } catch {
+    return { kind: "missing" };
+  }
+  if (!stat.isFile()) return { kind: "refused", reason: NOT_A_FILE };
+  if (stat.size > MAX_CONFIG_BYTES) return { kind: "refused", reason: TOO_LARGE };
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(file);
+  } catch {
+    return { kind: "refused", reason: UNREADABLE };
+  }
+  if (bytes.length > MAX_CONFIG_BYTES) return { kind: "refused", reason: TOO_LARGE };
+  return { kind: "text", text: bytes.toString("utf8") };
+}
+
+/** The outcome of one file as a `ModelConfigRead`; `missingReason` says what a missing file means for this lookup. */
+function toRead(outcome: FileOutcome, source: "cache" | "path", missingReason: string): ModelConfigRead {
+  if (outcome.kind === "missing") return { ok: false, reason: missingReason };
+  if (outcome.kind === "refused") return { ok: false, reason: outcome.reason };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(outcome.text);
   } catch {
     return { ok: false, reason: NOT_JSON };
   }
   return isRecord(parsed) ? { ok: true, config: parsed, source } : { ok: false, reason: NOT_AN_OBJECT };
-};
+}
 
-function readFromCache(cacheRoot: string, modelId: string): ModelConfigRead {
-  const entry = join(cacheRoot, `models--${modelId.replace("/", "--")}`);
-  let revision: string;
+/** The revision `refs/main` names: 40 hexadecimal characters in a small regular file, else nothing. */
+function mainRevision(entry: string): string | undefined {
+  const file = join(entry, "refs", "main");
   try {
-    revision = readFileSync(join(entry, "refs", "main"), "utf8").trim();
+    const stat = statSync(file);
+    if (!stat.isFile() || stat.size > 256) return undefined;
+    const text = readFileSync(file, "utf8").trim();
+    return /^[0-9a-f]{40}$/.test(text) ? text : undefined;
   } catch {
-    return { ok: false, reason: NOT_IN_CACHE };
+    return undefined;
   }
-  if (!/^[0-9a-f]{40}$/.test(revision)) return { ok: false, reason: NOT_IN_CACHE };
-  let text: string;
+}
+
+/** The snapshot with the newest modification time among those that hold a `config.json`, or nothing. */
+function newestSnapshot(entry: string): string | undefined {
+  const snapshots = join(entry, "snapshots");
+  let names: string[];
   try {
-    text = readFileSync(join(entry, "snapshots", revision, "config.json"), "utf8");
+    names = readdirSync(snapshots);
   } catch {
-    return { ok: false, reason: NOT_IN_CACHE };
+    return undefined;
   }
-  return parseConfig(text, "cache");
+  const held: Array<{ name: string; mtimeMs: number }> = [];
+  for (const name of names) {
+    try {
+      statSync(join(snapshots, name, "config.json"));
+      held.push({ name, mtimeMs: statSync(join(snapshots, name)).mtimeMs });
+    } catch {
+      // A snapshot without a config.json, or one that cannot be read, is skipped.
+    }
+  }
+  held.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.name < b.name ? -1 : 1));
+  return held[0]?.name;
 }
 
 /**
- * Create the reader of a model's `config.json`: the Hugging Face cache snapshot of the model. It never throws: every
- * outcome is a `ModelConfigRead`, and a reason never holds a path, a token or file text.
+ * The cached `config.json` of a repository id that already passed `isHfRepoId`: the snapshot `refs/main` names, else the
+ * newest snapshot that holds one (D-02). A snapshot is chosen by name from a directory listing only, never from file text.
+ */
+function readFromCache(cacheRoot: string, modelId: string): ModelConfigRead {
+  const entry = join(cacheRoot, `models--${modelId.replace("/", "--")}`);
+  const revision = mainRevision(entry);
+  if (revision !== undefined) {
+    const named = readConfigFile(join(entry, "snapshots", revision, "config.json"));
+    if (named.kind !== "missing") return toRead(named, "cache", NOT_IN_CACHE);
+  }
+  const newest = newestSnapshot(entry);
+  if (newest === undefined) return { ok: false, reason: NOT_IN_CACHE };
+  return toRead(readConfigFile(join(entry, "snapshots", newest, "config.json")), "cache", NOT_IN_CACHE);
+}
+
+/** An id that is an absolute path, or starts with `./` or `../`, names a local model directory. */
+const isLocalPath = (id: string): boolean => isAbsolute(id) || id.startsWith("./") || id.startsWith("../");
+
+/**
+ * Create the reader of a model's `config.json`: a local model directory (an absolute path, or `./` and `../` against the
+ * reader's working directory), or the Hugging Face cache snapshot of a repository id. Any other id is refused before a
+ * path is built (T-05-04). It never throws: every outcome is a `ModelConfigRead`, and a reason never holds a path, a token
+ * or file text (T-05-05).
  */
 export function createModelConfigReader(options: ModelConfigReaderOptions = {}): ReadModelConfig {
   const cacheRoot = options.cacheRoot ?? resolveCacheRoot(options.env ?? process.env);
   return async (modelId) => {
     try {
+      if (isLocalPath(modelId)) {
+        const directory = resolve(options.cwd ?? process.cwd(), modelId);
+        return toRead(readConfigFile(join(directory, "config.json")), "path", NO_CONFIG_IN_DIRECTORY);
+      }
       if (!isHfRepoId(modelId)) return { ok: false, reason: NOT_AN_ID };
       return readFromCache(cacheRoot, modelId);
     } catch {
