@@ -4315,7 +4315,7 @@ test("autoStart pre-gate ignores every other key: a file invalid elsewhere still
 });
 
 test("autoStart in a project file, true or false, is one autoStart-only violation and changes nothing that resolves", () => {
-  const violation = { path: "autoStart", shown: "", reason: "starts a model when pi opens; only your own config file or PI_MLX_MODELS_AUTO_START may turn it on", autoStartOnly: true };
+  const violation = { path: "autoStart", shown: "", reason: "starts a model when pi opens; your own config or env only", autoStartOnly: true };
   for (const value of [true, false]) {
     const project = ok({ autoStart: value });
     assert.deepEqual(violationsOf(project), [violation], String(value));
@@ -4334,7 +4334,7 @@ test("autoStart in a project file that fails the boolean check is an ordinary pr
 
 // ---- the autoStart refusal wording, the command and origin of a profile selection, the shared exports (plan 06-01) ----
 
-const AUTO_START_LINE = "  autoStart: starts a model when pi opens; only your own config file or PI_MLX_MODELS_AUTO_START may turn it on";
+const AUTO_START_LINE = "  autoStart: starts a model when pi opens; your own config or env only";
 const AUTO_START_SENTENCE = "autoStart never asks for confirmation; it applies only from that file or PI_MLX_MODELS_AUTO_START.";
 
 test("formatProjectRefusal autoStart alone names the option, the global file and the variable, and does not promise a confirmation", () => {

@@ -30,8 +30,11 @@ export type LayerFile =
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** The largest config file that is read (T-02-07). A real config is a few hundred bytes. */
-const MAX_FILE_BYTES = 256 * 1024;
+/**
+ * The largest config file that is read (T-02-07). A real config is a few hundred bytes. Exported so the config editor
+ * (plan 06-05) and the last-launch reader (plan 06-04) use this one cap instead of a copy.
+ */
+export const MAX_FILE_BYTES = 256 * 1024;
 
 /** Text from the file system or the JSON parser, made single-line, safe and bounded before it goes in a reason. */
 const reasonText = (text: string, max: number): string => clipDiagnostic(cleanLabel(text), max, "start");
@@ -961,8 +964,9 @@ const DEFAULT_PROFILE_KEY = "defaultProfile";
 const LIMITS_KEY = "limits";
 const LIMITS_PREFIX = `${MODEL_BLOCK}.${LIMITS_KEY}.`;
 /** A profile name: 1 to 64 characters, a letter or digit first, then letters, digits, `.`, `_` and `-` (T-04-15). */
-const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const PROFILE_NAME_SHORT_RULE = '1 to 64 characters: letters, digits, ".", "_" and "-", starting with a letter or digit';
+export const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/** The rule in words; exported with PROFILE_NAME for the last-launch reader and the config editor (plans 06-04, 06-05). */
+export const PROFILE_NAME_SHORT_RULE = '1 to 64 characters: letters, digits, ".", "_" and "-", starting with a letter or digit';
 const PROFILE_NAME_RULE = `the profile name must be ${PROFILE_NAME_SHORT_RULE}`;
 /** The most profile names an unknown-profile line lists. */
 const MAX_PROFILES_LISTED = 10;
@@ -1492,7 +1496,9 @@ function projectViolationsOf(project: ReadonlyMap<string, SettingValue>): Projec
     violations.push({
       path: "autoStart",
       shown: "",
-      reason: "starts a model when pi opens; only your own config file or PI_MLX_MODELS_AUTO_START may turn it on",
+      // Every violation line goes through `show`, which clips at 60 characters, so this stays under that; the header and
+      // footer of the refusal carry the full rule.
+      reason: "starts a model when pi opens; your own config or env only",
       autoStartOnly: true,
     });
   }
@@ -1800,9 +1806,14 @@ export function buildLaunch(
   // The profile in use: the one typed, else the model's defaultProfile, else none (D-02). The default comes from the
   // project file before the global file and, inside a file, from the model-id entry before the preset-key entry. A
   // default is looked at only when no profile was typed, so a dangling default never blocks another start (A5).
+  // A name kept from an earlier launch is not worded as if it were typed after --profile (D-02, D-06, D-14). Both texts
+  // come from this fixed union and from `show(name)`, never from other user text.
+  const command = options.command ?? "/mlx-start";
+  const kept = options.origin === "kept";
   let selected = options.profile;
-  let source = "/mlx-start";
-  let lead = (name: string) => `profile "${show(name)}" (/mlx-start --profile)`;
+  let source: string = kept ? "previous launch" : command;
+  let lead = (name: string) =>
+    kept ? `profile "${show(name)}" (kept from the previous launch)` : `profile "${show(name)}" (${command} --profile)`;
   if (selected === undefined) {
     for (const { layer, entry } of [...entries].reverse()) {
       if (entry.defaultProfile === undefined) continue;
@@ -2149,6 +2160,19 @@ export function trustRisks(prepared: Prepared): TrustRisk[] {
 
 /** The text that refuses a project file asking for a risky setting, without the "mlx-start failed: " prefix. */
 export function formatProjectRefusal(violations: readonly ProjectViolation[], globalConfigPath: string): string {
+  const lines = violations.map(
+    (violation) => `  ${show(violation.path)}${violation.shown === "" ? "" : ` (${show(violation.shown)})`}: ${show(violation.reason)}`,
+  );
+  const withAutoStart = violations.some((violation) => violation.autoStartOnly === true);
+  // autoStart is the one violation that never asks for confirmation and starts nothing the user can see first (D-24), so
+  // alone it gets a header and footer of its own; next to other violations it adds one sentence to theirs.
+  if (withAutoStart && violations.every((violation) => violation.autoStartOnly === true)) {
+    return [
+      ".pi/pi-mlx-models.json cannot set autoStart, which starts a model when pi opens:",
+      ...lines,
+      `Move it to ${cleanLabel(globalConfigPath)} or set PI_MLX_MODELS_AUTO_START; auto-start applies only from those sources and never asks for confirmation.`,
+    ].join("\n");
+  }
   const withInstall = violations.some((violation) => violation.installOnly === true);
   const header = withInstall
     ? ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:"
@@ -2158,10 +2182,8 @@ export function formatProjectRefusal(violations: readonly ProjectViolation[], gl
     : `Move them to ${cleanLabel(globalConfigPath)}; starting then asks for confirmation.`;
   return [
     header,
-    ...violations.map(
-      (violation) => `  ${show(violation.path)}${violation.shown === "" ? "" : ` (${show(violation.shown)})`}: ${show(violation.reason)}`,
-    ),
-    footer,
+    ...lines,
+    withAutoStart ? `${footer} autoStart never asks for confirmation; it applies only from that file or PI_MLX_MODELS_AUTO_START.` : footer,
   ].join("\n");
 }
 
