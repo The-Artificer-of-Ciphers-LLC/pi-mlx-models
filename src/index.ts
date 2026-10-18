@@ -94,6 +94,10 @@ export interface PiHost {
   on(event: "session_shutdown", handler: () => Promise<void> | void): void;
   /** Called with the payload pi is about to send; a returned value replaces it, undefined leaves it. */
   on(event: "before_provider_request", handler: (event: { payload: unknown }, ctx: HookContext) => unknown): void;
+  /** Fires on every change of the active model, the ones this extension makes included. */
+  on(event: "model_select", handler: (event: { model?: { provider?: string; id?: string }; source?: string }) => void): void;
+  /** pi's `ExtensionAPI.setModel`: selects a model for the current session only; resolves false when the model's provider has no authentication. */
+  setModel(model: any): Promise<boolean>;
 }
 
 /** Everything the extension reaches outside itself for, injectable so tests need no process, network or port. */

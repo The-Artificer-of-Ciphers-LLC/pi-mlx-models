@@ -81,6 +81,11 @@ export function makeFakePi() {
   const flags: FlagRegistration[] = [];
   const flagValues = new Map<string, boolean | string>();
   let getFlagCalls = 0;
+  const setModelCalls: unknown[] = [];
+  let setModelBehaviour: (model: unknown) => boolean | Promise<boolean> = () => true;
+  const emitModelSelect = (model: unknown, source: string) => {
+    handlers.get("model_select")?.({ type: "model_select", model, previousModel: undefined, source });
+  };
   const pi: PiHost = {
     registerCommand(name, options) {
       commands.set(name, options.handler);
@@ -100,6 +105,13 @@ export function makeFakePi() {
     on(event: string, handler: HookHandler) {
       handlers.set(event, handler);
     },
+    async setModel(model: unknown) {
+      setModelCalls.push(model);
+      const result = await setModelBehaviour(model);
+      // Like pi, a switch it accepts is announced before setModel returns.
+      if (result === true) emitModelSelect(model, "set");
+      return result;
+    },
   };
   return {
     pi,
@@ -112,7 +124,31 @@ export function makeFakePi() {
       else flagValues.set(name, value);
     },
     getFlagCalls: () => getFlagCalls,
+    /** The models passed to `pi.setModel`, in order. */
+    setModelCalls,
+    /** Replaces what `pi.setModel` does; the default accepts every model. */
+    onSetModel(fn: (model: unknown) => boolean | Promise<boolean>) {
+      setModelBehaviour = fn;
+    },
+    /** Raises a model_select event the way pi does when the user picks, cycles or restores a model. */
+    selectModel(model: unknown, source = "set") {
+      emitModelSelect(model, source);
+    },
   };
+}
+
+/** A fake pi model registry that knows the given models; `find` records its calls and returns the same object each time. */
+export function makeFakeRegistry(known: Array<{ provider: string; id: string }>) {
+  const models = new Map<string, { provider: string; id: string; name: string }>();
+  for (const { provider, id } of known) models.set(`${provider}/${id}`, { provider, id, name: id });
+  const findCalls: Array<[string, string]> = [];
+  const registry = {
+    find(provider: string, id: string) {
+      findCalls.push([provider, id]);
+      return models.get(`${provider}/${id}`);
+    },
+  };
+  return { registry, findCalls, models };
 }
 
 export interface CtxOptions {
@@ -122,6 +158,8 @@ export interface CtxOptions {
   hasUI?: boolean;
   /** The answer ui.confirm gives; default true. */
   confirm?: boolean;
+  /** What `ctx.modelRegistry` is; default: none, like a host that does not expose one. */
+  modelRegistry?: { find(provider: string, modelId: string): unknown };
 }
 
 /** A fake ctx.ui; `select` decides what the picker returns (default: the first option). */
@@ -136,6 +174,7 @@ export function makeCtx(
   const ctx = {
     cwd: options.cwd ?? mkdtempSync(join(tmpdir(), "pi-mlx-ctx-")),
     hasUI: options.hasUI ?? true,
+    ...(options.modelRegistry !== undefined ? { modelRegistry: options.modelRegistry } : {}),
     ui: {
       notify(message: string, type: string) {
         notes.push({ message, type });

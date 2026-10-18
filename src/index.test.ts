@@ -11,7 +11,7 @@ import { ensureInstalled, type RuntimeHost } from "./runtime.js";
 import { SETTINGS, initFlagSpecs } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
 import type { ModelConfigRead, ReadModelConfig } from "./modelinfo.js";
-import { makeCtx, makeFakeModelConfig, makeFakePi, type CtxOptions } from "./testkit.js";
+import { makeCtx, makeFakeModelConfig, makeFakePi, makeFakeRegistry, type CtxOptions } from "./testkit.js";
 
 type ProviderCall = { name: string; config: any };
 type Note = { message: string; type: string };
@@ -4153,4 +4153,176 @@ test("limits.maxTokens alone adds no --max-tokens to the server; with sampling.m
   assert.ok(startingNotes(both.notes)[0].includes("--max-tokens 8192 (profile fast)"), startingNotes(both.notes)[0]);
   assert.ok(modelNotes(both.notes)[0].message.includes("max output 4096 (profile fast)"), modelNotes(both.notes)[0].message);
   assert.deepEqual(outputWarnings(both.notes).map((n) => n.message), [OUTPUT_WARNING(8192, 4096, "profile fast")]);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The started model becomes pi's active model
+// ---------------------------------------------------------------------------------------------------------------------
+
+const readySelected = (id: string) => `MLX server is ready for prompts. ${PROVIDER_ID}/${id} is now the selected model.`;
+const selectRefused = (id: string) =>
+  `pi-mlx-models: pi did not select ${PROVIDER_ID}/${id}; it reports that authentication is not configured for the provider.`;
+const didNotSelect = (notes: Note[]) => notes.filter((n) => n.message.includes("did not select"));
+
+test("active model: a finished start selects the started model and the ready message says so", async () => {
+  const other = MODEL_PRESETS[0];
+  const reg = makeFakeRegistry([
+    { provider: PROVIDER_ID, id: QWEN_ID },
+    { provider: PROVIDER_ID, id: other.modelId },
+  ]);
+  const h = await setup({ ctx: { modelRegistry: reg.registry } });
+  assert.ok(h.handlers.has("model_select"));
+  let registrationsAtSwitch = -1;
+  h.onSetModel(() => {
+    registrationsAtSwitch = h.providerCalls.length;
+    return true;
+  });
+
+  await startMlx(h, "qwen3_4b");
+
+  assert.equal(h.setModelCalls.length, 1);
+  assert.strictEqual(h.setModelCalls[0], reg.models.get(`${PROVIDER_ID}/${QWEN_ID}`));
+  assert.deepEqual(reg.findCalls, [[PROVIDER_ID, QWEN_ID]]);
+  assert.equal(registrationsAtSwitch, h.providerCalls.length, "the switch comes after the last registration");
+  const last = h.notes.at(-1)!;
+  assert.equal(last.type, "info");
+  assert.equal(last.message, readySelected(QWEN_ID));
+  assert.equal(h.notes.some((n) => n.message === READY_NOTE), false);
+  assert.deepEqual(errors(h.notes), []);
+  assert.deepEqual(didNotSelect(h.notes), []);
+  assert.equal(lastStatus(h.statuses), `mlx: running (${QWEN_ID})`);
+
+  // The fake raised model_select for the first switch; that event is not a user pick.
+  await startMlx(h, other.key);
+  assert.equal(h.setModelCalls.length, 2);
+  assert.strictEqual(h.setModelCalls[1], reg.models.get(`${PROVIDER_ID}/${other.modelId}`));
+  assert.equal(h.notes.at(-1)?.message, readySelected(other.modelId));
+});
+
+test("active model: a start that was stopped never changes the active model", async () => {
+  // (a) stopped while the config read is pending
+  const gate = deferred<{ ok: true; config: unknown; source: "cache" }>();
+  let reads = 0;
+  const regA = makeFakeRegistry([{ provider: PROVIDER_ID, id: QWEN_ID }]);
+  const a = await setup({
+    ctx: { modelRegistry: regA.registry },
+    readModelConfig: async () => {
+      reads += 1;
+      return gate.promise;
+    },
+  });
+  const startedA = startMlx(a, "qwen3_4b");
+  for (let i = 0; i < 50 && reads === 0; i += 1) await flush();
+  assert.equal(reads, 1, "the start is waiting on the read");
+  await a.commands.get("mlx-stop")!("", a.ctx);
+  gate.resolve({ ok: true, config: { max_position_embeddings: 262144 }, source: "cache" });
+  await startedA;
+  await flush();
+  assert.deepEqual(a.setModelCalls, []);
+  assert.deepEqual(regA.findCalls, []);
+  assert.equal(a.notes.some((n) => n.message.startsWith("MLX server is ready")), false);
+
+  // (b) stopped while pi.setModel is pending
+  const switchGate = deferred<boolean>();
+  const regB = makeFakeRegistry([{ provider: PROVIDER_ID, id: QWEN_ID }]);
+  const b = await setup({ ctx: { modelRegistry: regB.registry } });
+  b.onSetModel(() => switchGate.promise);
+  const startedB = startMlx(b, "qwen3_4b");
+  for (let i = 0; i < 50 && b.setModelCalls.length === 0; i += 1) await flush();
+  assert.equal(b.setModelCalls.length, 1, "the start is waiting on setModel");
+  await b.commands.get("mlx-stop")!("", b.ctx);
+  switchGate.resolve(true);
+  await startedB;
+  await flush();
+  assert.equal(b.notes.some((n) => n.message.startsWith("MLX server is ready")), false);
+});
+
+test("active model: a model picked in pi during the start wins", async () => {
+  for (const source of ["set", "cycle", "restore"]) {
+    const gate = deferred();
+    const reg = makeFakeRegistry([{ provider: PROVIDER_ID, id: QWEN_ID }]);
+    const h = await setup({
+      ctx: { modelRegistry: reg.registry },
+      server: {
+        start: async (_model, onEvent) => {
+          onEvent?.({ type: "launched" });
+          await gate.promise;
+          onEvent?.({ type: "ready" });
+        },
+      },
+    });
+    const started = startMlx(h, "qwen3_4b");
+    for (let i = 0; i < 50 && h.server.startCalls.length === 0; i += 1) await flush();
+    assert.equal(h.server.startCalls.length, 1, source);
+    h.selectModel({ provider: "other", id: "x" }, source);
+    gate.resolve();
+    await started;
+
+    assert.deepEqual(h.setModelCalls, [], source);
+    assert.equal(h.notes.at(-1)?.message, READY_NOTE, source);
+    assert.deepEqual(didNotSelect(h.notes), [], source);
+    assert.deepEqual(errors(h.notes), [], source);
+    assert.equal(lastStatus(h.statuses), `mlx: running (${QWEN_ID})`, source);
+  }
+
+  // A selection made before the start began does not stop it.
+  const reg = makeFakeRegistry([{ provider: PROVIDER_ID, id: QWEN_ID }]);
+  const h = await setup({ ctx: { modelRegistry: reg.registry } });
+  h.selectModel({ provider: "other", id: "x" });
+  await startMlx(h, "qwen3_4b");
+  assert.equal(h.setModelCalls.length, 1);
+  assert.equal(h.notes.at(-1)?.message, readySelected(QWEN_ID));
+});
+
+test("active model: when pi refuses, throws or cannot find the model, the start still succeeds with the old hint", async () => {
+  const known = () => makeFakeRegistry([{ provider: PROVIDER_ID, id: QWEN_ID }]);
+  const cases: Array<{
+    name: string;
+    registry: { find(provider: string, id: string): unknown };
+    behaviour?: () => boolean | Promise<boolean>;
+    refused?: boolean;
+    switched: boolean;
+  }> = [
+    { name: "pi returns false", registry: known().registry, behaviour: () => false, refused: true, switched: true },
+    {
+      name: "setModel throws",
+      registry: known().registry,
+      behaviour: () => {
+        throw new Error("setModel threw");
+      },
+      switched: true,
+    },
+    { name: "setModel rejects", registry: known().registry, behaviour: () => Promise.reject(new Error("setModel rejected")), switched: true },
+    { name: "the registry knows no models", registry: makeFakeRegistry([]).registry, switched: false },
+    {
+      name: "the registry lookup throws",
+      registry: {
+        find() {
+          throw new Error("registry broke");
+        },
+      },
+      switched: false,
+    },
+  ];
+  for (const c of cases) {
+    const h = await setup({ ctx: { modelRegistry: c.registry } });
+    if (c.behaviour) h.onSetModel(c.behaviour);
+    await startMlx(h, "qwen3_4b");
+
+    const last = h.notes.at(-1)!;
+    assert.equal(last.message, READY_NOTE, c.name);
+    assert.equal(last.type, "info", c.name);
+    assert.deepEqual(errors(h.notes), [], c.name);
+    assert.equal(lastStatus(h.statuses), `mlx: running (${QWEN_ID})`, c.name);
+    assert.equal(h.server.startCalls.length, 1, c.name);
+    assert.deepEqual(modelIdsOf(h.providerCalls.at(-1)), [QWEN_ID], c.name);
+    assert.equal(h.setModelCalls.length > 0, c.switched, c.name);
+    if (c.refused) {
+      const before = h.notes.at(-2)!;
+      assert.equal(before.type, "warning", c.name);
+      assert.equal(before.message, selectRefused(QWEN_ID), c.name);
+    } else {
+      assert.deepEqual(didNotSelect(h.notes), [], c.name);
+    }
+  }
 });
