@@ -254,6 +254,14 @@ test("formatStatus: a served id that is a URL with a user name and password has 
   assert.ok(text.includes("***"), text);
 });
 
+test("formatStatus: a served id or a launch model id with an @ in a revision or a path is shown as it is", () => {
+  const served = formatStatus({ health: "ready", address: ADDRESS, session: "none", served: ["org/model@rev", "/Users/a@b/models/x"] });
+  assert.ok(served.includes("org/model@rev") && served.includes("/Users/a@b/models/x"), served);
+  const launch = formatStatus(view({ launch: { ...LAUNCH, modelId: "org/model@rev", presetKey: "k@v" } }));
+  assert.ok(launch.includes("org/model@rev") && launch.includes("(preset k@v)"), launch);
+  assert.ok(!launch.includes("***") && !served.includes("***"), `${launch}\n${served}`);
+});
+
 test("formatStatus: a served id of 500 characters is clipped", () => {
   const text = formatStatus({ health: "ready", address: ADDRESS, session: "none", served: ["x".repeat(500)] });
   assert.ok(text.includes("x".repeat(80)) && !text.includes("x".repeat(81)), "clipped to 80 characters");
