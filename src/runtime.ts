@@ -16,7 +16,12 @@ export interface RuntimeHost {
   findPython(): string | null;
   searched?(): string[];
   exists(path: string): boolean;
-  run(cmd: string, args: string[], onLine?: (line: string) => void): Promise<void>;
+  /** `options.timeoutMs` kills the child and rejects when it has not ended by then; without it the child may run for good. */
+  run(cmd: string, args: string[], onLine?: (line: string) => void, options?: RunOptions): Promise<void>;
+}
+
+export interface RunOptions {
+  timeoutMs?: number;
 }
 
 /**
@@ -98,10 +103,15 @@ export function findPython(options: { candidates?: string[]; env?: NodeJS.Proces
   return null;
 }
 
-export function run(cmd: string, args: string[], onLine?: (line: string) => void): Promise<void> {
+/** The most stderr kept for a failure message; the message shows the last 800 characters, so older output is dropped. */
+const MAX_STDERR_KEPT = 4096;
+
+export function run(cmd: string, args: string[], onLine?: (line: string) => void, options: RunOptions = {}): Promise<void> {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
     let err = "";
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
     const handle = (chunk: Buffer) => {
       if (!onLine) return;
       for (const line of chunk.toString().split(/\r?\n/)) {
@@ -112,12 +122,26 @@ export function run(cmd: string, args: string[], onLine?: (line: string) => void
     };
     p.stdout?.on("data", handle);
     p.stderr?.on("data", (d) => {
-      err += d.toString();
+      err = (err + d.toString()).slice(-MAX_STDERR_KEPT);
       handle(d);
     });
+    if (options.timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        p.kill("SIGKILL");
+      }, options.timeoutMs);
+    }
     // `close`, not `exit`: exit can fire before the last stderr chunk has been read.
-    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(clipDiagnostic(err, 800) || `${cmd} failed with exit ${code}`))));
-    p.on("error", reject);
+    p.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) reject(new Error(`${cmd} timed out after ${Math.round((options.timeoutMs ?? 0) / 1000)} s`));
+      else if (code === 0) resolve();
+      else reject(new Error(clipDiagnostic(err, 800) || `${cmd} failed with exit ${code}`));
+    });
+    p.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
   });
 }
 
@@ -128,6 +152,9 @@ export const systemHost: RuntimeHost = {
   run,
 };
 
+/** An import that takes longer than this is wedged: the check ends and answers "not installed". A cold first import is far shorter. */
+const IMPORT_CHECK_TIMEOUT_MS = 60_000;
+
 /**
  * True when the venv Python exists and can import mlx_lm: the one answer to "has /mlx-init been run". Runs only the fixed
  * command the installer already runs (`-c "import mlx_lm"`), with no user text, and never throws: any failure is false.
@@ -135,7 +162,7 @@ export const systemHost: RuntimeHost = {
 export async function runtimeInstalled(host: RuntimeHost = systemHost): Promise<boolean> {
   try {
     if (!host.exists(VENV_PYTHON)) return false;
-    await host.run(VENV_PYTHON, ["-c", "import mlx_lm"]);
+    await host.run(VENV_PYTHON, ["-c", "import mlx_lm"], undefined, { timeoutMs: IMPORT_CHECK_TIMEOUT_MS });
     return true;
   } catch {
     return false;

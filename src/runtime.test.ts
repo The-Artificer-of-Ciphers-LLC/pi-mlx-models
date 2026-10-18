@@ -430,8 +430,6 @@ test("run's onLine lines are cleaned of control characters", async () => {
 });
 
 // IN-03: a child that never ends must not hang the caller for good.
-type RunWithTimeout = (cmd: string, args: string[], onLine: ((line: string) => void) | undefined, options: { timeoutMs: number }) => Promise<void>;
-
 const isAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
@@ -445,7 +443,7 @@ test("run with a timeout kills a child that does not end and rejects with a fixe
   const script = "process.stdout.write('pid=' + process.pid + '\\n'); setInterval(() => {}, 1000)";
   let pid = 0;
   const started = Date.now();
-  await assert.rejects((run as unknown as RunWithTimeout)(process.execPath, ["-e", script], (line) => {
+  await assert.rejects(run(process.execPath, ["-e", script], (line) => {
     const m = line.match(/^pid=(\d+)$/);
     if (m) pid = Number(m[1]);
   }, { timeoutMs: 500 }), /timed out/);
@@ -456,16 +454,16 @@ test("run with a timeout kills a child that does not end and rejects with a fixe
 });
 
 test("run with a timeout that is not reached resolves as before", async () => {
-  await (run as unknown as RunWithTimeout)(process.execPath, ["-e", "process.exit(0)"], undefined, { timeoutMs: 20_000 });
+  await run(process.execPath, ["-e", "process.exit(0)"], undefined, { timeoutMs: 20_000 });
 });
 
 test("runtimeInstalled: the import check is run with a bound, so a wedged import cannot hang auto-start", async () => {
   const seen: unknown[] = [];
   const { host } = fakeHost({
     venv: true,
-    run: (async (_cmd: string, _args: string[], _onLine: unknown, options: unknown) => {
+    run: async (_cmd, _args, _onLine, options) => {
       seen.push(options);
-    }) as unknown as RuntimeHost["run"],
+    },
   });
   assert.equal(await runtimeInstalled(host), true);
   const options = seen[0] as { timeoutMs?: unknown } | undefined;
