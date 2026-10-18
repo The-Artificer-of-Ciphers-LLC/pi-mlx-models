@@ -141,6 +141,7 @@ async function harness(
     argv: (): string[] => JSON.parse(readFileSync(argvFile, "utf8")),
     start: (input = "qwen3_4b") => fakePi.commands.get("mlx-start")!(input, fakeCtx.ctx),
     last: (input = "") => fakePi.commands.get("mlx-last")!(input, fakeCtx.ctx),
+    status: (input = "") => fakePi.commands.get("mlx-status")!(input, fakeCtx.ctx),
     stop: () => fakePi.commands.get("mlx-stop")!("", fakeCtx.ctx),
   };
 }
@@ -1624,4 +1625,73 @@ test("mlx-last e2e: an override applies to one launch only and is never remember
   assert.deepEqual(errorNotes(third.notes), []);
   assert.equal(third.argv().some((arg) => arg.startsWith("--log-level")), false, JSON.stringify(third.argv()));
   await third.stop();
+});
+
+// ---- /mlx-status: one block with the health and the lines the start showed, from a record kept in memory (plan 06-08: CMD-03) ----
+
+/** The notices a command added after `before` notices existed. */
+const addedSince = (notes: Array<{ message: string; type: string }>, before: number) => notes.slice(before);
+
+test("mlx-status e2e: a started model is reported ready with the very lines the start showed", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({
+    server: { port },
+    models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2, repetitionPenalty: 1.1 } } } } },
+  });
+
+  await h.start("qwen3_4b --profile fast");
+  assert.deepEqual(errorNotes(h.notes), []);
+  const starting = startNotes(h.notes);
+  assert.equal(starting.length, 1);
+  const startLines = starting[0].message.split("\n").slice(1);
+  assert.ok(startLines.length >= 3, `the start message has a profile, a flags and a request line: ${starting[0].message}`);
+  const modelNote = h.notes.find((n) => n.message.startsWith("model: "));
+  assert.ok(modelNote, "the start shows a model line");
+
+  const before = h.notes.length;
+  await h.status();
+
+  const added = addedSince(h.notes, before);
+  assert.equal(added.length, 1, "one notice, through the same channel as the start message");
+  assert.equal(added[0].type, "info");
+  const block = added[0].message;
+  assert.ok(block.startsWith("status: ready"), block);
+  for (const line of startLines) assert.ok(block.includes(line), `the status block repeats "${line}": ${block}`);
+  assert.ok(block.includes(modelNote.message), `the status block repeats the model line: ${block}`);
+  assert.ok(block.includes(`:${port}`), block);
+  assert.ok(block.includes("--temp 0.2 (profile fast)"), block);
+  await h.stop();
+});
+
+test("mlx-status e2e: after /mlx-stop the status is down and no longer shows the session's lines", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port }, models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } } });
+  await h.start("qwen3_4b --profile fast");
+  await h.stop();
+
+  const before = h.notes.length;
+  await h.status();
+
+  const block = addedSince(h.notes, before)[0].message;
+  assert.ok(block.startsWith("status: down"), block);
+  assert.ok(block.includes("nothing is listening"), block);
+  assert.equal(block.includes("profile:"), false, block);
+  assert.equal(block.includes("flags:"), false, block);
+});
+
+test("mlx-status e2e: with nothing ever started the status is down and does not claim a session", { timeout: 30_000 }, async (t) => {
+  const port = await freePort();
+  const h = await harness(t);
+  h.writeConfig({ server: { port } });
+
+  await h.status();
+
+  assert.equal(h.notes.length, 1);
+  const block = h.notes[0].message;
+  assert.ok(block.startsWith("status: down"), block);
+  assert.ok(block.includes("nothing is listening"), block);
+  assert.equal(block.includes("started by this session"), false, block);
+  assert.equal(existsSync(h.argvFile), false, "no child was started");
 });
