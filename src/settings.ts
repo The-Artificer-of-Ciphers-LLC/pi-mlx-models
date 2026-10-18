@@ -862,12 +862,15 @@ const SAMPLING_ROWS: ReadonlyMap<string, SettingDef> = new Map(
 const SAMPLING_CANDIDATES: readonly Candidate[] = [...SAMPLING_ROWS.keys()].map((name) => ({ path: name, name }));
 /** The key of a `models` entry that holds its named profiles (D-01). */
 const PROFILES_KEY = "profiles";
+/** The key of a `models` entry that names the profile used when `/mlx-start` gives none (D-02). */
+const DEFAULT_PROFILE_KEY = "defaultProfile";
 /** The key of the reserved object inside a profile (D-17) and the path prefix of the rows Phase 5 adds for it. */
 const LIMITS_KEY = "limits";
 const LIMITS_PREFIX = `${MODEL_BLOCK}.${LIMITS_KEY}.`;
 /** A profile name: 1 to 64 characters, a letter or digit first, then letters, digits, `.`, `_` and `-` (T-04-15). */
 const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const PROFILE_NAME_RULE = 'the profile name must be 1 to 64 characters: letters, digits, ".", "_" and "-", starting with a letter or digit';
+const PROFILE_NAME_SHORT_RULE = '1 to 64 characters: letters, digits, ".", "_" and "-", starting with a letter or digit';
+const PROFILE_NAME_RULE = `the profile name must be ${PROFILE_NAME_SHORT_RULE}`;
 /** The most profile names an unknown-profile line lists. */
 const MAX_PROFILES_LISTED = 10;
 /** The block names of nested keys, e.g. "server". */
@@ -1266,6 +1269,11 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
       readSampling(entry.values, entryPath(id), label, value, problems);
       return;
     }
+    if (key === DEFAULT_PROFILE_KEY) {
+      if (typeof value === "string" && PROFILE_NAME.test(value)) entry.defaultProfile = value;
+      else problems.push(`${entryPath(id)}.${DEFAULT_PROFILE_KEY} (${label}): ${showValue(value)} is not a profile name (${PROFILE_NAME_SHORT_RULE})`);
+      return;
+    }
     if (key === PROFILES_KEY) {
       const where = `${entryPath(id)}.${PROFILES_KEY}`;
       if (!isPlainObject(value)) {
@@ -1312,7 +1320,12 @@ function readFileLayer(file: LayerFile | undefined, layer: "global" | "project",
     } else {
       for (const [child, childValue] of Object.entries(value)) {
         if (key === MODEL_BLOCK && child === SAMPLING_KEY) readSampling(data.values, MODEL_BLOCK, label, childValue, problems);
-        else consider(key, child, childValue);
+        // A profile or a default profile in the model block would apply to every model, which D-01 does not define.
+        else if (key === MODEL_BLOCK && child === PROFILES_KEY) {
+          problems.push(`${MODEL_BLOCK}.${PROFILES_KEY} (${label}): profiles belong to one model; define them inside a "${MODELS_KEY}" entry`);
+        } else if (key === MODEL_BLOCK && child === DEFAULT_PROFILE_KEY) {
+          problems.push(`${MODEL_BLOCK}.${DEFAULT_PROFILE_KEY} (${label}): defaultProfile belongs to one model; set it inside a "${MODELS_KEY}" entry`);
+        } else consider(key, child, childValue);
       }
     }
   }
@@ -1639,8 +1652,9 @@ function unknownProfileLine(lead: string, modelId: string, entries: ReadonlyArra
 /**
  * The second stage: pair the prepared settings with the model being started. The model options of each file layer
  * are overlaid by `models[preset key]` and then `models[model id]`, the layers are applied from the lowest
- * precedence up (so a project `model` block beats a global `models` entry), and what was typed on `/mlx-start`
- * comes last. Paths are resolved, the chat template file is read, and the flags come out in schema order.
+ * precedence up (so a project `model` block beats a global `models` entry). The selected profile (typed with
+ * `--profile`, else the model's `defaultProfile`) goes over all of those and under what was typed on `/mlx-start`,
+ * which comes last. Paths are resolved, the chat template file is read, and the flags come out in schema order.
  */
 export function buildLaunch(
   prepared: Prepared,
@@ -1657,10 +1671,27 @@ export function buildLaunch(
     if (byPreset !== undefined) entries.push({ layer: data.layer, entry: byPreset });
     if (byId !== undefined) entries.push({ layer: data.layer, entry: byId });
   }
+  // The profile in use: the one typed, else the model's defaultProfile, else none (D-02). The default comes from the
+  // project file before the global file and, inside a file, from the model-id entry before the preset-key entry. A
+  // default is looked at only when no profile was typed, so a dangling default never blocks another start (A5).
+  let selected = options.profile;
+  let source = "/mlx-start";
+  let lead = (name: string) => `profile "${show(name)}" (/mlx-start --profile)`;
+  if (selected === undefined) {
+    for (const { layer, entry } of [...entries].reverse()) {
+      if (entry.defaultProfile === undefined) continue;
+      selected = entry.defaultProfile;
+      source = layer === "project" ? "project file" : "global file";
+      lead = (name) => `defaultProfile "${show(name)}" (${source})`;
+      break;
+    }
+  }
   // A profile that is not defined for this model refuses the start before anything else is looked at (D-02).
-  const selected = options.profile;
-  if (selected !== undefined && !entries.some(({ entry }) => entry.profiles.has(selected))) {
-    return { ok: false, errors: [unknownProfileLine(`profile "${show(selected)}" (/mlx-start --profile)`, model.modelId, entries)] };
+  if (selected !== undefined) {
+    const name = selected;
+    if (!entries.some(({ entry }) => entry.profiles.has(name))) {
+      return { ok: false, errors: [unknownProfileLine(lead(name), model.modelId, entries)] };
+    }
   }
 
   const folded = new Map<string, { value: SettingValue; layer: LayerName; profile?: string }>();
@@ -1761,7 +1792,7 @@ export function buildLaunch(
       flags: [...prepared.flags, ...modelFlags],
       request,
       requestNotes,
-      ...(selected === undefined ? {} : { profile: { name: selected, source: "/mlx-start" } }),
+      ...(selected === undefined ? {} : { profile: { name: selected, source } }),
     },
   };
 }
