@@ -26,3 +26,10 @@ export async function discoverModelIds(options: DiscoverModelIdsOptions): Promis
     return [];
   }
 }
+
+/** What a probe of the models endpoint learned: whether the server answered, and the ids when it did. */
+export type ModelsProbe = { answers: true; ids: string[] } | { answers: false };
+
+export async function probeModels(_options: DiscoverModelIdsOptions): Promise<ModelsProbe> {
+  throw new Error("not implemented");
+}
