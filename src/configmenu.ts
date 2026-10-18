@@ -324,6 +324,17 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   const ofModel = (model: string): string => ` of model ${shown(model)}`;
   const ofProfile = (model: string, profile: string): string => ` of profile ${shown(profile)}${ofModel(model)}`;
 
+  /**
+   * A model entry as the menu numbers it, "3 of 5 (key)", for the questions that cannot be undone: two keys that look alike
+   * once cleaned and clipped give the same `shown` text, but never the same place (WR-02, WR-02b). A key that is no longer
+   * in the file has no place and is named by its text.
+   */
+  function entryPlace(model: string): string {
+    const keys = modelKeys(currentTree());
+    const index = keys.indexOf(model);
+    return index < 0 ? shown(model) : `${index + 1} of ${keys.length} (${shown(model)})`;
+  }
+
   async function modelEntryFlow(): Promise<Flow> {
     const model = await chooseModel("Choose the model whose options to edit", true);
     if (model === undefined) return "menu";
@@ -334,7 +345,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   async function deleteProfile(model: string, profile: string): Promise<Flow> {
     const defaultPath = ["models", model, "defaultProfile"];
     const clears = getAt(currentTree(), defaultPath) === profile;
-    const name = `profile ${shown(profile)}${ofModel(model)}`;
+    const name = `profile ${shown(profile)} of model entry ${entryPlace(model)}`;
     const confirmed = await dialogs.confirm(
       `Delete ${name}?`,
       `This removes the profile and everything set in it from the config file.${clears ? " It is the default profile of this model, so the default is cleared too." : ""} Yes deletes it. No or Esc cancels.`,
@@ -459,7 +470,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     }
     const model = await chooseModel("Choose the model entry to delete", false);
     if (model === undefined) return "menu";
-    const name = `model entry ${shown(model)}`;
+    const name = `model entry ${entryPlace(model)}`;
     const confirmed = await dialogs.confirm(
       `Delete ${name}?`,
       `${lostByEntry(model)} Other model entries and settings are not touched. Yes deletes it. No or Esc cancels.`,
