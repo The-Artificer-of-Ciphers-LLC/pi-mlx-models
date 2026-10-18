@@ -60,9 +60,22 @@ export function applyRequestOverrides(payload: unknown, active: ActiveLaunch): R
   let applied = false;
   const { sampling, chatTemplateArgs } = active.request;
 
-  if (sampling.temperature !== undefined) {
-    result.temperature = sampling.temperature;
+  const set = (field: string, value: unknown) => {
+    result[field] = value;
     applied = true;
+  };
+  if (sampling.temperature !== undefined) set("temperature", sampling.temperature);
+  if (sampling.topP !== undefined) set("top_p", sampling.topP);
+  if (sampling.topK !== undefined) set("top_k", sampling.topK);
+  if (sampling.minP !== undefined) set("min_p", sampling.minP);
+  if (sampling.repetitionPenalty !== undefined) set("repetition_penalty", sampling.repetitionPenalty);
+  if (sampling.stop !== undefined) set("stop", Array.isArray(sampling.stop) ? [...sampling.stop] : sampling.stop);
+  if (sampling.seed !== undefined) set("seed", sampling.seed);
+  if (sampling.maxTokens !== undefined) {
+    // pi-ai sends max_completion_tokens for a local URL and mlx-lm reads it first; the older name is also overwritten when
+    // pi sent it, so the limit cannot lose to pi's own value (Pitfall 1).
+    set("max_completion_tokens", sampling.maxTokens);
+    if (Object.prototype.hasOwnProperty.call(payload, "max_tokens")) set("max_tokens", sampling.maxTokens);
   }
   if (chatTemplateArgs !== undefined && Object.keys(chatTemplateArgs).length > 0) {
     result.chat_template_kwargs = JSON.parse(JSON.stringify(chatTemplateArgs)) as unknown;
