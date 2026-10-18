@@ -234,3 +234,16 @@ test("takesModel false still parses a valid flag list and rejects a repeated fla
     error: "--mlx-lm-version was given twice",
   });
 });
+
+// ---- a stray URL is echoed without its user name and password (plan 03-06, WR-01, T-03-25) ----
+
+test("/mlx-init echoes a stray URL with its user name and password hidden", () => {
+  const result = parseStartArgs("https://bob:pa?ss@mirror.example/simple/", INIT_SPECS, INIT);
+  assert.deepEqual(result, { ok: false, error: "unexpected argument https://***@mirror.example/simple/ (/mlx-init takes no model)" });
+});
+
+test("/mlx-start echoes a stray URL given as a second argument with its user name and password hidden", () => {
+  const error = failure("qwen3_4b https://bob:pa?ss@mirror.example/simple/");
+  assert.equal(error, "unexpected extra argument https://***@mirror.example/simple/ (only one model is accepted)");
+  assert.ok(!error.includes("pa?ss") && !error.includes("bob"), error);
+});

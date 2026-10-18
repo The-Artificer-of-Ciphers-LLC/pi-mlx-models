@@ -4,22 +4,29 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MODEL_ID, DEFAULT_PIP_INDEX } from "./config.js";
+import * as settingsModule from "./settings.js";
 import {
   PI_FLAGS,
+  PROFILE_FLAG_SPEC,
   SETTINGS,
   buildLaunch,
   cliFlagSpecs,
   describeFlags,
+  describeProfile,
+  describeRequest,
   formatConfigErrors,
   formatProjectRefusal,
   initFlagSpecs,
+  isAutoStartRequested,
   kvNotices,
   pinNotice,
+  pinUnreadableNotice,
   prepareSettings,
   readLayerFile,
   sameVersion,
   toLaunchSpec,
   trustRisks,
+  type BuildOptions,
   type LayerFile,
   type PrepareInput,
   type Prepared,
@@ -2676,6 +2683,9 @@ for (const pipIndex of [
   "http://127.0.0.1:3141/root/pypi/+simple/",
   "http://localhost/simple/",
   "http://[::1]:8080/simple/",
+  // The host is written as WHATWG normalises it, in any letter case and with any port (IN-02).
+  "http://LOCALHOST/simple/",
+  "http://127.0.0.1:80/simple/",
 ]) {
   test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is accepted in a global file and kept verbatim`, () => {
     const { prepared, warnings } = resolved({ global: ok({ mlxLm: { pipIndex } }) });
@@ -2700,11 +2710,27 @@ const BAD_PIP_INDEXES: unknown[] = [
   "https://",
   "pypi.org/simple/",
   5,
+  // A query string or a fragment can carry a token, even a bare marker with nothing after it (IN-02).
+  "https://mirror.example/simple/?token=abc",
+  "https://mirror.example/simple/#frag",
+  "https://mirror.example/simple/?",
+  "https://mirror.example/simple/#",
+  // An http host that is loopback only after WHATWG rewrites it is not the host pip reads (IN-02).
+  "http://0x7f.1/simple/",
+  "http://127.1/simple/",
+  "http://2130706433/simple/",
+  "http://[0:0:0:0:0:0:0:1]/simple/",
 ];
+/** What a refused value shows when it holds an `@`: the user and password are gone, spelled out so no test re-implements the pattern (WR-01). */
+const SHOWN_WITHOUT_CREDENTIALS = new Map<unknown, string>([
+  ["https://user:pass@example.test/simple/", '"https://***@example.test/simple/"'],
+  ["https://user@example.test/simple/", '"https://***@example.test/simple/"'],
+  ["https://pypi.org@evil.example/simple/", '"https://***@evil.example/simple/"'],
+  ["https://:@example.test/simple/", '"https://***@example.test/simple/"'],
+]);
 for (const pipIndex of BAD_PIP_INDEXES) {
   test(`mlxLm.pipIndex ${JSON.stringify(pipIndex)} is refused naming the allowed form`, () => {
-    // Credentials are never repeated back (WR-01): the user and password of a refused URL show as ***.
-    const shown = JSON.stringify(pipIndex).replace(/([/\\]{2})[^\s/\\?#"]*@/g, "$1***@");
+    const shown = SHOWN_WITHOUT_CREDENTIALS.get(pipIndex) ?? JSON.stringify(pipIndex);
     assert.deepEqual(refused({ global: ok({ mlxLm: { pipIndex } }) }), [pipLine(shown)]);
   });
 }
@@ -2864,6 +2890,25 @@ test("pinNotice: with no known source the parenthesised part is left out, and un
   assert.ok(shown.length < 160, `clipped: ${shown.length}`);
 });
 
+test("pinUnreadableNotice: names the pin, its source and the reason, and says nothing for a floating policy", () => {
+  const reason = "could not read the mlx-lm version (python exited with 1)";
+  assert.equal(
+    pinUnreadableNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX, versionSource: "project file" }, reason),
+    "mlx-lm pinned 0.31.1 (project file) was not compared with the installed version: could not read the mlx-lm version (python exited with 1)",
+  );
+  assert.equal(
+    pinUnreadableNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, reason),
+    "mlx-lm pinned 0.31.1 was not compared with the installed version: could not read the mlx-lm version (python exited with 1)",
+  );
+  assert.equal(pinUnreadableNotice({ version: "latest", pipIndex: DEFAULT_PIP_INDEX }, reason), undefined);
+});
+
+test("pinUnreadableNotice: an escape character is removed and a long reason is clipped", () => {
+  const shown = pinUnreadableNotice({ version: "0.31.1", pipIndex: DEFAULT_PIP_INDEX }, `unreadable\u001b[31m${"9".repeat(100)}`) ?? "";
+  assert.ok(!shown.includes("\u001b"), "no control character reaches the notification");
+  assert.ok(shown.length < 200, `clipped: ${shown.length}`);
+});
+
 // ---- review hardening of the pip index: WR-01 credentials never shown, WR-02 one parser, WR-03 fail closed ----
 
 const SECRET_INDEX = "https://bob:s3cr3tTOKEN@mirror.example/simple/";
@@ -2914,4 +2959,1480 @@ test("an invalid PI_MLX_MODELS_PIP_INDEX refuses instead of falling back to the 
 test("an unset or blank PI_MLX_MODELS_PIP_INDEX still means the next layer down", () => {
   assert.equal(resolved({ env: { PI_MLX_MODELS_PIP_INDEX: "" } }).prepared.install.pipIndex, DEFAULT_PIP_INDEX);
   assert.equal(resolved({ env: { PI_MLX_MODELS_PIP_INDEX: "   " } }).prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+});
+
+// ---- credentials in any spelling and any layer never show (plan 03-06, WR-01, T-03-24) ----
+
+test("a pasted pip index secret with a slash, a question mark or a hash is hidden in every layer's refusal", () => {
+  for (const password of ["s3cr3t/TOKEN", "s3cr3t?TOKEN", "s3cr3t#TOKEN"]) {
+    const index = `https://bob:${password}@mirror.example/simple/`;
+    const layers: Array<[string, ReturnType<typeof resolve>]> = [
+      ["PI_MLX_MODELS_PIP_INDEX", resolve({ env: { PI_MLX_MODELS_PIP_INDEX: index } })],
+      ["the typed /mlx-init value", resolve({ args: { "mlxLm.pipIndex": index } })],
+      ["the global file", resolve({ global: ok({ mlxLm: { pipIndex: index } }) })],
+    ];
+    for (const [layer, result] of layers) {
+      const text = everyText(result);
+      assert.equal(result.ok, false, `${layer}: ${password}`);
+      assert.ok(!text.includes("s3cr3t"), `${layer}: ${text}`);
+      assert.ok(!text.includes("TOKEN"), `${layer}: ${text}`);
+      assert.ok(!text.includes("bob"), `${layer}: ${text}`);
+      assert.ok(text.includes("mirror.example"), `${layer}: the host stays visible to find the mistake: ${text}`);
+    }
+  }
+});
+
+test("a global file whose baseUrl is 200000 slashes is refused at once: nothing in the report path is quadratic (T-03-23)", () => {
+  const started = Date.now();
+  const result = resolve({ global: ok({ baseUrl: "/".repeat(200000) }) });
+  assert.equal(result.ok, false);
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+});
+
+// ---- the extension-load resolution leaves the install rows out (plan 03-07, WR-02, T-03-27, T-03-28) ----
+
+test("ignoreInstall: a bad PI_MLX_MODELS_PIP_INDEX refuses as before, and with the option the other settings still apply", () => {
+  const env = { PI_MLX_MODELS_PIP_INDEX: "http://example.com/simple/", PI_MLX_MODELS_PORT: "9001" };
+  const refusedResult = resolve({ env });
+  assert.equal(refusedResult.ok, false, "without the option the bad index refuses");
+  assert.ok(!refusedResult.ok && refusedResult.errors.some((line) => line.includes("PI_MLX_MODELS_PIP_INDEX")), JSON.stringify(refusedResult));
+
+  const { prepared, warnings } = resolved({ env, ignoreInstall: true });
+  assert.equal(prepared.address.port, 9001);
+  assert.deepEqual(warnings, []);
+  assert.equal(prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+  assert.equal(prepared.sources.has("mlxLm.pipIndex"), false, "no install entry in the sources");
+
+  const version = { PI_MLX_MODELS_MLX_LM_VERSION: "^0.32" };
+  assert.equal(resolved({ env: version }).warnings.length, 1, "without the option a bad pin variable warns");
+  assert.deepEqual(resolved({ env: version, ignoreInstall: true }).warnings, []);
+});
+
+test("ignoreInstall: a bad mlxLm.pipIndex and mlxLm.version in the global file refuse as before, and with the option the file's other values apply", () => {
+  const global = ok({ baseUrl: "http://127.0.0.1:9100/v1", mlxLm: { pipIndex: "http://example.com/simple/", version: "^0.32" } });
+  const refusedResult = resolve({ global });
+  assert.equal(refusedResult.ok, false);
+  const errorLines = refusedResult.ok ? [] : refusedResult.errors;
+  assert.equal(errorLines.length, 2, JSON.stringify(errorLines));
+  assert.ok(errorLines.some((line) => line.startsWith("mlxLm.pipIndex")), JSON.stringify(errorLines));
+  assert.ok(errorLines.some((line) => line.startsWith("mlxLm.version")), JSON.stringify(errorLines));
+
+  const { prepared } = resolved({ global, ignoreInstall: true });
+  assert.equal(prepared.baseUrl, "http://127.0.0.1:9100/v1");
+  assert.equal(prepared.install.version, "latest");
+  assert.equal(prepared.install.pipIndex, DEFAULT_PIP_INDEX);
+});
+
+test("ignoreInstall is not general leniency: the performance and KV rows resolve and validate as before (SRV-04, SRV-05)", () => {
+  const { prepared } = resolved({ global: ok({ server: { kvBits: 4, decodeConcurrency: 2 } }), ignoreInstall: true });
+  const args = prepared.flags.flatMap((flag) => flag.args);
+  assert.ok(args.includes("--decode-concurrency=2"), JSON.stringify(args));
+  assert.ok(args.includes("--kv-bits=4"), JSON.stringify(args));
+
+  const bad = resolve({ global: ok({ server: { kvBits: 9 } }), ignoreInstall: true });
+  assert.equal(bad.ok, false);
+  assert.ok(!bad.ok && bad.errors.some((line) => line.startsWith("server.kvBits")), JSON.stringify(bad));
+});
+
+test("ignoreInstall still reports a typo inside the mlxLm block as an unknown key that suggests the right one", () => {
+  const result = resolve({ global: ok({ mlxLm: { pipindex: "https://mirror.example/simple/" } }), ignoreInstall: true });
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.errors.some((line) => line.includes("unknown key") && line.includes("mlxLm.pipIndex")), JSON.stringify(result));
+});
+
+// ---- sampling to the server (SRV-03: D-07, D-08, D-09) ----
+
+test("a temperature in the sampling object of the global file becomes one --temp flag labelled with its layer", () => {
+  const launch = launchOf({ global: ok({ model: { sampling: { temperature: 0.2 } } }) });
+  assert.deepEqual(
+    launch.flags.filter((flag) => flag.flag === "--temp"),
+    [{ path: "model.sampling.temperature", flag: "--temp", args: ["--temp=0.2"], display: "0.2", label: "global file", core: false }],
+  );
+});
+
+test("a temperature of 0 is accepted and emitted, because the row has no default", () => {
+  assert.deepEqual(extraOf({ global: ok({ model: { sampling: { temperature: 0 } } }) }), ["--temp=0"]);
+});
+
+for (const [name, value] of [
+  ["-1", -1],
+  ['the string "0.2"', "0.2"],
+  ["true", true],
+  ["null", null],
+  ["an empty list", []],
+] as const) {
+  test(`model.sampling.temperature with ${name} is refused with the range, the OpenAI field and the flag`, () => {
+    const lines = refused({ global: ok({ model: { sampling: { temperature: value } } }) });
+    assert.deepEqual(lines, [
+      `model.sampling.temperature (${GLOBAL}): ${JSON.stringify(value)} is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+    ]);
+  });
+}
+
+test("model.sampling.temperature with a value that parses to Infinity is refused", () => {
+  const data = JSON.parse('{"model":{"sampling":{"temperature":1e999}}}') as Record<string, unknown>;
+  const lines = refused({ global: ok(data) });
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  assert.ok(lines[0].startsWith(`model.sampling.temperature (${GLOBAL}): `), lines[0]);
+  assert.ok(lines[0].endsWith("is not a number of at least 0 (OpenAI field temperature, flag --temp)"), lines[0]);
+});
+
+test("a value that overflows to Infinity or -Infinity is echoed by name, not as null (IN-02)", () => {
+  const data = JSON.parse('{"model":{"sampling":{"temperature":1e999}}}') as Record<string, unknown>;
+  assert.deepEqual(refused({ global: ok(data) }), [
+    `model.sampling.temperature (${GLOBAL}): Infinity is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+  ]);
+  const negative = JSON.parse('{"model":{"sampling":{"temperature":-1e999}}}') as Record<string, unknown>;
+  assert.deepEqual(refused({ global: ok(negative) }), [
+    `model.sampling.temperature (${GLOBAL}): -Infinity is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+  ]);
+});
+
+test("a sampling value that is not an object is one line", () => {
+  assert.deepEqual(refused({ global: ok({ model: { sampling: "x" } }) }), [`model.sampling (${GLOBAL}): "x" must be a JSON object`]);
+});
+
+test("a mistyped key inside the sampling object is reported with the key it was probably meant for", () => {
+  assert.deepEqual(refused({ global: ok({ model: { sampling: { temprature: 0.2 } } }) }), [
+    `model.sampling.temprature (${GLOBAL}): unknown key (did you mean temperature?)`,
+  ]);
+});
+
+// -- the other seven keys: exact validation (D-09) --
+
+const STOP_PHRASE = "must be a non-empty string or a list of 1 to 4 non-empty strings of at most 256 characters";
+
+const SAMPLING_BAD_VALUES: ReadonlyArray<[string, readonly unknown[], string, string]> = [
+  ["topP", [0, 1.5, -0.5, "0.9", null], "is not a number above 0 and at most 1", "OpenAI field top_p, flag --top-p"],
+  ["topK", [-1, 1.5, "40", true, 1e21], "is not an integer of at least 0", "OpenAI field top_k, flag --top-k"],
+  ["minP", [-0.1, 1.1, "0.05", null], "is not a number from 0 to 1", "OpenAI field min_p, flag --min-p"],
+  ["repetitionPenalty", [0, -1, "1.1", null], "is not a number above 0", "OpenAI field repetition_penalty"],
+  ["maxTokens", [0, -1, 1.5, "100", 1e21], "is not an integer of at least 1", "OpenAI field max_completion_tokens, flag --max-tokens"],
+  ["seed", [1.5, "7", true, null, 1e21], "is not an integer", "OpenAI field seed"],
+  ["stop", ["", [], ["a", ""], ["a", "b", "c", "d", "e"], "x".repeat(257), 5, null, {}, [1]], STOP_PHRASE, "OpenAI field stop"],
+];
+
+for (const [key, values, phrase, suffix] of SAMPLING_BAD_VALUES) {
+  for (const value of values) {
+    const name = JSON.stringify(value).length > 40 ? `${JSON.stringify(value).slice(0, 37)}...` : JSON.stringify(value);
+    test(`model.sampling.${key} with ${name} is refused: ${phrase}`, () => {
+      const lines = refused({ global: ok({ model: { sampling: { [key]: value } } }) });
+      assert.equal(lines.length, 1, JSON.stringify(lines));
+      assert.ok(lines[0].startsWith(`model.sampling.${key} (${GLOBAL}): `), lines[0]);
+      assert.ok(lines[0].endsWith(` ${phrase} (${suffix})`), lines[0]);
+      const shown = JSON.stringify(value);
+      if (shown.length <= 40) assert.equal(lines[0], `model.sampling.${key} (${GLOBAL}): ${shown} ${phrase} (${suffix})`);
+    });
+  }
+}
+
+// -- the other seven keys: accepted values --
+
+for (const [key, values, flag] of [
+  ["topP", [0.9, 1], "--top-p"],
+  ["topK", [0, 40], "--top-k"],
+  ["minP", [0, 0.05, 1], "--min-p"],
+  ["maxTokens", [1, 2048], "--max-tokens"],
+] as const) {
+  test(`model.sampling.${key} accepts ${values.join(", ")} and emits one ${flag}=N element each`, () => {
+    for (const value of values) {
+      assert.deepEqual(extraOf({ global: ok({ model: { sampling: { [key]: value } } }) }), [`${flag}=${value}`]);
+    }
+  });
+}
+
+for (const [key, values] of [
+  ["repetitionPenalty", [1.1]],
+  ["seed", [-1, 42]],
+  ["stop", ["END", ["a", "\n\n"]]],
+] as const) {
+  test(`model.sampling.${key} accepts ${JSON.stringify(values)} and holds it without any argv element`, () => {
+    for (const value of values) {
+      const input = { global: ok({ model: { sampling: { [key]: value } } }) };
+      assert.deepEqual(resolved(input).prepared.modelSettings.layers[0].model.get(`model.sampling.${key}`), value);
+      assert.deepEqual(extraOf(input), []);
+    }
+  });
+}
+
+test("a launch that sets repetitionPenalty, stop and seed has no argv element and an empty flags line (D-07)", () => {
+  const input = { global: ok({ model: { sampling: { repetitionPenalty: 1.1, stop: ["END"], seed: 7 } } }) };
+  assert.deepEqual(extraOf(input), []);
+  assert.equal(describeFlags(launchOf(input)), "");
+});
+
+// -- the sampling object of a models entry --
+
+test("a models entry holds the same sampling object and launches with it, labelled with the file", () => {
+  const launch = launchOf({ global: ok({ models: { qwen3_4b: { sampling: { temperature: 0.2 } } } }) });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.2"]);
+  assert.equal(describeFlags(launch), "flags: --temp 0.2 (global file)");
+});
+
+test("a bad value inside the sampling object of a models entry names the entry", () => {
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { sampling: { temperature: -1 } } } }) }), [
+    `models["qwen3_4b"].sampling.temperature (${GLOBAL}): -1 is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+  ]);
+});
+
+test("a mistyped key inside the sampling object of a models entry names the entry", () => {
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { sampling: { temprature: 0.2 } } } }) }), [
+    `models["qwen3_4b"].sampling.temprature (${GLOBAL}): unknown key (did you mean temperature?)`,
+  ]);
+});
+
+// -- a sampling key or the sampling container in the wrong place --
+
+test("a sampling key written directly in the model block says it belongs inside sampling", () => {
+  assert.deepEqual(refused({ global: ok({ model: { temperature: 0.2 } }) }), [
+    `model.temperature (${GLOBAL}): unknown key (temperature is a "sampling" key; write it inside "sampling")`,
+  ]);
+});
+
+test("a sampling key written directly in a models entry says it belongs inside sampling", () => {
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { temperature: 0.2 } } }) }), [
+    `models["qwen3_4b"].temperature (${GLOBAL}): unknown key (temperature is a "sampling" key; write it inside "sampling")`,
+  ]);
+});
+
+test("a sampling key spelled with an underscore names the real spelling", () => {
+  assert.deepEqual(refused({ global: ok({ model: { top_p: 0.9 } }) }), [
+    `model.top_p (${GLOBAL}): unknown key (topP is a "sampling" key; write it inside "sampling")`,
+  ]);
+});
+
+test("a mistyped sampling container in the model block suggests model.sampling", () => {
+  assert.deepEqual(refused({ global: ok({ model: { samplng: { temperature: 0.2 } } }) }), [
+    `model.samplng (${GLOBAL}): unknown key (did you mean model.sampling?)`,
+  ]);
+});
+
+test("a top-level sampling key is an unknown key that points to model.sampling (D-08)", () => {
+  assert.deepEqual(refused({ global: ok({ sampling: { temperature: 0.2 } }) }), [
+    `sampling (${GLOBAL}): unknown key (did you mean model.sampling?)`,
+  ]);
+});
+
+test("a top-level request key is an unknown key with no hint (D-08)", () => {
+  assert.deepEqual(refused({ global: ok({ request: { temperature: 0.2 } }) }), [`request (${GLOBAL}): unknown key`]);
+});
+
+// -- the order of the rows --
+
+test("the eight sampling rows follow model.chatTemplateArgs in key order, and the server flags come out in that order", () => {
+  const paths = SETTINGS.map((row) => row.path);
+  const first = paths.indexOf("model.chatTemplateArgs") + 1;
+  assert.deepEqual(paths.slice(first, first + 8), [
+    "model.sampling.temperature",
+    "model.sampling.topP",
+    "model.sampling.topK",
+    "model.sampling.minP",
+    "model.sampling.repetitionPenalty",
+    "model.sampling.maxTokens",
+    "model.sampling.stop",
+    "model.sampling.seed",
+  ]);
+  const sampling = { maxTokens: 2048, minP: 0.05, topK: 40, topP: 0.9, temperature: 0.2 };
+  assert.deepEqual(extraOf({ global: ok({ model: { sampling } }) }), ["--temp=0.2", "--top-p=0.9", "--top-k=40", "--min-p=0.05", "--max-tokens=2048"]);
+});
+
+// -- merge order, the project file and the absence of a typed spelling (D-04, D-08) --
+
+test("within one file the sampling order is the model block, then the preset-key entry, then the model-id entry", () => {
+  const model = { sampling: { temperature: 0.7 } };
+  const byKey = { qwen3_4b: { sampling: { temperature: 0.5 } } };
+  const byId = { [QWEN.modelId]: { sampling: { temperature: 0.2 } } };
+  assert.deepEqual(extraOf({ global: ok({ model, models: { ...byKey, ...byId } }) }), ["--temp=0.2"]);
+  assert.deepEqual(extraOf({ global: ok({ model, models: byKey }) }), ["--temp=0.5"]);
+  assert.deepEqual(extraOf({ global: ok({ model }) }), ["--temp=0.7"]);
+});
+
+test("each sampling key merges on its own: an entry that does not set a key keeps the lower value", () => {
+  const global = ok({
+    model: { sampling: { temperature: 0.7, topP: 0.9 } },
+    models: { qwen3_4b: { sampling: { temperature: 0.5 } } },
+  });
+  assert.deepEqual(extraOf({ global }), ["--temp=0.5", "--top-p=0.9"]);
+  const other = ok({ model: { sampling: { topP: 0.9 } }, models: { qwen3_4b: { sampling: { temperature: 0.5 } } } });
+  assert.deepEqual(extraOf({ global: other }), ["--temp=0.5", "--top-p=0.9"], "an entry key and a model-block key both reach the launch");
+});
+
+test("the project file beats the global file per key, and a project model block beats a global models entry", () => {
+  const launch = launchOf({
+    global: ok({ models: { qwen3_4b: { sampling: { temperature: 0.5, topK: 20 } } } }),
+    project: ok({ model: { sampling: { temperature: 0.1 } } }),
+  });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.1", "--top-k=20"]);
+  assert.equal(describeFlags(launch), "flags: --temp 0.1 (project file), --top-k 20 (global file)");
+});
+
+test("a stop list replaces the lower layer's list whole instead of being joined to it", () => {
+  const { prepared } = resolved({
+    global: ok({ model: { sampling: { stop: ["a", "b"] } } }),
+    project: ok({ model: { sampling: { stop: ["c"] } } }),
+  });
+  const [global, project] = prepared.modelSettings.layers;
+  assert.deepEqual(global.model.get("model.sampling.stop"), ["a", "b"]);
+  assert.deepEqual(project.model.get("model.sampling.stop"), ["c"]);
+  assert.equal(project.layer, "project");
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, []);
+});
+
+test("a project file may set every sampling key with no project violation and no flag of its own (D-04)", () => {
+  const sampling = { temperature: 0.2, topP: 0.9, topK: 40, minP: 0.05, repetitionPenalty: 1.1, maxTokens: 2048, stop: ["END"], seed: 7 };
+  const { prepared } = resolved({ project: ok({ model: { sampling } }) });
+  assert.deepEqual(prepared.projectViolations, []);
+  assert.deepEqual(prepared.flags, []);
+  assert.deepEqual(toLaunchSpec(buildOk(prepared)).extraArgs, ["--temp=0.2", "--top-p=0.9", "--top-k=40", "--min-p=0.05", "--max-tokens=2048"]);
+});
+
+test("no sampling key can be typed on /mlx-start, set by an environment variable or set by a pi flag (D-02)", () => {
+  const typed = cliFlagSpecs().map((spec) => spec.flag);
+  for (const flag of ["--temp", "--top-p", "--top-k", "--min-p", "--max-tokens", "--repetition-penalty", "--stop", "--seed"]) {
+    assert.equal(typed.includes(flag), false, flag);
+  }
+  assert.deepEqual(
+    PI_FLAGS.map((flag) => flag.name),
+    ["mlx-model", "mlx-port", "mlx-host", "mlx-log-level"],
+  );
+  for (const row of SETTINGS.filter((setting) => setting.path.startsWith("model.sampling."))) {
+    assert.equal(row.cli, undefined, row.path);
+    assert.equal(row.env, undefined, row.path);
+    assert.equal(row.piFlag, undefined, row.path);
+  }
+});
+
+// ---- the request record (GEN-01, GEN-02) ----
+
+test("all eight sampling keys of the model block appear in launch.request.sampling with exactly those values", () => {
+  const sampling = { temperature: 0.2, topP: 0.9, topK: 40, minP: 0.05, repetitionPenalty: 1.1, maxTokens: 2048, stop: ["END", "STOP"], seed: 7 };
+  const launch = launchOf({ global: ok({ model: { sampling } }) });
+  assert.deepEqual(launch.request.sampling, sampling);
+  assert.equal(launch.request.chatTemplateArgs, undefined);
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.2", "--top-p=0.9", "--top-k=40", "--min-p=0.05", "--max-tokens=2048"]);
+});
+
+test("launch.request.chatTemplateArgs is the merged object of the model block, a models entry and a typed --chat-template-args", () => {
+  const launch = launchOf({
+    global: ok({
+      model: { chatTemplateArgs: { a: 1, shared: "model" } },
+      models: { qwen3_4b: { chatTemplateArgs: { b: 2, shared: "entry" } } },
+    }),
+    args: { "model.chatTemplateArgs": '{"c":3}' },
+  });
+  assert.deepEqual(launch.request.chatTemplateArgs, { a: 1, b: 2, c: 3, shared: "entry" });
+  assert.deepEqual(Object.getPrototypeOf(launch.request.chatTemplateArgs), Object.prototype, "a plain object, not the prototype-less merge result");
+});
+
+test("a configured empty chatTemplateArgs object leaves request.chatTemplateArgs absent", () => {
+  const launch = launchOf({ global: ok({ model: { chatTemplateArgs: {} } }) });
+  assert.equal("chatTemplateArgs" in launch.request, false);
+});
+
+test("with no sampling and no template arguments launch.request is an empty sampling record", () => {
+  assert.deepEqual(launchOf({}).request, { sampling: {} });
+});
+
+test("a stop list in launch.request is a copy: changing it does not change what a second build produces", () => {
+  const { prepared } = resolved({ global: ok({ model: { sampling: { stop: ["a", "b"] } } }) });
+  const first = buildOk(prepared);
+  (first.request.sampling.stop as string[]).push("mutated");
+  assert.deepEqual(buildOk(prepared).request.sampling.stop, ["a", "b"]);
+});
+
+test("request.chatTemplateArgs does not depend on the server flag: a skipped --chat-template-args still leaves the request its object (D-15)", () => {
+  const launch = launchOf({ global: ok({ model: { chatTemplateArgs: { enable_thinking: false } } }) });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ['--chat-template-args={"enable_thinking":false}']);
+  assert.deepEqual(toLaunchSpec(launch, new Set(["--chat-template-args"])).extraArgs, []);
+  assert.deepEqual(launch.request.chatTemplateArgs, { enable_thinking: false });
+});
+
+// ---- the request: line of the start message (plan 04-03, assumption A8) ----
+
+test("describeRequest lists the three request-only keys with their layer, in schema order", () => {
+  const launch = launchOf({ global: ok({ model: { sampling: { seed: 7, stop: ["END"], repetitionPenalty: 1.1 } } }) });
+  assert.equal(describeRequest(launch), 'request: repetition_penalty 1.1 (global file), stop ["END"] (global file), seed 7 (global file)');
+  assert.deepEqual(
+    launch.requestNotes.map((note) => note.field),
+    ["repetition_penalty", "stop", "seed"],
+  );
+});
+
+test("describeRequest is empty when the sampling holds only server-capable keys", () => {
+  const launch = launchOf({ global: ok({ model: { sampling: { temperature: 0.2, topP: 0.9, topK: 40, minP: 0.05, maxTokens: 2048 } } }) });
+  assert.equal(describeRequest(launch), "");
+  assert.deepEqual(launch.requestNotes, []);
+  assert.equal(describeRequest(launchOf({})), "");
+});
+
+test("describeRequest labels each key with the layer it came from", () => {
+  const launch = launchOf({
+    global: ok({ model: { sampling: { stop: ["END"] } } }),
+    project: ok({ model: { sampling: { seed: 7 } } }),
+  });
+  assert.equal(describeRequest(launch), 'request: stop ["END"] (global file), seed 7 (project file)');
+});
+
+test("describeRequest shows a hostile stop string cleaned and clipped, never raw", () => {
+  const stop = `\u001b[31m${"x".repeat(200)}\u0007end`;
+  const text = describeRequest(launchOf({ global: ok({ model: { sampling: { stop } } }) }));
+  assert.ok(text.startsWith("request: stop "), text);
+  assert.ok(!/[\u0000-\u001f\u007f]/.test(text), JSON.stringify(text));
+  assert.ok(text.length < 120, `${text.length} characters`);
+  assert.ok(!text.includes("end"), "the clip drops the tail");
+});
+
+// ---- profiles (CFG-04): plan 04-04 ----
+
+/** Build the launch of `model` with the profile options and require success. */
+function launchWith(input: Partial<PrepareInput>, options: BuildOptions, model: ModelIdentity = QWEN, context = LAUNCH_CTX) {
+  const built = buildLaunch(resolved(input).prepared, model, context, options);
+  assert.ok(built.ok, `expected a launch, got ${JSON.stringify(built)}`);
+  return built.launch;
+}
+
+/** The report of a launch with the profile options that must be refused at the second stage. */
+function errorsWith(input: Partial<PrepareInput>, options: BuildOptions, model: ModelIdentity = QWEN, context = LAUNCH_CTX): string[] {
+  const built = buildLaunch(resolved(input).prepared, model, context, options);
+  assert.equal(built.ok, false, "expected the launch to be refused");
+  assert.ok(!built.ok);
+  return built.errors;
+}
+
+/** The argv of a launch with the profile options. */
+const argvWith = (input: Partial<PrepareInput>, options: BuildOptions, model: ModelIdentity = QWEN, context = LAUNCH_CTX): readonly string[] =>
+  toLaunchSpec(launchWith(input, options, model, context)).extraArgs;
+
+/** What a flag looks like in the flags line: its name, argv and label. */
+const flagSummary = (launch: ReturnType<typeof launchWith>) => launch.flags.map((flag) => ({ flag: flag.flag, args: flag.args, label: flag.label }));
+
+const FAST_PROFILE = { sampling: { temperature: 0.2, maxTokens: 2048 }, chatTemplateArgs: { enable_thinking: false } };
+const FAST_FILE = () => ok({ models: { qwen3_4b: { profiles: { fast: FAST_PROFILE } } } });
+const FAST = { profile: "fast" };
+const MISSING_PROFILE = (name: string, tail: string) =>
+  `profile "${name}" (/mlx-start --profile): not defined for ${QWEN.modelId}; ${tail}`;
+
+test("the profile flag is a /mlx-start flag of its own and not a settings row", () => {
+  assert.deepEqual(PROFILE_FLAG_SPEC, { flag: "--profile", path: "profile", takesValue: true });
+  assert.ok(!cliFlagSpecs().some((spec) => spec.flag === "--profile"));
+});
+
+test("a profile's values become the model flags in schema order, each labelled with the profile", () => {
+  const launch = launchWith({ global: FAST_FILE() }, FAST);
+  assert.deepEqual(flagSummary(launch), [
+    { flag: "--chat-template-args", args: ['--chat-template-args={"enable_thinking":false}'], label: "profile fast" },
+    { flag: "--temp", args: ["--temp=0.2"], label: "profile fast" },
+    { flag: "--max-tokens", args: ["--max-tokens=2048"], label: "profile fast" },
+  ]);
+});
+
+test("launch.profile names the profile and /mlx-start, and launch.request carries the same values", () => {
+  const launch = launchWith({ global: FAST_FILE() }, FAST);
+  assert.deepEqual(launch.profile, { name: "fast", source: "/mlx-start" });
+  assert.deepEqual(launch.request, { sampling: { temperature: 0.2, maxTokens: 2048 }, chatTemplateArgs: { enable_thinking: false } });
+});
+
+test("without the profile option the same file adds no model flags and no profile", () => {
+  const launch = launchWith({ global: FAST_FILE() }, {});
+  assert.deepEqual(launch.flags, []);
+  assert.equal(launch.profile, undefined);
+  assert.deepEqual(launch.request, { sampling: {} });
+});
+
+test("a profile wins over the model block and the models entry for the same key", () => {
+  const input = {
+    global: ok({
+      model: { sampling: { temperature: 0.7 } },
+      models: { qwen3_4b: { sampling: { temperature: 0.5 }, profiles: { fast: { sampling: { temperature: 0.2 } } } } },
+    }),
+  };
+  assert.deepEqual(argvWith(input, FAST), ["--temp=0.2"]);
+  assert.deepEqual(argvWith(input, {}), ["--temp=0.5"]);
+  assert.equal(launchWith(input, FAST).flags[0].label, "profile fast");
+});
+
+test("a typed model flag beats the profile's value for the same key", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { profiles: { fast: { draftModel: "profile-draft" } } } } }),
+    args: { "model.draftModel": "typed-draft" },
+  };
+  const launch = launchWith(input, FAST);
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--draft-model=typed-draft"]);
+  assert.equal(launch.flags[0].label, "/mlx-start");
+});
+
+test("chatTemplateArgs of the base and of the profile merge key by key", () => {
+  const launch = launchWith(
+    {
+      global: ok({
+        model: { chatTemplateArgs: { a: 1, b: 2 } },
+        models: { qwen3_4b: { profiles: { fast: { chatTemplateArgs: { b: 3 } } } } },
+      }),
+    },
+    FAST,
+  );
+  assert.deepEqual(launch.request.chatTemplateArgs, { a: 1, b: 3 });
+});
+
+test("a profile is reachable only for the model its entry names", () => {
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, FAST, LLAMA), [
+    `profile "fast" (/mlx-start --profile): not defined for ${LLAMA.modelId}; no profiles are defined for this model`,
+  ]);
+});
+
+test("an unknown profile is refused with one line that lists the model's profile", () => {
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "nope" }), [MISSING_PROFILE("nope", "available profiles: fast")]);
+});
+
+test("the available profiles in an unknown-profile line are sorted", () => {
+  const input = { global: ok({ models: { qwen3_4b: { profiles: { fast: {}, careful: {} } } } }) };
+  assert.deepEqual(errorsWith(input, { profile: "nope" }), [MISSING_PROFILE("nope", "available profiles: careful, fast")]);
+});
+
+test("a model with no profiles at all says that none are defined", () => {
+  assert.deepEqual(errorsWith({}, { profile: "nope" }), [MISSING_PROFILE("nope", "no profiles are defined for this model")]);
+});
+
+test("a project file's models entry may hold profiles, and their flags carry the profile label", () => {
+  const launch = launchWith({ project: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.3 } } } } } }) }, FAST);
+  assert.deepEqual(flagSummary(launch), [{ flag: "--temp", args: ["--temp=0.3"], label: "profile fast" }]);
+});
+
+test("every model key is accepted inside a profile and reaches the flags", (t) => {
+  const template = writeTemplate(t, "{{ t }}");
+  const profile = {
+    adapterPath: "/adapters/a",
+    draftModel: "org/draft",
+    numDraftTokens: 3,
+    chatTemplate: template.path,
+    useDefaultChatTemplate: true,
+    chatTemplateArgs: { enable_thinking: false },
+  };
+  assert.deepEqual(argvWith({ global: ok({ models: { qwen3_4b: { profiles: { fast: profile } } } }) }, FAST), [
+    "--adapter-path=/adapters/a",
+    "--draft-model=org/draft",
+    "--num-draft-tokens=3",
+    "--chat-template={{ t }}",
+    "--use-default-chat-template",
+    '--chat-template-args={"enable_thinking":false}',
+  ]);
+});
+
+test("a server-wide key inside a profile is refused, naming the key, the profile and the file", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { port: 9100 } } } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, [
+    'models["qwen3_4b"].profiles["fast"].port (global config.json): unknown key (port is a "server" key, not part of a profile)',
+  ]);
+});
+
+test("a profile name that breaks the naming rule is refused", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { "bad name!": {} } } } }) });
+  assert.ok(!result.ok);
+  assert.equal(result.errors.length, 1);
+  assert.ok(result.errors[0].startsWith('models["qwen3_4b"].profiles["bad name!"] (global config.json): '), result.errors[0]);
+});
+
+test("a project profile's chatTemplate outside the project directory is refused like the model block's", (t) => {
+  const project = writeTemplate(t, "{{ project }}");
+  const elsewhere = writeTemplate(t, "{{ elsewhere }}");
+  const context = { home: "/nowhere", cwd: project.dir };
+  const projectProfile = (chatTemplate: string) => ({ project: ok({ models: { qwen3_4b: { profiles: { fast: { chatTemplate } } } } }) });
+  assert.deepEqual(argvWith(projectProfile("template.jinja"), FAST, QWEN, context), ["--chat-template={{ project }}"]);
+  assert.deepEqual(errorsWith(projectProfile(elsewhere.path), FAST, QWEN, context), [
+    `model.chatTemplate (${PROJECT}): ${elsewhere.path} is outside the project directory`,
+  ]);
+});
+
+test("the same chatTemplate path in a global profile is read and launches", (t) => {
+  const project = writeTemplate(t, "{{ project }}");
+  const elsewhere = writeTemplate(t, "{{ elsewhere }}");
+  const context = { home: "/nowhere", cwd: project.dir };
+  const input = { global: ok({ models: { qwen3_4b: { profiles: { fast: { chatTemplate: elsewhere.path } } } } }) };
+  assert.deepEqual(argvWith(input, FAST, QWEN, context), ["--chat-template={{ elsewhere }}"]);
+});
+
+test("describeProfile words the profile line, and is empty for a launch without one", () => {
+  assert.equal(describeProfile(launchWith({ global: FAST_FILE() }, FAST)), "profile: fast (/mlx-start)");
+  assert.equal(describeProfile(launchWith({ global: FAST_FILE() }, {})), "");
+});
+
+// ---- profile limits (MOD-02, MOD-03): plan 05-05 ----
+
+test("an empty limits object is accepted and changes nothing", () => {
+  const plain = launchWith({ global: FAST_FILE() }, FAST);
+  const withLimits = launchWith(
+    { global: ok({ models: { qwen3_4b: { profiles: { fast: { ...FAST_PROFILE, limits: {} } } } } }) },
+    FAST,
+  );
+  assert.deepEqual(withLimits.flags, plain.flags);
+  assert.deepEqual(withLimits.request, plain.request);
+});
+
+test("a key that limits does not define is an unknown key with no hint, and the reserved wording is gone", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { limits: { thinkingTokens: 1 } } } } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ['models["qwen3_4b"].profiles["fast"].limits.thinkingTokens (global config.json): unknown key']);
+});
+
+test("a profile's limits.maxTokens and limits.reasoning land on launch.limits with the profile as their label", () => {
+  const file = ok({ models: { qwen3_4b: { profiles: { fast: { limits: { maxTokens: 4096, reasoning: false } } } } } });
+  assert.deepEqual(launchWith({ global: file }, FAST).limits, {
+    maxTokens: { value: 4096, label: "profile fast" },
+    reasoning: { value: false, label: "profile fast" },
+  });
+});
+
+test("limits that is not an object is refused with the usual object line", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { limits: 5 } } } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ['models["qwen3_4b"].profiles["fast"].limits (global config.json): 5 must be a JSON object']);
+});
+
+test("a row added under model.limits is read from a profile with no change to the reader, and reaches neither argv nor the request", () => {
+  const row: SettingDef = {
+    path: "model.limits.example",
+    kind: "integer",
+    perModel: true,
+    expected: "an integer of at least 1",
+    check: (value) => (typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? { ok: true, value } : { ok: false }),
+    problem: (shown) => `${shown} is not an integer of at least 1`,
+    parseText: () => ({ ok: false }),
+    emit: () => [],
+  };
+  const table = SETTINGS as SettingDef[];
+  table.push(row);
+  try {
+    const input = { global: ok({ models: { qwen3_4b: { profiles: { fast: { ...FAST_PROFILE, limits: { example: 3 } } } } } }) };
+    const { prepared } = resolved(input);
+    assert.equal(prepared.modelSettings.layers[0].models.get("qwen3_4b")?.profiles.get("fast")?.get("model.limits.example"), 3);
+    const plain = launchWith({ global: FAST_FILE() }, FAST);
+    const launch = launchWith(input, FAST);
+    assert.deepEqual(launch.flags, plain.flags);
+    assert.deepEqual(toLaunchSpec(launch).extraArgs, toLaunchSpec(plain).extraArgs);
+    assert.deepEqual(launch.request, plain.request);
+    const bad = resolve({ global: ok({ models: { qwen3_4b: { profiles: { fast: { limits: { example: 0 } } } } } }) });
+    assert.ok(!bad.ok);
+    assert.equal(bad.errors[0], 'models["qwen3_4b"].profiles["fast"].limits.example (global config.json): 0 is not an integer of at least 1');
+  } finally {
+    table.pop();
+  }
+});
+
+// ---- defaultProfile, the layering rules and the entry-specificity rules (plan 04-04, Task 2) ----
+
+const FAST_ARGV = ['--chat-template-args={"enable_thinking":false}', "--temp=0.2", "--max-tokens=2048"];
+const WITH_DEFAULT = (extra: Record<string, unknown> = {}) => ({ models: { qwen3_4b: { defaultProfile: "fast", profiles: { fast: FAST_PROFILE }, ...extra } } });
+
+test("a defaultProfile in the global file applies when /mlx-start names no profile, and says which file supplied it", () => {
+  const input = { global: ok(WITH_DEFAULT()) };
+  assert.deepEqual(launchWith(input, {}).profile, { name: "fast", source: "global file" });
+  assert.deepEqual(argvWith(input, {}), FAST_ARGV);
+  assert.equal(describeProfile(launchWith(input, {})), "profile: fast (global file)");
+});
+
+test("a defaultProfile in the project file names the project file as its source", () => {
+  const launch = launchWith({ project: ok(WITH_DEFAULT()) }, {});
+  assert.deepEqual(launch.profile, { name: "fast", source: "project file" });
+  assert.equal(launch.flags[0].label, "profile fast");
+});
+
+test("when both files set a default, the project file's default wins", () => {
+  const global = ok({
+    models: { qwen3_4b: { defaultProfile: "slow", profiles: { slow: { sampling: { temperature: 0.9 } }, fast: { sampling: { temperature: 0.2 } } } } },
+  });
+  const project = ok({ models: { qwen3_4b: { defaultProfile: "fast" } } });
+  const launch = launchWith({ global, project }, {});
+  assert.deepEqual(launch.profile, { name: "fast", source: "project file" });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.2"]);
+});
+
+test("a default in the model-id entry beats the default in the preset-key entry of the same file", () => {
+  const global = ok({
+    models: {
+      qwen3_4b: { defaultProfile: "a", profiles: { a: { sampling: { temperature: 0.1 } }, b: { sampling: { temperature: 0.2 } } } },
+      [QWEN.modelId]: { defaultProfile: "b" },
+    },
+  });
+  const launch = launchWith({ global }, {});
+  assert.deepEqual(launch.profile, { name: "b", source: "global file" });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.2"]);
+});
+
+test("a typed profile beats the default and shows /mlx-start as its source", () => {
+  const global = ok({
+    models: { qwen3_4b: { defaultProfile: "fast", profiles: { fast: { sampling: { temperature: 0.2 } }, careful: { sampling: { temperature: 0.1 } } } } },
+  });
+  const launch = launchWith({ global }, { profile: "careful" });
+  assert.deepEqual(launch.profile, { name: "careful", source: "/mlx-start" });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, ["--temp=0.1"]);
+});
+
+test("a default that names a missing profile refuses the start when it is the profile in use", () => {
+  const global = ok({ models: { qwen3_4b: { defaultProfile: "gone", profiles: { fast: FAST_PROFILE } } } });
+  assert.deepEqual(errorsWith({ global }, {}), [
+    `defaultProfile "gone" (global file): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+});
+
+test("a dangling default is ignored when a valid profile is typed (assumption A5)", () => {
+  const global = ok({ models: { qwen3_4b: { defaultProfile: "gone", profiles: { fast: FAST_PROFILE } } } });
+  const launch = launchWith({ global }, FAST);
+  assert.deepEqual(launch.profile, { name: "fast", source: "/mlx-start" });
+  assert.deepEqual(toLaunchSpec(launch).extraArgs, FAST_ARGV);
+});
+
+test("a default with no profiles defined says that none are defined", () => {
+  assert.deepEqual(errorsWith({ global: ok({ models: { qwen3_4b: { defaultProfile: "fast" } } }) }, {}), [
+    `defaultProfile "fast" (global file): not defined for ${QWEN.modelId}; no profiles are defined for this model`,
+  ]);
+});
+
+test("a dangling default in the project file names the project file", () => {
+  assert.deepEqual(errorsWith({ project: ok({ models: { qwen3_4b: { defaultProfile: "gone" } } }) }, {}), [
+    `defaultProfile "gone" (project file): not defined for ${QWEN.modelId}; no profiles are defined for this model`,
+  ]);
+});
+
+test("a dangling default for another model never blocks this model's start", () => {
+  const global = ok({ models: { llama3_2_3b: { defaultProfile: "gone" } } });
+  const launch = launchWith({ global }, {});
+  assert.equal(launch.profile, undefined);
+  assert.deepEqual(launch.flags, []);
+});
+
+test("profiles defined with no default and no typed profile leave the launch exactly as without profiles", () => {
+  const launch = launchWith({ global: FAST_FILE() }, {});
+  assert.equal(launch.profile, undefined);
+  assert.deepEqual(launch.flags, []);
+  assert.deepEqual(launch.request, { sampling: {} });
+  assert.equal(describeProfile(launch), "");
+});
+
+const NOT_A_PROFILE_NAME = 'is not a profile name (1 to 64 characters: letters, digits, ".", "_" and "-", starting with a letter or digit)';
+for (const [value, shown] of [
+  [5, "5"],
+  [true, "true"],
+  [null, "null"],
+  [[], "[]"],
+  [{}, "{}"],
+  ["bad name!", '"bad name!"'],
+] as const) {
+  test(`defaultProfile ${shown} is refused as not a profile name`, () => {
+    const result = resolve({ global: ok({ models: { qwen3_4b: { defaultProfile: value } } }) });
+    assert.ok(!result.ok);
+    assert.deepEqual(result.errors, [`models["qwen3_4b"].defaultProfile (global config.json): ${shown} ${NOT_A_PROFILE_NAME}`]);
+  });
+}
+
+test("profiles in the model block are refused: they belong to one model", () => {
+  const result = resolve({ global: ok({ model: { profiles: { fast: {} } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ['model.profiles (global config.json): profiles belong to one model; define them inside a "models" entry']);
+});
+
+test("defaultProfile in the model block is refused: it belongs to one model", () => {
+  const result = resolve({ project: ok({ model: { defaultProfile: "fast" } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, [
+    'model.defaultProfile (project .pi/pi-mlx-models.json): defaultProfile belongs to one model; set it inside a "models" entry',
+  ]);
+});
+
+test("limits is per profile only: in the model block it is an unknown key that says where limits belongs", () => {
+  const result = resolve({ global: ok({ model: { limits: {} } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ["model.limits (global config.json): unknown key (limits belongs inside a profile)"]);
+});
+
+test("limits is per profile only: in a models entry it is an unknown key that says where limits belongs", () => {
+  const result = resolve({ global: ok({ models: { qwen3_4b: { limits: {} } } }) });
+  assert.ok(!result.ok);
+  assert.deepEqual(result.errors, ['models["qwen3_4b"].limits (global config.json): unknown key (limits belongs inside a profile)']);
+});
+
+test("layering: a profile in the global file beats a project model block for the same key", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } } }),
+    project: ok({ model: { sampling: { temperature: 0.9 } } }),
+  };
+  const launch = launchWith(input, FAST);
+  assert.deepEqual(flagSummary(launch), [{ flag: "--temp", args: ["--temp=0.2"], label: "profile fast" }]);
+  assert.deepEqual(flagSummary(launchWith(input, {})), [{ flag: "--temp", args: ["--temp=0.9"], label: "project file" }]);
+});
+
+test("layering: typed template arguments merge over the profile's, which merge over the base's", () => {
+  const launch = launchWith(
+    {
+      global: ok({
+        model: { chatTemplateArgs: { a: 1, b: 2 } },
+        models: { qwen3_4b: { profiles: { fast: { chatTemplateArgs: { b: 3 } } } } },
+      }),
+      args: { "model.chatTemplateArgs": '{"z":4}' },
+    },
+    FAST,
+  );
+  assert.deepEqual(launch.request.chatTemplateArgs, { a: 1, b: 3, z: 4 });
+  assert.equal(launch.flags[0].label, "/mlx-start");
+});
+
+test("layering: the same profile name in both files merges key by key, the project file over the global one", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2, topP: 0.9 } } } } } }),
+    project: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.3 } } } } } }),
+  };
+  assert.deepEqual(flagSummary(launchWith(input, FAST)), [
+    { flag: "--temp", args: ["--temp=0.3"], label: "profile fast" },
+    { flag: "--top-p", args: ["--top-p=0.9"], label: "profile fast" },
+  ]);
+});
+
+test("layering: template arguments of the global profile and the project profile merge key by key over the base", () => {
+  const input = {
+    global: ok({ model: { chatTemplateArgs: { a: 1 } }, models: { qwen3_4b: { profiles: { fast: { chatTemplateArgs: { b: 2 } } } } } }),
+    project: ok({ models: { qwen3_4b: { profiles: { fast: { chatTemplateArgs: { c: 3 } } } } } }),
+  };
+  assert.deepEqual(launchWith(input, FAST).request.chatTemplateArgs, { a: 1, b: 2, c: 3 });
+});
+
+test("layering: a global profile beats a project models entry for the same key", () => {
+  const input = {
+    global: ok({ models: { qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.2 } } } } } }),
+    project: ok({ models: { qwen3_4b: { sampling: { temperature: 0.9 } } } }),
+  };
+  assert.deepEqual(flagSummary(launchWith(input, FAST)), [{ flag: "--temp", args: ["--temp=0.2"], label: "profile fast" }]);
+});
+
+test("entries: a profile in both the preset-key entry and the model-id entry takes the model-id entry's keys, key by key", () => {
+  const global = ok({
+    models: {
+      qwen3_4b: { profiles: { fast: { sampling: { temperature: 0.1, topP: 0.5 } } } },
+      [QWEN.modelId]: { profiles: { fast: { sampling: { temperature: 0.2 } } } },
+    },
+  });
+  assert.deepEqual(argvWith({ global }, FAST), ["--temp=0.2", "--top-p=0.5"]);
+});
+
+test("entries: the profiles listed for an unknown name are the sorted union of both entries", () => {
+  const global = ok({
+    models: {
+      qwen3_4b: { profiles: { zeta: {}, alpha: {} } },
+      [QWEN.modelId]: { profiles: { mid: {}, alpha: {} } },
+    },
+  });
+  assert.deepEqual(errorsWith({ global }, { profile: "nope" }), [MISSING_PROFILE("nope", "available profiles: alpha, mid, zeta")]);
+});
+
+test("entries: a profile defined only in the preset-key entry is selectable for a model that also has a model-id entry", () => {
+  const global = ok({
+    models: {
+      qwen3_4b: { profiles: { fromKey: { sampling: { temperature: 0.1 } } } },
+      [QWEN.modelId]: { profiles: { fromId: { sampling: { temperature: 0.2 } } } },
+    },
+  });
+  assert.deepEqual(argvWith({ global }, { profile: "fromKey" }), ["--temp=0.1"]);
+  assert.deepEqual(argvWith({ global }, { profile: "fromId" }), ["--temp=0.2"]);
+});
+
+// ---- the profile validation matrix (plan 04-05: CFG-04, D-03, D-05, D-17, T-04-13, T-04-15, T-04-18) ----
+
+/** One profile `fast` of `models.qwen3_4b` holding `body`, as the parsed text of a file would. */
+const withProfile = (body: unknown) => ok({ models: { qwen3_4b: { profiles: { fast: body } } } });
+const PROFILE_PATH = 'models["qwen3_4b"].profiles["fast"]';
+
+/** The refusal lines of a file that must be refused as invalid. */
+function refusedLines(input: Partial<PrepareInput>): string[] {
+  const result = resolve(input);
+  assert.ok(!result.ok, "expected the configuration to be refused");
+  return result.errors;
+}
+
+const SERVER_ROWS = [
+  "host",
+  "port",
+  "allowedOrigins",
+  "logLevel",
+  "trustRemoteCode",
+  "decodeConcurrency",
+  "promptConcurrency",
+  "prefillStepSize",
+  "promptCacheSize",
+  "promptCacheBytes",
+  "kvBits",
+  "kvGroupSize",
+  "quantizedKvStart",
+];
+
+test("the thirteen server rows pinned here are exactly the server rows of the schema", () => {
+  assert.deepEqual(
+    SETTINGS.filter((row) => row.path.startsWith("server.")).map((row) => row.path.slice("server.".length)),
+    SERVER_ROWS,
+  );
+});
+
+for (const key of SERVER_ROWS) {
+  test(`the server row ${key} inside a profile is refused, naming the key, the profile and the file`, () => {
+    assert.deepEqual(refusedLines({ global: withProfile({ [key]: 1 }) }), [
+      `${PROFILE_PATH}.${key} (${GLOBAL}): unknown key (${key} is a "server" key, not part of a profile)`,
+    ]);
+  });
+}
+
+test("a server row inside a project profile names the project file", () => {
+  assert.deepEqual(refusedLines({ project: withProfile({ port: 9100, trustRemoteCode: true }) }), [
+    `${PROFILE_PATH}.port (${PROJECT}): unknown key (port is a "server" key, not part of a profile)`,
+    `${PROFILE_PATH}.trustRemoteCode (${PROJECT}): unknown key (trustRemoteCode is a "server" key, not part of a profile)`,
+  ]);
+});
+
+test("a project profile with a server row is an invalid configuration and not a project violation", () => {
+  const result = resolve({ project: withProfile({ trustRemoteCode: true }) });
+  assert.ok(!result.ok);
+  assert.equal("prepared" in result, false, "no preparation exists, so no project violation list does either");
+  assert.ok(result.errors.every((line) => !line.includes("lets the model repository run Python code")), result.errors.join("|"));
+  const clean = resolved({ project: withProfile({ sampling: { temperature: 0.3 } }) });
+  assert.deepEqual(clean.prepared.projectViolations, []);
+});
+
+for (const key of ["profiles", "extends", "defaultProfile"]) {
+  test(`${key} inside a profile is an unknown key of that profile (no nesting, no inheritance)`, () => {
+    const lines = refusedLines({ global: withProfile({ [key]: key === "profiles" ? { inner: {} } : "base" }) });
+    assert.equal(lines.length, 1, lines.join("|"));
+    assert.ok(lines[0].startsWith(`${PROFILE_PATH}.${key} (${GLOBAL}): unknown key`), lines[0]);
+  });
+}
+
+test("a key limits does not define inside a project profile is refused as an unknown key", () => {
+  assert.deepEqual(refusedLines({ project: withProfile({ limits: { thinkingTokens: 1 } }) }), [
+    `${PROFILE_PATH}.limits.thinkingTokens (${PROJECT}): unknown key`,
+  ]);
+});
+
+test("a nested object inside limits names only its key and never echoes the value", () => {
+  const lines = refusedLines({ global: withProfile({ limits: { a: { secret: "ZZZ-NESTED-VALUE" } } }) });
+  assert.deepEqual(lines, [`${PROFILE_PATH}.limits.a (${GLOBAL}): unknown key`]);
+  assert.ok(!lines[0].includes("ZZZ-NESTED-VALUE"));
+});
+
+// ---- profile limits (MOD-02, MOD-03): plan 05-05, Task 2 ----
+
+const limitsLine = (key: string, problem: string, label = GLOBAL) => `${PROFILE_PATH}.limits.${key} (${label}): ${problem}`;
+
+test("each limits key is accepted inside a profile and lands on launch.limits with the profile as its label", () => {
+  const cases: Array<[string, unknown]> = [
+    ["contextWindow", 100000],
+    ["maxTokens", 4096],
+    ["reasoning", true],
+    ["input", ["text", "image"]],
+  ];
+  for (const [key, value] of cases) {
+    const launch = launchWith({ global: withProfile({ limits: { [key]: value } }) }, FAST);
+    assert.deepEqual(launch.limits, { [key]: { value, label: "profile fast" } }, key);
+  }
+});
+
+test("a bad limits value gives one line naming the key, the file and the allowed values", () => {
+  const badIntegers: Array<[unknown, string]> = [
+    [0, "0"],
+    [-1, "-1"],
+    [1.5, "1.5"],
+    ["8192", '"8192"'],
+    [null, "null"],
+  ];
+  for (const key of ["contextWindow", "maxTokens"]) {
+    for (const [value, shown] of badIntegers) {
+      assert.deepEqual(refusedLines({ global: withProfile({ limits: { [key]: value } }) }), [
+        limitsLine(key, `${shown} is not an integer of at least 1`),
+      ]);
+    }
+  }
+  for (const [value, shown] of [["yes", '"yes"'], [1, "1"], [null, "null"]] as const) {
+    assert.deepEqual(refusedLines({ global: withProfile({ limits: { reasoning: value } }) }), [limitsLine("reasoning", `${shown} must be true or false`)]);
+  }
+  const badInputs: Array<[unknown, string]> = [
+    [["image"], '["image"]'],
+    [[], "[]"],
+    ["text", '"text"'],
+    [["text", "video"], '["text","video"]'],
+    [[1], "[1]"],
+  ];
+  for (const [value, shown] of badInputs) {
+    assert.deepEqual(refusedLines({ project: withProfile({ limits: { input: value } }) }), [
+      limitsLine("input", `${shown} must be a list of "text" and "image" that includes "text"`, PROJECT),
+    ]);
+  }
+});
+
+test("limits.input collapses a repeated entry in first-seen order and hands out a copy", () => {
+  const input = { global: withProfile({ limits: { input: ["text", "text", "image"] } }) };
+  const first = launchWith(input, FAST);
+  assert.deepEqual(first.limits.input?.value, ["text", "image"]);
+  first.limits.input?.value.push("image");
+  assert.deepEqual(launchWith(input, FAST).limits.input?.value, ["text", "image"]);
+});
+
+test("an unknown key inside limits is a line of its own: no hint, a did-you-mean, and a hostile key changes nothing", () => {
+  assert.deepEqual(refusedLines({ global: withProfile({ limits: { thinkingTokens: 1 } }) }), [limitsLine("thinkingTokens", "unknown key")]);
+  assert.deepEqual(refusedLines({ global: withProfile({ limits: { contextwindow: 1 } }) }), [
+    limitsLine("contextwindow", "unknown key (did you mean contextWindow?)"),
+  ]);
+  assert.deepEqual(refusedLines({ global: withProfile({ limits: { maxToken: 1 } }) }), [
+    limitsLine("maxToken", "unknown key (did you mean maxTokens?)"),
+  ]);
+  const before = Object.getOwnPropertyNames(Object.prototype).sort();
+  const hostile = JSON.parse('{"__proto__": {"polluted": true}}');
+  assert.deepEqual(refusedLines({ global: withProfile({ limits: hostile }) }), [limitsLine("__proto__", "unknown key")]);
+  assert.deepEqual(Object.getOwnPropertyNames(Object.prototype).sort(), before);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
+});
+
+test("limits in the model block, a models entry or at the top level is an unknown key; the first two say where it belongs", () => {
+  assert.deepEqual(refused({ global: ok({ model: { limits: { maxTokens: 4096 } } }) }), [
+    `model.limits (${GLOBAL}): unknown key (limits belongs inside a profile)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ models: { qwen3_4b: { limits: { maxTokens: 4096 } } } }) }), [
+    `models["qwen3_4b"].limits (${GLOBAL}): unknown key (limits belongs inside a profile)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ limits: { maxTokens: 4096 } }) }), [`limits (${GLOBAL}): unknown key`]);
+  assert.deepEqual(refused({ global: ok({ model: { limitz: {} } }) }), [`model.limitz (${GLOBAL}): unknown key`]);
+});
+
+test("limits never reach argv or a request: the flags, extra arguments, request and request notes are the same with and without them", () => {
+  const without = launchWith({ global: FAST_FILE() }, FAST);
+  const profile = { ...FAST_PROFILE, limits: { contextWindow: 100000, maxTokens: 4096, reasoning: true, input: ["text", "image"] } };
+  const withLimits = launchWith({ global: ok({ models: { qwen3_4b: { profiles: { fast: profile } } } }) }, FAST);
+  assert.deepEqual(withLimits.flags, without.flags);
+  assert.deepEqual(toLaunchSpec(withLimits).extraArgs, toLaunchSpec(without).extraArgs);
+  assert.deepEqual(withLimits.request, without.request);
+  assert.deepEqual(withLimits.requestNotes, without.requestNotes);
+  const only = launchWith({ global: withProfile({ limits: { maxTokens: 4096 } }) }, FAST);
+  assert.deepEqual(toLaunchSpec(only).extraArgs, []);
+  assert.deepEqual(only.flags, []);
+  assert.deepEqual(only.request.sampling, {});
+  assert.deepEqual(only.requestNotes, []);
+});
+
+test("the same profile name in both files merges its limits key by key, the project value winning, and a project profile's limits are no violation", () => {
+  const global = withProfile({ limits: { contextWindow: 100000, maxTokens: 8192 } });
+  const project = withProfile({ limits: { maxTokens: 4096 } });
+  assert.deepEqual(launchWith({ global, project }, FAST).limits, {
+    contextWindow: { value: 100000, label: "profile fast" },
+    maxTokens: { value: 4096, label: "profile fast" },
+  });
+  assert.deepEqual(resolved({ global, project }).prepared.projectViolations, []);
+});
+
+test("a launch without a profile, or with a profile that sets no limits, has empty limits", () => {
+  assert.deepEqual(launchWith({ global: FAST_FILE() }, {}).limits, {});
+  assert.deepEqual(launchWith({ global: FAST_FILE() }, FAST).limits, {});
+  assert.deepEqual(launchOf({}).limits, {});
+});
+
+test("every model.limits row is profile-only: per model, with no flag, environment variable, request field or default", () => {
+  const rows = SETTINGS.filter((row) => row.path.startsWith("model.limits."));
+  assert.deepEqual(
+    rows.map((row) => row.path),
+    ["model.limits.contextWindow", "model.limits.maxTokens", "model.limits.reasoning", "model.limits.input"],
+  );
+  for (const row of rows) {
+    assert.equal(row.perModel, true, row.path);
+    for (const field of ["cli", "env", "piFlag", "mlxFlag", "requestField", "initCli", "default"] as const) {
+      assert.equal(Object.hasOwn(row, field), false, `${row.path} has ${field}`);
+    }
+    assert.deepEqual(row.emit(1), [], row.path);
+  }
+  assert.ok(!cliFlagSpecs().some((spec) => spec.path.startsWith("model.limits.")));
+  assert.ok(!initFlagSpecs().some((spec) => spec.path.startsWith("model.limits.")));
+});
+
+const NAME_LINE = (shown: string, label = GLOBAL) => `models["qwen3_4b"].profiles[${shown}] (${label}): the profile name must be 1 to 64 characters`;
+for (const [name, shown] of [
+  ["", '""'],
+  ["-x", '"-x"'],
+  [".x", '".x"'],
+  ["a b", '"a b"'],
+  ["a/b", '"a/b"'],
+  ["a".repeat(65), `"${"a".repeat(65)}"`],
+  ["é", '"é"'],
+] as const) {
+  test(`the profile name ${JSON.stringify(name.length > 20 ? `${name.slice(0, 8)}... (${name.length} characters)` : name)} is refused`, () => {
+    const lines = refusedLines({ global: ok({ models: { qwen3_4b: { profiles: { [name]: {} } } } }) });
+    assert.equal(lines.length, 1, lines.join("|"));
+    assert.ok(lines[0].startsWith(NAME_LINE(shown)), lines[0]);
+  });
+}
+
+test("the name __proto__ is refused as an invalid name and nothing reaches Object.prototype", () => {
+  const data = JSON.parse('{"models":{"qwen3_4b":{"profiles":{"__proto__":{"polluted":true,"sampling":{"temperature":0.2}}}}}}');
+  const lines = refusedLines({ global: ok(data) });
+  assert.equal(lines.length, 1, lines.join("|"));
+  assert.ok(lines[0].startsWith(NAME_LINE('"__proto__"')), lines[0]);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "polluted"), false);
+});
+
+test("a profile called constructor is an ordinary name and selectable", () => {
+  const input = { global: withProfile({}) };
+  const named = { global: ok({ models: { qwen3_4b: { profiles: { constructor: { sampling: { temperature: 0.2 } } } } } }) };
+  assert.deepEqual(argvWith(named, { profile: "constructor" }), ["--temp=0.2"]);
+  assert.deepEqual(launchWith(named, { profile: "constructor" }).profile, { name: "constructor", source: "/mlx-start" });
+  assert.deepEqual(errorsWith(input, { profile: "constructor" }), [MISSING_PROFILE("constructor", "available profiles: fast")]);
+});
+
+test("fast, a, Fast_2.0-x and a 64 character name are all accepted", () => {
+  for (const name of ["fast", "a", "Fast_2.0-x", "a".repeat(64), "9lives"]) {
+    const input = { global: ok({ models: { qwen3_4b: { profiles: { [name]: { sampling: { temperature: 0.2 } } } } } }) };
+    assert.deepEqual(argvWith(input, { profile: name }), ["--temp=0.2"], name);
+  }
+});
+
+for (const [body, shown] of [
+  [5, "5"],
+  ["x", '"x"'],
+  [null, "null"],
+  [[], "[]"],
+  [true, "true"],
+] as const) {
+  test(`a profile body that is ${shown} is refused with the object line`, () => {
+    assert.deepEqual(refusedLines({ global: withProfile(body) }), [`${PROFILE_PATH} (${GLOBAL}): ${shown} must be a JSON object`]);
+  });
+}
+
+for (const [value, shown] of [
+  [[], "[]"],
+  ["x", '"x"'],
+] as const) {
+  test(`a profiles value that is ${shown} is refused with the object line`, () => {
+    assert.deepEqual(refusedLines({ global: ok({ models: { qwen3_4b: { profiles: value } } }) }), [
+      `models["qwen3_4b"].profiles (${GLOBAL}): ${shown} must be a JSON object`,
+    ]);
+  });
+}
+
+test("a bad sampling value inside a profile is reported with the full path, the file and the request field", () => {
+  assert.deepEqual(refusedLines({ global: withProfile({ sampling: { temperature: -1 } }) }), [
+    `${PROFILE_PATH}.sampling.temperature (${GLOBAL}): -1 is not a number of at least 0 (OpenAI field temperature, flag --temp)`,
+  ]);
+});
+
+test("a bad numDraftTokens in a project profile names the project file and its flag", () => {
+  const lines = refusedLines({ project: withProfile({ numDraftTokens: 0 }) });
+  assert.equal(lines.length, 1, lines.join("|"));
+  assert.ok(lines[0].startsWith(`${PROFILE_PATH}.numDraftTokens (${PROJECT}): `), lines[0]);
+  assert.ok(lines[0].endsWith("(flag --num-draft-tokens)"), lines[0]);
+});
+
+test("a mistyped model key inside a profile gets the did-you-mean hint", () => {
+  assert.deepEqual(refusedLines({ global: withProfile({ draftModle: "x" }) }), [
+    `${PROFILE_PATH}.draftModle (${GLOBAL}): unknown key (did you mean model.draftModel?)`,
+  ]);
+});
+
+test("a sampling key written directly in a profile is told to go inside sampling", () => {
+  assert.deepEqual(refusedLines({ global: withProfile({ temperature: 0.2 }) }), [
+    `${PROFILE_PATH}.temperature (${GLOBAL}): unknown key (temperature is a "sampling" key; write it inside "sampling")`,
+  ]);
+});
+
+test("there is no other way to pick a profile: no flag spec, no pi flag and no environment variable", () => {
+  assert.ok(!cliFlagSpecs().some((spec) => /profile/i.test(spec.flag) || /profile/i.test(spec.path)));
+  assert.ok(!initFlagSpecs().some((spec) => /profile/i.test(spec.flag) || /profile/i.test(spec.path)));
+  assert.deepEqual(
+    PI_FLAGS.map((flag) => flag.name),
+    ["mlx-model", "mlx-port", "mlx-host", "mlx-log-level"],
+  );
+  for (const row of SETTINGS) {
+    assert.ok(!/profile/i.test(`${row.path} ${row.env ?? ""} ${row.piFlag ?? ""}`), row.path);
+  }
+});
+
+test("an unknown-profile line lists at most ten names, sorted, and counts the rest", () => {
+  const profiles = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`p${String(i + 1).padStart(2, "0")}`, {}]));
+  const [line] = errorsWith({ global: ok({ models: { qwen3_4b: { profiles } } }) }, { profile: "nope" });
+  assert.equal(
+    line,
+    MISSING_PROFILE("nope", "available profiles: p01, p02, p03, p04, p05, p06, p07, p08, p09, p10, ...and 2 more"),
+  );
+});
+
+test("a typed profile name of 200 characters is shown clipped", () => {
+  const typed = `${"y".repeat(100)}${"z".repeat(100)}`;
+  const [line] = errorsWith({ global: FAST_FILE() }, { profile: typed });
+  assert.ok(line.startsWith('profile "yyyy'), line);
+  assert.ok(!line.includes("y".repeat(100)), "the name is cut at the display bound");
+  assert.ok(!line.includes("z"), "the tail is dropped");
+  assert.ok(line.length < 200, `${line.length} characters`);
+});
+
+// ---- the provider.listAllModels row (MOD-04) ----
+
+test("provider.listAllModels is false with no provider block and true when the global file sets it", () => {
+  assert.equal(resolved().prepared.listAllModels, false);
+  assert.equal(resolved({ global: ok({ provider: { listAllModels: false } }) }).prepared.listAllModels, false);
+  assert.equal(resolved({ global: ok({ provider: { listAllModels: true } }) }).prepared.listAllModels, true);
+});
+
+test("provider.listAllModels: the project file beats the global file in both directions", () => {
+  const globalTrue = ok({ provider: { listAllModels: true } });
+  const globalFalse = ok({ provider: { listAllModels: false } });
+  assert.equal(resolved({ global: globalTrue, project: ok({ provider: { listAllModels: false } }) }).prepared.listAllModels, false);
+  assert.equal(resolved({ global: globalFalse, project: ok({ provider: { listAllModels: true } }) }).prepared.listAllModels, true);
+});
+
+test("provider.listAllModels refuses a value that is not true or false with one line naming the key, the file and the allowed values", () => {
+  for (const [value, shown] of [
+    ["yes", '"yes"'],
+    [1, "1"],
+    [null, "null"],
+    ["true", '"true"'],
+  ] as const) {
+    assert.deepEqual(refused({ global: ok({ provider: { listAllModels: value } }) }), [
+      `provider.listAllModels (${GLOBAL}): ${shown} must be true or false`,
+    ]);
+  }
+});
+
+test("provider.listAllModels has no environment variable, flag, pi flag, init flag, server flag or request field", () => {
+  const row = SETTINGS.find((candidate) => candidate.path === "provider.listAllModels");
+  assert.ok(row, "the row exists");
+  assert.equal(row.kind, "bool");
+  for (const field of ["env", "cli", "initCli", "piFlag", "mlxFlag", "requestField", "default", "bare"] as const) {
+    assert.equal(row[field], undefined, field);
+  }
+  assert.deepEqual(row.emit(true), []);
+  assert.ok(!cliFlagSpecs().some((spec) => spec.path === "provider.listAllModels"));
+  assert.ok(!initFlagSpecs().some((spec) => spec.path === "provider.listAllModels"));
+  assert.ok(!PI_FLAGS.some((flag) => flag.path === "provider.listAllModels"));
+  const env = {
+    PI_MLX_MODELS_LIST_ALL_MODELS: "true",
+    PI_MLX_MODELS_LIST_ALL: "true",
+    PI_MLX_MODELS_PROVIDER_LIST_ALL_MODELS: "true",
+  };
+  const typed = resolved({
+    env,
+    args: { "provider.listAllModels": "true" },
+    piFlags: { "mlx-list-all-models": "true" },
+  });
+  assert.equal(typed.prepared.listAllModels, false);
+  assert.deepEqual(typed.warnings, []);
+  assert.deepEqual(extraOf({ global: ok({ provider: { listAllModels: true } }) }), [], "the key never reaches argv");
+});
+
+test("a project file with provider.listAllModels true is not a project violation and refuses nothing", () => {
+  const { prepared } = resolved({ project: ok({ provider: { listAllModels: true } }) });
+  assert.equal(prepared.listAllModels, true);
+  assert.deepEqual(prepared.projectViolations, []);
+});
+
+test("a mistyped provider key names provider.listAllModels, and the key written at the top level points into the provider block", () => {
+  assert.deepEqual(refused({ global: ok({ provider: { listAllModel: true } }) }), [
+    `provider.listAllModel (${GLOBAL}): unknown key (did you mean provider.listAllModels?)`,
+  ]);
+  assert.deepEqual(refused({ global: ok({ listAllModels: true }) }), [
+    `listAllModels (${GLOBAL}): unknown key (did you mean provider.listAllModels?)`,
+  ]);
+});
+
+test("a provider value that is not an object is the usual one-line object refusal", () => {
+  assert.deepEqual(refused({ global: ok({ provider: 5 }) }), [`provider (${GLOBAL}): 5 must be a JSON object`]);
+});
+
+test("provider.listAllModels names the layer that set it in the sources", () => {
+  const fromGlobal = resolved({ global: ok({ provider: { listAllModels: true } }) }).prepared;
+  assert.equal(fromGlobal.sources.get("provider.listAllModels")?.label, "global file");
+  const fromProject = resolved({
+    global: ok({ provider: { listAllModels: true } }),
+    project: ok({ provider: { listAllModels: false } }),
+  }).prepared;
+  assert.equal(fromProject.sources.get("provider.listAllModels")?.label, "project file");
+  assert.equal(resolved().prepared.sources.has("provider.listAllModels"), false);
+});
+
+// ---- autoStart (plan 06-01, D-24, D-26): opt-in, the user's own sources only ----
+
+const AUTO_START_ENV = "PI_MLX_MODELS_AUTO_START";
+
+test("the autoStart row is a user-level boolean with an environment variable and no flag of any kind", () => {
+  const row = SETTINGS.find((candidate) => candidate.path === "autoStart");
+  assert.ok(row, "the SETTINGS table has an autoStart row");
+  assert.equal(row.kind, "bool");
+  assert.equal(row.userLevelOnly, true);
+  assert.equal(row.env, AUTO_START_ENV);
+  assert.equal(row.default, false);
+  assert.equal(row.cli, undefined);
+  assert.equal(row.initCli, undefined);
+  assert.equal(row.piFlag, undefined);
+  assert.equal(row.mlxFlag, undefined);
+  assert.deepEqual(row.emit(true), []);
+  assert.deepEqual(row.emit(false), []);
+  assert.ok(!cliFlagSpecs().some((spec) => spec.path === "autoStart"));
+  assert.ok(!PI_FLAGS.some((flag) => flag.path === "autoStart"));
+});
+
+test("autoStart accepted from the global file with no warning, no violation and no flag; other values are refused naming the layer", () => {
+  const accepted = resolved({ global: ok({ autoStart: true }) });
+  assert.deepEqual(accepted.warnings, []);
+  assert.deepEqual(accepted.prepared.projectViolations, []);
+  assert.deepEqual(accepted.prepared.flags, []);
+  assert.equal(accepted.prepared.sources.get("autoStart")?.label, "global file");
+  assert.deepEqual(refused({ global: ok({ autoStart: "yes" }) }), [`autoStart (${GLOBAL}): "yes" must be true or false`]);
+  assert.deepEqual(refused({ global: ok({ autoStart: 1 }) }), [`autoStart (${GLOBAL}): 1 must be true or false`]);
+});
+
+test("autoStart misspelled in a file is an unknown key whose hint names autoStart", () => {
+  assert.equal(unknownLine({ autoStar: true }), `autoStar (${GLOBAL}): unknown key (did you mean autoStart?)`);
+  assert.equal(unknownLine({ autostart: true }), `autostart (${GLOBAL}): unknown key (did you mean autoStart?)`);
+});
+
+test("autoStart pre-gate, file: only a global file whose own autoStart is the boolean true answers true", () => {
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), {}), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: false }), {}), false);
+  assert.equal(isAutoStartRequested(absent, {}), false);
+  assert.equal(isAutoStartRequested({ state: "unusable", reason: "is not valid JSON" }, {}), false);
+  assert.equal(isAutoStartRequested(ok({ autoStart: "true" }), {}), false);
+  assert.equal(isAutoStartRequested(ok({ autoStart: 1 }), {}), false);
+  assert.equal(isAutoStartRequested(ok({ server: { port: 9000 } }), {}), false);
+});
+
+test("autoStart pre-gate, environment: a valid true or false text beats the file; blank or bad text leaves the file to decide", () => {
+  assert.equal(isAutoStartRequested(ok({ autoStart: false }), { [AUTO_START_ENV]: "true" }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), { [AUTO_START_ENV]: "false" }), false);
+  assert.equal(isAutoStartRequested(absent, { [AUTO_START_ENV]: " true " }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), { [AUTO_START_ENV]: "" }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), { [AUTO_START_ENV]: "   " }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: false }), { [AUTO_START_ENV]: "" }), false);
+  assert.equal(isAutoStartRequested(ok({ autoStart: true }), { [AUTO_START_ENV]: "maybe" }), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: false }), { [AUTO_START_ENV]: "maybe" }), false);
+  assert.equal(isAutoStartRequested(absent, { [AUTO_START_ENV]: "maybe" }), false);
+  assert.doesNotThrow(() => isAutoStartRequested(absent, { [AUTO_START_ENV]: undefined, OTHER: "x" }));
+  assert.doesNotThrow(() => isAutoStartRequested(ok({ autoStart: true }), Object.create(null) as Record<string, string | undefined>));
+});
+
+test("autoStart pre-gate ignores every other key: a file invalid elsewhere still answers, and no project file is taken", () => {
+  assert.equal(isAutoStartRequested(ok({ autoStart: true, server: { port: "x" }, unknown: 1 }), {}), true);
+  assert.equal(isAutoStartRequested(ok({ autoStart: false, server: { port: "x" } }), {}), false);
+  assert.equal(isAutoStartRequested.length, 2, "the function takes the global file and the environment, nothing else");
+});
+
+test("autoStart in a project file, true or false, is one autoStart-only violation and changes nothing that resolves", () => {
+  const violation = { path: "autoStart", shown: "", reason: "starts a model when pi opens; your own config or env only", autoStartOnly: true };
+  for (const value of [true, false]) {
+    const project = ok({ autoStart: value });
+    assert.deepEqual(violationsOf(project), [violation], String(value));
+    assert.equal(resolved({ project }).prepared.sources.has("autoStart"), false, String(value));
+    // A higher or lower layer does not hide the violation.
+    assert.deepEqual(violationsOf(project, { global: ok({ autoStart: true }) }), [violation], String(value));
+    assert.deepEqual(violationsOf(project, { env: { [AUTO_START_ENV]: "true" } }), [violation], String(value));
+  }
+  const withGlobal = resolved({ global: ok({ autoStart: true }), project: ok({ autoStart: false }) }).prepared;
+  assert.equal(withGlobal.sources.get("autoStart")?.label, "global file", "the project value never wins");
+});
+
+test("autoStart in a project file that fails the boolean check is an ordinary project file error, not a violation", () => {
+  assert.deepEqual(refused({ project: ok({ autoStart: "yes" }) }), [`autoStart (${PROJECT}): "yes" must be true or false`]);
+});
+
+// ---- the autoStart refusal wording, the command and origin of a profile selection, the shared exports (plan 06-01) ----
+
+const AUTO_START_LINE = "  autoStart: starts a model when pi opens; your own config or env only";
+const AUTO_START_SENTENCE = "autoStart never asks for confirmation; it applies only from that file or PI_MLX_MODELS_AUTO_START.";
+
+test("formatProjectRefusal autoStart alone names the option, the global file and the variable, and does not promise a confirmation", () => {
+  const text = formatProjectRefusal(violationsOf(ok({ autoStart: true })), "/home/u/config.json");
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot set autoStart, which starts a model when pi opens:",
+      AUTO_START_LINE,
+      "Move it to /home/u/config.json or set PI_MLX_MODELS_AUTO_START; auto-start applies only from those sources and never asks for confirmation.",
+    ].join("\n"),
+  );
+  assert.ok(!text.includes("starting then asks for confirmation"));
+  assert.equal(text, formatProjectRefusal(violationsOf(ok({ autoStart: false })), "/home/u/config.json"), "false is refused the same way");
+});
+
+test("formatProjectRefusal autoStart with trustRemoteCode keeps the existing header and lines and adds the autoStart sentence to the footer", () => {
+  const text = formatProjectRefusal(violationsOf(ok({ autoStart: true, server: { trustRemoteCode: true } })), "/home/u/config.json");
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot enable settings that run code or open the network:",
+      "  server.trustRemoteCode: lets the model repository run Python code",
+      AUTO_START_LINE,
+      `Move them to /home/u/config.json; starting then asks for confirmation. ${AUTO_START_SENTENCE}`,
+    ].join("\n"),
+  );
+});
+
+test("formatProjectRefusal autoStart with a pip index keeps the install header and footer and adds the autoStart sentence", () => {
+  const text = formatProjectRefusal(
+    violationsOf(ok({ autoStart: false, mlxLm: { pipIndex: "https://mirror.example/simple/" } })),
+    "/home/u/config.json",
+  );
+  assert.equal(
+    text,
+    [
+      ".pi/pi-mlx-models.json cannot set options that run code, open the network or choose where mlx-lm is installed from:",
+      "  mlxLm.pipIndex (https://mirror.example/simple/): chooses where mlx-lm is installed from",
+      AUTO_START_LINE,
+      `Move them to /home/u/config.json. Settings that run code or open the network then ask for confirmation at every start; the pip index applies without asking. ${AUTO_START_SENTENCE}`,
+    ].join("\n"),
+  );
+});
+
+test("buildLaunch command typed: the profile source and the unknown-profile line name /mlx-restart", () => {
+  const launch = launchWith({ global: FAST_FILE() }, { profile: "fast", command: "/mlx-restart" });
+  assert.deepEqual(launch.profile, { name: "fast", source: "/mlx-restart" });
+  assert.equal(describeProfile(launch), "profile: fast (/mlx-restart)");
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "nope", command: "/mlx-restart" }), [
+    `profile "nope" (/mlx-restart --profile): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "nope", command: "/mlx-last", origin: "typed" }), [
+    `profile "nope" (/mlx-last --profile): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+});
+
+test("buildLaunch command kept: the profile source is the previous launch and the unknown-profile line says it was kept", () => {
+  const launch = launchWith({ global: FAST_FILE() }, { profile: "fast", command: "/mlx-last", origin: "kept" });
+  assert.deepEqual(launch.profile, { name: "fast", source: "previous launch" });
+  assert.equal(describeProfile(launch), "profile: fast (previous launch)");
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "gone", command: "/mlx-last", origin: "kept" }), [
+    `profile "gone" (kept from the previous launch): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+  assert.deepEqual(errorsWith({}, { profile: "gone", command: "/mlx-restart", origin: "kept" }), [
+    `profile "gone" (kept from the previous launch): not defined for ${QWEN.modelId}; no profiles are defined for this model`,
+  ]);
+});
+
+test("buildLaunch command default: no command, no origin and no options give the /mlx-start text", () => {
+  const withFlag = launchWith({ global: FAST_FILE() }, FAST);
+  assert.deepEqual(withFlag.profile, { name: "fast", source: "/mlx-start" });
+  assert.deepEqual(launchWith({ global: FAST_FILE() }, { profile: "fast", command: "/mlx-start", origin: "typed" }).profile, withFlag.profile);
+  assert.equal(describeProfile(withFlag), "profile: fast (/mlx-start)");
+  assert.deepEqual(errorsWith({ global: FAST_FILE() }, { profile: "nope" }), [MISSING_PROFILE("nope", "available profiles: fast")]);
+  const built = buildLaunch(resolved({ global: FAST_FILE() }).prepared, QWEN, LAUNCH_CTX);
+  assert.ok(built.ok);
+  assert.equal(built.launch.profile, undefined);
+});
+
+test("buildLaunch command does not reword a profile that came from defaultProfile", () => {
+  const file = ok({ models: { qwen3_4b: { defaultProfile: "fast", profiles: { fast: FAST_PROFILE } } } });
+  const launch = launchWith({ global: file }, { command: "/mlx-restart", origin: "kept" });
+  assert.deepEqual(launch.profile, { name: "fast", source: "global file" });
+  const dangling = ok({ models: { qwen3_4b: { defaultProfile: "gone", profiles: { fast: FAST_PROFILE } } } });
+  assert.deepEqual(errorsWith({ global: dangling }, { command: "/mlx-last" }), [
+    `defaultProfile "gone" (global file): not defined for ${QWEN.modelId}; available profiles: fast`,
+  ]);
+});
+
+test("exports: PROFILE_NAME, PROFILE_NAME_SHORT_RULE and MAX_FILE_BYTES are shared with the state file reader and the config editor", () => {
+  const shared = settingsModule as unknown as Record<string, unknown>;
+  const name = shared.PROFILE_NAME;
+  assert.ok(name instanceof RegExp, "PROFILE_NAME is exported");
+  for (const accepted of ["fast", "a.b_c-1", "0", "A"]) assert.ok(name.test(accepted), accepted);
+  for (const rejected of ["", "-x", ".x", "a b", "a".repeat(65)]) assert.ok(!name.test(rejected), JSON.stringify(rejected));
+  assert.ok(name.test("a".repeat(64)));
+  assert.equal(typeof shared.PROFILE_NAME_SHORT_RULE, "string");
+  assert.ok((shared.PROFILE_NAME_SHORT_RULE as string).length > 0);
+  assert.equal(shared.MAX_FILE_BYTES, 262144);
 });

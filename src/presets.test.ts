@@ -76,3 +76,16 @@ test("an empty default model is an error rather than an empty --model argument",
 test("an explicit model id still wins over an unusable default", () => {
   assert.equal(resolveModel("org/model", "--foo").modelId, "org/model");
 });
+
+test("every preset has a boolean reasoning flag, true only for the DeepSeek-R1 distill", () => {
+  for (const preset of MODEL_PRESETS) {
+    assert.equal(typeof preset.reasoning, "boolean", preset.key);
+    assert.equal(preset.reasoning, preset.key === "deepseek_r1_1_5b", preset.key);
+  }
+});
+
+test("a preset resolved by key or by full model id carries its reasoning flag", () => {
+  assert.equal(resolveModel("deepseek_r1_1_5b", DEFAULT).preset?.reasoning, true);
+  assert.equal(resolveModel(MODEL_PRESETS[0].modelId, DEFAULT).preset?.reasoning, true);
+  assert.equal(resolveModel("qwen3_4b", DEFAULT).preset?.reasoning, false);
+});

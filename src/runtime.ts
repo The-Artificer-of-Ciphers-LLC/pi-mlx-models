@@ -16,7 +16,12 @@ export interface RuntimeHost {
   findPython(): string | null;
   searched?(): string[];
   exists(path: string): boolean;
-  run(cmd: string, args: string[], onLine?: (line: string) => void): Promise<void>;
+  /** `options.timeoutMs` kills the child and rejects when it has not ended by then; without it the child may run for good. */
+  run(cmd: string, args: string[], onLine?: (line: string) => void, options?: RunOptions): Promise<void>;
+}
+
+export interface RunOptions {
+  timeoutMs?: number;
 }
 
 /**
@@ -98,10 +103,35 @@ export function findPython(options: { candidates?: string[]; env?: NodeJS.Proces
   return null;
 }
 
-export function run(cmd: string, args: string[], onLine?: (line: string) => void): Promise<void> {
+/** The most stderr kept for a failure message; the message shows the last 800 characters, so older output is dropped. */
+const MAX_STDERR_KEPT = 4096;
+
+/** What `run` rejects with when its `timeoutMs` ran out, so a caller can tell a slow command from a failed one. */
+export class RunTimeoutError extends Error {
+  constructor(cmd: string, timeoutMs: number) {
+    // Whole seconds read well; a bound under one second would round to "0 s", so it is given in milliseconds.
+    const bound = timeoutMs < 1000 ? `${Math.round(timeoutMs)} ms` : `${Math.round(timeoutMs / 1000)} s`;
+    super(`${cmd} timed out after ${bound}`);
+    this.name = "RunTimeoutError";
+  }
+}
+
+export function run(cmd: string, args: string[], onLine?: (line: string) => void, options: RunOptions = {}): Promise<void> {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    // A bounded run gets its own process group (POSIX), so the timeout can end the child and anything it started. An
+    // unbounded run (the installer) stays in the caller's group, where a Ctrl-C still reaches pip.
+    const bounded = options.timeoutMs !== undefined;
+    const ownGroup = bounded && process.platform !== "win32";
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], env: process.env, detached: ownGroup });
     let err = "";
+    let timer: NodeJS.Timeout | undefined;
+    let settled = false;
+    const settle = (finish: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      finish();
+    };
     const handle = (chunk: Buffer) => {
       if (!onLine) return;
       for (const line of chunk.toString().split(/\r?\n/)) {
@@ -112,12 +142,37 @@ export function run(cmd: string, args: string[], onLine?: (line: string) => void
     };
     p.stdout?.on("data", handle);
     p.stderr?.on("data", (d) => {
-      err += d.toString();
+      err = (err + d.toString()).slice(-MAX_STDERR_KEPT);
       handle(d);
     });
+    if (options.timeoutMs !== undefined) {
+      const timeoutMs = options.timeoutMs;
+      timer = setTimeout(() => {
+        // The group first (the child leads it, so its id is the group id), the child alone when that is not possible.
+        try {
+          if (ownGroup && p.pid !== undefined) process.kill(-p.pid, "SIGKILL");
+          else p.kill("SIGKILL");
+        } catch {
+          p.kill("SIGKILL");
+        }
+        // Settled here, not on `close`: a process that left the group could still hold the pipes open.
+        settle(() => {
+          p.stdout?.destroy();
+          p.stderr?.destroy();
+          reject(new RunTimeoutError(cmd, timeoutMs));
+        });
+      }, timeoutMs);
+    }
     // `close`, not `exit`: exit can fire before the last stderr chunk has been read.
-    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(clipDiagnostic(err, 800) || `${cmd} failed with exit ${code}`))));
-    p.on("error", reject);
+    p.on("close", (code) => {
+      settle(() => {
+        if (code === 0) resolve();
+        else reject(new Error(clipDiagnostic(err, 800) || `${cmd} failed with exit ${code}`));
+      });
+    });
+    p.on("error", (e) => {
+      settle(() => reject(e));
+    });
   });
 }
 
@@ -127,6 +182,32 @@ export const systemHost: RuntimeHost = {
   exists: existsSync,
   run,
 };
+
+/** An import that takes longer than this is wedged: the check ends and answers "timed out". A cold first import is far shorter. */
+const IMPORT_CHECK_TIMEOUT_MS = 60_000;
+
+/** The answer of the import check: usable, not usable, or too slow to tell. */
+export type RuntimeCheck = "installed" | "missing" | "timed out";
+
+/**
+ * Whether the venv Python exists and can import mlx_lm, with a timeout told apart from a missing runtime (a slow cold import
+ * is not a reason to say "run /mlx-init"). Runs only the fixed command the installer already runs (`-c "import mlx_lm"`),
+ * with no user text, and never throws.
+ */
+export async function runtimeCheck(host: RuntimeHost = systemHost): Promise<RuntimeCheck> {
+  try {
+    if (!host.exists(VENV_PYTHON)) return "missing";
+    await host.run(VENV_PYTHON, ["-c", "import mlx_lm"], undefined, { timeoutMs: IMPORT_CHECK_TIMEOUT_MS });
+    return "installed";
+  } catch (error) {
+    return error instanceof RunTimeoutError ? "timed out" : "missing";
+  }
+}
+
+/** True when the venv Python exists and can import mlx_lm: the one answer to "has /mlx-init been run". A timeout is false. */
+export async function runtimeInstalled(host: RuntimeHost = systemHost): Promise<boolean> {
+  return (await runtimeCheck(host)) === "installed";
+}
 
 /** Minor version of the venv's own interpreter, or null when it cannot be run or its output is not a Python 3 version. */
 async function venvPythonMinor(host: RuntimeHost): Promise<number | null> {
@@ -164,15 +245,9 @@ export async function ensureInstalled(options: {
   // What events and failures say about the index: already validated, and still cleaned and clipped (T-03-18).
   const shownIndex = clipDiagnostic(cleanLabel(index), 200, "start");
 
-  if (!options.upgrade && host.exists(VENV_PYTHON)) {
-    const importable = await host.run(VENV_PYTHON, ["-c", "import mlx_lm"]).then(
-      () => true,
-      () => false,
-    );
-    if (importable) {
-      emit({ phase: "mlx-lm", state: "done", detail: "mlx-lm already installed" });
-      return;
-    }
+  if (!options.upgrade && (await runtimeInstalled(host))) {
+    emit({ phase: "mlx-lm", state: "done", detail: "mlx-lm already installed" });
+    return;
   }
 
   const py = host.findPython();

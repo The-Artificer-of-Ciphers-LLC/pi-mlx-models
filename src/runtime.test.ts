@@ -4,7 +4,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { VENV_DIR, VENV_PYTHON } from "./config.js";
-import { ensureInstalled, findPython, pythonCandidates, run, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
+import { RunTimeoutError, ensureInstalled, findPython, pythonCandidates, run, runtimeCheck, runtimeInstalled, type RuntimeEvent, type RuntimeHost } from "./runtime.js";
 
 function fakeHost(overrides: Partial<RuntimeHost> & { venv?: boolean } = {}) {
   const calls: string[][] = [];
@@ -429,6 +429,86 @@ test("run's onLine lines are cleaned of control characters", async () => {
   for (const line of lines) assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f]/);
 });
 
+// IN-03: a child that never ends must not hang the caller for good.
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test("run with a timeout kills a child that does not end and rejects with a fixed phrase", { timeout: 20_000 }, async () => {
+  const script = "process.stdout.write('pid=' + process.pid + '\\n'); setInterval(() => {}, 1000)";
+  let pid = 0;
+  const started = Date.now();
+  await assert.rejects(run(process.execPath, ["-e", script], (line) => {
+    const m = line.match(/^pid=(\d+)$/);
+    if (m) pid = Number(m[1]);
+  }, { timeoutMs: 500 }), /timed out/);
+  assert.ok(Date.now() - started < 10_000, "rejected soon after the bound");
+  assert.ok(pid > 0, "premise: the child reported its pid");
+  for (let i = 0; i < 40 && isAlive(pid); i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(isAlive(pid), false, "the child was killed");
+});
+
+test("run with a timeout also ends a grandchild that holds the output pipes", { timeout: 20_000, skip: process.platform === "win32" }, async () => {
+  // The child starts a grandchild that inherits stdout and would live 6 s; the caller must not wait for it.
+  const script = [
+    "const { spawn } = require('node:child_process');",
+    "const g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 6000)'], { stdio: 'inherit' });",
+    "process.stdout.write('gpid=' + g.pid + '\\n');",
+    "setInterval(() => {}, 1000);",
+  ].join(" ");
+  let gpid = 0;
+  const started = Date.now();
+  try {
+    await assert.rejects(run(process.execPath, ["-e", script], (line) => {
+      const m = line.match(/^gpid=(\d+)$/);
+      if (m) gpid = Number(m[1]);
+    }, { timeoutMs: 400 }), /timed out/);
+    assert.ok(Date.now() - started < 3000, "rejected at the bound, not when the grandchild ended");
+    assert.ok(gpid > 0, "premise: the child reported the grandchild's pid");
+    for (let i = 0; i < 40 && isAlive(gpid); i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(isAlive(gpid), false, "the grandchild was killed with the child");
+  } finally {
+    if (gpid > 0 && isAlive(gpid)) process.kill(gpid, "SIGKILL");
+  }
+});
+
+test("run with a sub-second timeout says so in milliseconds, never 0 s", { timeout: 20_000 }, async () => {
+  await assert.rejects(
+    run(process.execPath, ["-e", "setInterval(() => {}, 1000)"], undefined, { timeoutMs: 300 }),
+    (error: Error) => /timed out after 300 ms/.test(error.message) && !/after 0 s/.test(error.message),
+  );
+});
+
+test("run with a timeout of whole seconds says so in seconds", { timeout: 20_000 }, async () => {
+  await assert.rejects(
+    run(process.execPath, ["-e", "setInterval(() => {}, 1000)"], undefined, { timeoutMs: 1000 }),
+    /timed out after 1 s/,
+  );
+});
+
+test("run with a timeout that is not reached resolves as before", async () => {
+  await run(process.execPath, ["-e", "process.exit(0)"], undefined, { timeoutMs: 20_000 });
+});
+
+test("runtimeInstalled: the import check is run with a bound, so a wedged import cannot hang auto-start", async () => {
+  const seen: unknown[] = [];
+  const { host } = fakeHost({
+    venv: true,
+    run: async (_cmd, _args, _onLine, options) => {
+      seen.push(options);
+    },
+  });
+  assert.equal(await runtimeInstalled(host), true);
+  const options = seen[0] as { timeoutMs?: unknown } | undefined;
+  assert.equal(typeof options?.timeoutMs, "number");
+  assert.ok((options?.timeoutMs as number) > 0);
+});
+
 // WR-07: a venv built by an older Python cannot take mlx-lm; it is recreated with a compatible interpreter.
 /** A host whose venv exists and whose `--version` probe reports `venvVersion`; the import check fails unless `importable`. */
 function venvHost(venvVersion: string, importable = false) {
@@ -503,4 +583,103 @@ test("pip's own output does not replace the index in either pip step's progress 
     }
   }
   assert.ok(fromPip("mlx-lm")[0].detail?.includes("mlx-lm==0.31.1"));
+});
+
+// ---- runtimeInstalled: the one answer to "has /mlx-init been run" (plan 06-03, D-27) ----
+
+test("runtimeInstalled: a host without the venv Python is not installed and nothing is run", async () => {
+  const { host, calls } = fakeHost({ venv: false });
+  assert.equal(await runtimeInstalled(host), false);
+  assert.deepEqual(calls, []);
+});
+
+test("runtimeInstalled: the venv Python that imports mlx_lm is installed, with one fixed command", async () => {
+  const { host, calls } = fakeHost({ venv: true });
+  assert.equal(await runtimeInstalled(host), true);
+  assert.deepEqual(calls, [[VENV_PYTHON, "-c", "import mlx_lm"]]);
+});
+
+test("runtimeInstalled: a run that rejects is not installed", async () => {
+  const { host } = fakeHost({
+    venv: true,
+    run: async () => {
+      throw new Error("No module named mlx_lm");
+    },
+  });
+  assert.equal(await runtimeInstalled(host), false);
+});
+
+test("runtimeCheck tells a timed-out import check from a missing runtime, and runtimeInstalled still answers false for both", async () => {
+  const timedOut = fakeHost({
+    venv: true,
+    run: async () => {
+      throw new RunTimeoutError("python", 60_000);
+    },
+  });
+  const missing = fakeHost({
+    venv: true,
+    run: async () => {
+      throw new Error("No module named mlx_lm");
+    },
+  });
+  assert.equal(await runtimeCheck(timedOut.host), "timed out");
+  assert.equal(await runtimeCheck(missing.host), "missing");
+  assert.equal(await runtimeCheck(fakeHost({ venv: false }).host), "missing");
+  assert.equal(await runtimeCheck(fakeHost({ venv: true }).host), "installed");
+  assert.equal(await runtimeInstalled(timedOut.host), false);
+});
+
+test("runtimeInstalled: a run that throws before it returns a promise is not installed", async () => {
+  const { host } = fakeHost({
+    venv: true,
+    run: () => {
+      throw new Error("spawn failed");
+    },
+  });
+  assert.equal(await runtimeInstalled(host), false);
+});
+
+test("runtimeInstalled: an exists that throws is not installed and nothing is run", async () => {
+  const { host, calls } = fakeHost({
+    exists: () => {
+      throw new Error("EACCES");
+    },
+  });
+  assert.equal(await runtimeInstalled(host), false);
+  assert.deepEqual(calls, []);
+});
+
+test("runtimeInstalled: is callable with no argument, which means the system host", () => {
+  assert.equal(typeof runtimeInstalled, "function");
+  assert.equal(runtimeInstalled.length, 0, "the host parameter has a default");
+});
+
+test("runtimeInstalled: ensureInstalled with an installed runtime still reports it and never looks for Python", async () => {
+  const { host, calls } = fakeHost({
+    venv: true,
+    findPython: () => {
+      throw new Error("findPython must not be called");
+    },
+  });
+  const events: RuntimeEvent[] = [];
+  await ensureInstalled({ host, onEvent: (e) => events.push(e) });
+  assert.deepEqual(calls, [[VENV_PYTHON, "-c", "import mlx_lm"]]);
+  assert.deepEqual(events, [{ phase: "mlx-lm", state: "done", detail: "mlx-lm already installed" }]);
+});
+
+test("runtimeInstalled: ensureInstalled with upgrade does not ask whether the venv exists up front", async () => {
+  let existsCalls = 0;
+  const { host } = fakeHost({
+    exists: () => {
+      existsCalls += 1;
+      return true;
+    },
+  });
+  // The pip steps and the venv step still look at the venv; the short cut must not add a call of its own.
+  await ensureInstalled({ host, upgrade: true });
+  const withUpgrade = existsCalls;
+  existsCalls = 0;
+  await ensureInstalled({ host });
+  assert.equal(withUpgrade, 1, "only the venv step asks");
+  assert.equal(existsCalls, 1, "the short cut asks once and an installed runtime stops there");
 });
