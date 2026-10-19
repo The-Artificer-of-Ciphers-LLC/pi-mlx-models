@@ -18,7 +18,8 @@ For maintainers. A release is one manual run of the **Release** workflow, follow
    - installs, builds and tests
    - stages the release on npm
    - commits `chore(release): <version>` to `main` and tags `v<version>`
-5. Approve it on npm. Open the package's **Staged Packages** tab on npmjs.com, check the version, and click **Approve** with your two-factor code. Or run `npm stage approve <stage-id>`; the run's summary shows how to list it.
+   - waits for you to approve the version on npm (step 5), then creates the GitHub Release from that version's changelog section
+5. Approve it on npm. Open the package's **Staged Packages** tab on npmjs.com, check the version, and click **Approve** with your two-factor code. Or run `npm stage approve <stage-id>`; the run's summary shows how to list it. The run is still going and creates the GitHub Release within a few minutes of your approval. It waits up to 30 minutes; if you approve later, it ends without failing and the run's summary gives the `gh release create` command to run yourself.
 
 The release is live only after step 5.
 
