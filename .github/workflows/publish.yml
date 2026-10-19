@@ -191,7 +191,7 @@ jobs:
 
       # Runs after the commit and tag, once the version is live on npm: the staged package goes live only when a
       # maintainer approves it, so the step waits for that. If the approval takes longer than the wait, the step
-      # ends without failing and says how to create the Release by hand; the release itself is already done.
+      # ends without failing and prints a command that creates the Release by hand; the release itself is already done.
       - name: Create the GitHub Release once the version is on npm
         if: ${{ !inputs.dry-run }}
         shell: bash
@@ -201,21 +201,36 @@ jobs:
           set -euo pipefail
           name="$(node -p "require('./package.json').name")"
           live=false
-          for _ in $(seq 1 60); do
-            if [ "$(npm view "$name@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
-              live=true
-              break
+          for attempt in $(seq 1 60); do
+            # An npm error is logged on every poll and the wait goes on: an outage must not look like a quiet wait.
+            if found="$(npm view "$name@$VERSION" version 2>&1)"; then
+              if [ "$found" = "$VERSION" ]; then
+                live=true
+                break
+              fi
+            else
+              echo "attempt $attempt: npm view failed: $found" >&2
             fi
             sleep 30
           done
           if [ "$live" != true ]; then
-            echo "$name@$VERSION is not on npm yet, so no GitHub Release was created. After approving it, run: gh release create v$VERSION --title $VERSION --notes-file <the $VERSION section of CHANGELOG.md>" | tee -a "$GITHUB_STEP_SUMMARY"
+            {
+              echo "$name@$VERSION was not on npm after 30 minutes, so no GitHub Release was created."
+              echo "After approving it, run this from a checkout of main:"
+              echo "gh release create v$VERSION --title $VERSION --notes \"\$(awk '/^## $VERSION /{f=1; next} /^## /{f=0} f' CHANGELOG.md)\""
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # A Release made by hand during the wait is left alone: the release itself is done, so this must not turn red.
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "A GitHub Release for v$VERSION already exists; leaving it as it is." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           awk -v v="$VERSION" 'index($0, "## " v " ") == 1 { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "the changelog has no section for $VERSION" >&2
-            exit 1
+          if [ -s release-notes.md ]; then
+            gh release create "v$VERSION" --title "$VERSION" --notes-file release-notes.md --verify-tag
+          else
+            echo "the changelog has no section for $VERSION; using generated notes" >&2
+            gh release create "v$VERSION" --title "$VERSION" --generate-notes --verify-tag
           fi
-          gh release create "v$VERSION" --title "$VERSION" --notes-file release-notes.md --verify-tag
           echo "Created the GitHub Release for v$VERSION." >> "$GITHUB_STEP_SUMMARY"
