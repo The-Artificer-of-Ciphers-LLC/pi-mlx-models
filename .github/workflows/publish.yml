@@ -1,7 +1,8 @@
 name: Release
 
 # One manual trigger does the whole release: it bumps the version, updates the changelog, builds and tests, stages the
-# release to npm, then commits the bump and tags it on main. Nothing releases automatically; pushing a tag does not.
+# release to npm, then commits the bump and tags it on main, then waits for the approval and creates the GitHub Release.
+# Nothing releases automatically; pushing a tag does not.
 #
 # The file is still called publish.yml because the npm trusted publisher is bound to that file name (and to the
 # npm-publish environment below). Renaming either one means re-creating the trusted publisher on npmjs.com.
@@ -43,7 +44,8 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The last step waits up to 30 minutes for the staged version to be approved on npm.
+    timeout-minutes: 45
     # A named environment lets you require a reviewer before the job runs (Settings > Environments).
     # The trusted publisher on npmjs.com names this environment, so it must stay.
     environment: npm-publish
@@ -186,3 +188,34 @@ jobs:
             exit 1
           fi
           echo "Committed and tagged v$VERSION on main." >> "$GITHUB_STEP_SUMMARY"
+
+      # Runs after the commit and tag, once the version is live on npm: the staged package goes live only when a
+      # maintainer approves it, so the step waits for that. If the approval takes longer than the wait, the step
+      # ends without failing and says how to create the Release by hand; the release itself is already done.
+      - name: Create the GitHub Release once the version is on npm
+        if: ${{ !inputs.dry-run }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./package.json').name")"
+          live=false
+          for _ in $(seq 1 60); do
+            if [ "$(npm view "$name@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
+              live=true
+              break
+            fi
+            sleep 30
+          done
+          if [ "$live" != true ]; then
+            echo "$name@$VERSION is not on npm yet, so no GitHub Release was created. After approving it, run: gh release create v$VERSION --title $VERSION --notes-file <the $VERSION section of CHANGELOG.md>" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          awk -v v="$VERSION" 'index($0, "## " v " ") == 1 { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "the changelog has no section for $VERSION" >&2
+            exit 1
+          fi
+          gh release create "v$VERSION" --title "$VERSION" --notes-file release-notes.md --verify-tag
+          echo "Created the GitHub Release for v$VERSION." >> "$GITHUB_STEP_SUMMARY"
