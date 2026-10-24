@@ -24,6 +24,7 @@ import {
   validateModelKey,
   validateProfileName,
 } from "./configedit.js";
+import { type ConfigMenuUi, createDialogs } from "./configdialogs.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { readLayerFile } from "./settings.js";
@@ -70,13 +71,7 @@ export const PROFILE_ACTION = {
   back: "Back",
 } as const;
 
-/** The parts of pi's `ctx.ui` the menu uses, with pi's signatures. */
-export interface ConfigMenuUi {
-  select(title: string, options: string[], opts?: unknown): Promise<string | undefined>;
-  input(title: string, placeholder?: string, opts?: unknown): Promise<string | undefined>;
-  confirm(title: string, message: string, opts?: unknown): Promise<boolean>;
-  notify(message: string, type?: "info" | "warning" | "error"): void;
-}
+export { CARRY_MAX_CHARS, CARRY_MAX_LINES, type ConfigMenuUi, carriedCopy } from "./configdialogs.js";
 
 export interface ConfigMenuOptions {
   ui: ConfigMenuUi;
@@ -106,48 +101,6 @@ function shownValue(value: unknown): string {
   }
 }
 
-/** The most lines of a result the next menu title carries, so a long refusal cannot make the menu taller than the screen. */
-export const CARRY_MAX_LINES = 6;
-/** The most characters of a result the next menu title carries. */
-export const CARRY_MAX_CHARS = 500;
-
-/**
- * Defense in depth for the carried copy: in every whitespace-separated token that holds "://", the text between "://" and
- * the token's last at sign becomes "***", so "https://u:p@host/x" is carried as "https://***@host/x". Every other token and
- * every separator is returned as it is, so the status word of a notice and text such as @scope/pkg, model@rev or a@b.com
- * (no "://" in the token) are kept. `redactCredentials` is not used because it works by position and cuts a line at its last
- * at sign, which would drop the status word, and the userinfo pattern inside it is private to src/diagnostic.ts and stops at
- * a slash, so it would leak a password that holds one. The cost is one indexOf and one lastIndexOf per token (linear).
- * Limits: a password that holds whitespace is not covered here (the primary layers, `shown` and the settings messages, still
- * hide it), and a URL whose own path holds an at sign has the text between "://" and that last sign hidden, which errs toward
- * hiding.
- */
-function maskCredentialSpans(line: string): string {
-  return line
-    .split(/(\s+)/)
-    .map((token) => {
-      const scheme = token.indexOf("://");
-      if (scheme < 0) return token;
-      const at = token.lastIndexOf("@");
-      return at > scheme + 2 ? `${token.slice(0, scheme + 3)}***${token.slice(at)}` : token;
-    })
-    .join("");
-}
-
-/**
- * A notice as the title of the next menu carries it: the first lines, each with the credential span of a URL masked, cut to
- * a length, with "..." when anything was left out. The notice itself (ctx.ui.notify) is not changed. The message was built
- * from `shown(...)` parts, but its other parts (settings messages, a write reason, a path) are composed elsewhere, so the
- * copy does not rely on that. clipDiagnostic still replaces control characters.
- */
-export function carriedCopy(message: string): string {
-  const lines = message.split("\n");
-  const kept = lines.slice(0, CARRY_MAX_LINES).map(maskCredentialSpans).join("\n");
-  const clipped = clipDiagnostic(kept, CARRY_MAX_CHARS, "start");
-  const cut = lines.length > CARRY_MAX_LINES || kept.trim().length > CARRY_MAX_CHARS;
-  return cut ? `${clipped}...` : clipped;
-}
-
 /** The result of one flow: go back to the top menu, or end the menu (the file cannot be used). */
 type Flow = "menu" | "end";
 
@@ -160,83 +113,14 @@ const flowOf = (written: Written): Flow => (written === "end" ? "end" : "menu");
 export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   const { path } = options;
 
-  // Every ui call is guarded: a dialog that throws is a dismissal (and a declined confirm), the same fail-closed stance as
-  // the trust dialogs (Phase 2 D-13). A notify that throws must never stop the menu.
-  const dialogs = {
-    async select(title: string, choices: string[]): Promise<string | undefined> {
-      try {
-        const answer = await options.ui.select(title, choices);
-        return typeof answer === "string" ? answer : undefined;
-      } catch {
-        return undefined;
-      }
-    },
-    async input(title: string, placeholder?: string): Promise<string | undefined> {
-      try {
-        const answer = await options.ui.input(title, placeholder);
-        return typeof answer === "string" ? answer : undefined;
-      } catch {
-        return undefined;
-      }
-    },
-    async confirm(title: string, message: string): Promise<boolean> {
-      try {
-        return (await options.ui.confirm(title, message)) === true;
-      } catch {
-        return false;
-      }
-    },
-    notify(message: string, type: "info" | "warning" | "error" = "info"): void {
-      try {
-        options.ui.notify(message, type);
-      } catch {
-        // A notice that cannot be shown does not change what was or was not saved.
-      }
-    },
-  };
+  const dialogs = createDialogs(options.ui);
+  const { report, pick, pickWithResult } = dialogs;
 
   // Without an interactive UI nothing can be asked, so the menu only prints the config and says why it stops (D-23).
   if (!options.hasUI) {
     dialogs.notify(renderConfig(readLayerFile(path), path), "info");
     dialogs.notify("Editing the config needs an interactive pi session; this is a read-only view of the file.", "warning");
     return;
-  }
-
-  /** The last result of an action, waiting for the title of the next menu; used up by a menu that is answered. */
-  let pendingResult: string | undefined;
-
-  /** Tell the user what happened: notify with the message as it is, and remember a bounded copy for the next menu title. */
-  function report(message: string, type: "info" | "warning" | "error" = "info"): void {
-    dialogs.notify(message, type);
-    pendingResult = carriedCopy(message);
-  }
-
-  /** The title with the last result above it, once; the result is cleared. Without a result the title is unchanged. */
-  function titled(title: string): string {
-    if (pendingResult === undefined) return title;
-    const carried = pendingResult;
-    pendingResult = undefined;
-    return `Last result: ${carried}\n\n${title}`;
-  }
-
-  /** The index of the chosen option, or undefined for a dismissal or an answer that is not one of the options. */
-  async function pick(title: string, choices: string[]): Promise<number | undefined> {
-    const answer = await dialogs.select(title, choices);
-    if (answer === undefined) return undefined;
-    const index = choices.indexOf(answer);
-    return index < 0 ? undefined : index;
-  }
-
-  /**
-   * `pick` with the pending result above the title. An answered menu uses the result up, so it is shown once per answered
-   * menu. A menu that answers nothing (dismissed, or a dialog that threw: `dialogs.select` cannot tell the two apart) may
-   * never have been seen, so the result is put back for the next menu, unless `report` stored a newer one meanwhile (WR-03).
-   */
-  async function pickWithResult(title: string, choices: string[]): Promise<number | undefined> {
-    const carried = pendingResult;
-    const chosen = await pick(titled(title), choices);
-    if (chosen === undefined && pendingResult === undefined) pendingResult = carried;
-    return chosen;
   }
 
   /** The file as data for showing current values; a file that cannot be used shows nothing, and the write reports it. */
