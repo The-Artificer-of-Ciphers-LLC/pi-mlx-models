@@ -2,7 +2,7 @@ import { writeFileAtomic } from "./atomicfile.js";
 import { isLoopbackHost } from "./config.js";
 import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 import { MODEL_PRESETS } from "./presets.js";
-import { CONTROL_CHARACTER, type LayerFile, MAX_FILE_BYTES, MAX_TEXT_LENGTH, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
+import { CONTROL_CHARACTER, DEFAULT_PROFILE_KEY, type LayerFile, MAX_FILE_BYTES, MAX_TEXT_LENGTH, MODELS_KEY, PROFILES_KEY, PROFILE_NAME, PROFILE_NAME_SHORT_RULE, SETTINGS, type SettingDef, formatConfigErrors, prepareSettings, readLayerFile } from "./settings.js";
 
 /**
  * The pure editing core of /mlx-config (CMD-02, D-17, D-20). An edit reads the global config fresh, changes one key in a
@@ -196,9 +196,9 @@ export function editableKeys(scope: ConfigScope): EditableKey[] {
 export function segmentsFor(scope: ConfigScope, row: SettingDef, target: { model?: string; profile?: string } = {}): string[] {
   if (scope === "global" || scope === "modelBlock") return row.path.split(".");
   if (target.model === undefined) throw new Error("segmentsFor needs a model key for this scope");
-  if (scope === "modelEntry") return ["models", target.model, ...belowModel(row)];
+  if (scope === "modelEntry") return [MODELS_KEY, target.model, ...belowModel(row)];
   if (target.profile === undefined) throw new Error("segmentsFor needs a profile name for this scope");
-  return ["models", target.model, "profiles", target.profile, ...belowModel(row)];
+  return [MODELS_KEY, target.model, PROFILES_KEY, target.profile, ...belowModel(row)];
 }
 
 /** Plain decimal or exponent syntax: no hex, no `Infinity`, and no empty text, which `Number()` would read as 0. */
@@ -359,12 +359,40 @@ function sortedKeys(value: unknown): string[] {
 
 /** The model keys under `models`, sorted. */
 export function modelKeys(tree: ConfigTree): string[] {
-  return sortedKeys(getAt(tree, ["models"]));
+  return sortedKeys(getAt(tree, [MODELS_KEY]));
 }
 
 /** The profile names of one model entry, sorted. */
 export function profileNames(tree: ConfigTree, model: string): string[] {
-  return sortedKeys(getAt(tree, ["models", model, "profiles"]));
+  return sortedKeys(getAt(tree, [MODELS_KEY, model, PROFILES_KEY]));
+}
+
+/** The default profile a model entry names, or undefined when it names none or something that is not a name. */
+export function defaultProfileOf(tree: ConfigTree, model: string): string | undefined {
+  const chosen = getAt(tree, [MODELS_KEY, model, DEFAULT_PROFILE_KEY]);
+  return typeof chosen === "string" ? chosen : undefined;
+}
+
+/** A copy of `tree` with an empty profile, and the model entry that holds it when there is none. An existing profile is replaced. */
+export function createProfile(tree: ConfigTree, model: string, profile: string): ConfigTree {
+  return setAt(tree, [MODELS_KEY, model, PROFILES_KEY, profile], {});
+}
+
+/** A copy of `tree` without the profile; a default profile that named it is cleared in the same change. */
+export function deleteProfile(tree: ConfigTree, model: string, profile: string): ConfigTree {
+  const without = unsetAt(tree, [MODELS_KEY, model, PROFILES_KEY, profile]);
+  return defaultProfileOf(without, model) === profile ? unsetAt(without, [MODELS_KEY, model, DEFAULT_PROFILE_KEY]) : without;
+}
+
+/** A copy of `tree` whose model entry names `profile` as its default, or none when `profile` is undefined. */
+export function setDefaultProfile(tree: ConfigTree, model: string, profile: string | undefined): ConfigTree {
+  const path = [MODELS_KEY, model, DEFAULT_PROFILE_KEY];
+  return profile === undefined ? unsetAt(tree, path) : setAt(tree, path, profile);
+}
+
+/** A copy of `tree` without one model entry. */
+export function deleteModelEntry(tree: ConfigTree, model: string): ConfigTree {
+  return unsetAt(tree, [MODELS_KEY, model]);
 }
 
 /** What deleting one model entry takes with it: the profile names, the option keys and the default profile, for the confirm text. */
@@ -377,13 +405,12 @@ export interface ModelEntrySummary {
 }
 
 export function modelEntrySummary(tree: ConfigTree, model: string): ModelEntrySummary {
-  const entry = getAt(tree, ["models", model]);
+  const entry = getAt(tree, [MODELS_KEY, model]);
   if (!isObject(entry)) return { profiles: [], options: [], defaultProfile: undefined, notAnObject: entry !== undefined };
-  const chosen = getAt(tree, ["models", model, "defaultProfile"]);
   return {
     profiles: profileNames(tree, model),
-    options: sortedKeys(entry).filter((key) => key !== "profiles" && key !== "defaultProfile"),
-    defaultProfile: typeof chosen === "string" ? chosen : undefined,
+    options: sortedKeys(entry).filter((key) => key !== PROFILES_KEY && key !== DEFAULT_PROFILE_KEY),
+    defaultProfile: defaultProfileOf(tree, model),
     notAnObject: false,
   };
 }
@@ -465,7 +492,7 @@ export function renderConfig(file: LayerFile, path: string): string {
     lines.push(`Models (${keys.length})`);
     for (const key of keys.slice(0, MAX_VIEW_LINES)) {
       const profiles = profileNames(file.data, key).map(viewText);
-      const defaultProfile = getAt(file.data, ["models", key, "defaultProfile"]);
+      const defaultProfile = getAt(file.data, [MODELS_KEY, key, DEFAULT_PROFILE_KEY]);
       const parts = [
         defaultProfile === undefined ? undefined : `defaultProfile ${viewValue(defaultProfile)}`,
         profiles.length === 0 ? undefined : `profiles: ${profiles.join(", ")}`,

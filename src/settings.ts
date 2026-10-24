@@ -942,7 +942,7 @@ export function initFlagSpecs(): CliFlagSpec[] {
 
 const ROWS_BY_PATH = new Map(SETTINGS.map((row) => [row.path, row]));
 /** The top-level key whose entries override the model block for one preset key or model id (D-21). */
-const MODELS_KEY = "models";
+export const MODELS_KEY = "models";
 /** The block the entries of `models` are written in: an entry holds the keys of the `model` block. */
 const MODEL_BLOCK = "model";
 /** The block of the install rows: which mlx-lm /mlx-init installs and where from (D-04). */
@@ -958,9 +958,9 @@ const SAMPLING_ROWS: ReadonlyMap<string, SettingDef> = new Map(
 /** The keys valid inside the sampling object, for the "did you mean" of a mistyped one. */
 const SAMPLING_CANDIDATES: readonly Candidate[] = [...SAMPLING_ROWS.keys()].map((name) => ({ path: name, name }));
 /** The key of a `models` entry that holds its named profiles (D-01). */
-const PROFILES_KEY = "profiles";
+export const PROFILES_KEY = "profiles";
 /** The key of a `models` entry that names the profile used when `/mlx-start` gives none (D-02). */
-const DEFAULT_PROFILE_KEY = "defaultProfile";
+export const DEFAULT_PROFILE_KEY = "defaultProfile";
 /** The key of the `limits` object inside a profile (D-10) and the path prefix of its four rows. */
 const LIMITS_KEY = "limits";
 const LIMITS_PREFIX = `${MODEL_BLOCK}.${LIMITS_KEY}.`;

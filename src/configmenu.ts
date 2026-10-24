@@ -5,6 +5,10 @@ import {
   type Segments,
   confirmationFor,
   convertInput,
+  createProfile,
+  defaultProfileOf,
+  deleteModelEntry,
+  deleteProfile,
   editConfig,
   editableKeys,
   getAt,
@@ -15,6 +19,7 @@ import {
   renderConfig,
   segmentsFor,
   setAt,
+  setDefaultProfile,
   unsetAt,
   validateModelKey,
   validateProfileName,
@@ -385,9 +390,8 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   }
 
   /** Delete a profile after a confirmation; a default profile that named it is cleared in the same write. */
-  async function deleteProfile(model: string, profile: string): Promise<Flow> {
-    const defaultPath = ["models", model, "defaultProfile"];
-    const clears = getAt(currentTree(), defaultPath) === profile;
+  async function deleteProfileFlow(model: string, profile: string): Promise<Flow> {
+    const clears = defaultProfileOf(currentTree(), model) === profile;
     const name = `profile ${shown(profile)} of model entry ${entryPlace(model)}`;
     const confirmed = await dialogs.confirm(
       `Delete ${name}?`,
@@ -399,10 +403,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     }
     return flowOf(
       write(
-        (draft) => {
-          const without = unsetAt(draft, ["models", model, "profiles", profile]);
-          return getAt(without, defaultPath) === profile ? unsetAt(without, defaultPath) : without;
-        },
+        (draft) => deleteProfile(draft, model, profile),
         `Deleted ${name}.${clears ? " It was the default profile, so defaultProfile was cleared too." : ""}`,
         `${name} was not in the file.`,
       ),
@@ -432,7 +433,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
         report(`Profile ${shown(profile)}${ofModel(model)} already exists; its keys are edited and nothing is replaced.`, "info");
       } else {
         const created = write(
-          (draft) => setAt(draft, ["models", model, "profiles", profile], {}),
+          (draft) => createProfile(draft, model, profile),
           `Created profile ${shown(profile)}${ofModel(model)}.`,
           `profile ${shown(profile)}${ofModel(model)} already exists.`,
           // The empty profile is written before the action menu opens, so Back leaves it in the file.
@@ -448,7 +449,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     if (actions[action] === PROFILE_ACTION.edit) {
       return editKey("profile", { model, profile }, `Keys of profile ${shown(profile)}${ofModel(model)}`, ofProfile(model, profile));
     }
-    if (actions[action] === PROFILE_ACTION.delete) return deleteProfile(model, profile);
+    if (actions[action] === PROFILE_ACTION.delete) return deleteProfileFlow(model, profile);
     return "menu";
   }
 
@@ -467,20 +468,19 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
       report(`Model ${shown(model)} has no profiles: add a profile first.`, "info");
       return "menu";
     }
-    const current = getAt(tree, ["models", model, "defaultProfile"]);
+    const current = defaultProfileOf(tree, model);
     const lines = numbered(names).map((line, index) => (names[index] === current ? `${line} (current default)` : line));
     const chosen = await pick(`Default profile${ofModel(model)}`, [...lines, NO_DEFAULT]);
     if (chosen === undefined) return "menu";
-    const defaultPath = ["models", model, "defaultProfile"];
     if (chosen >= names.length) {
       return flowOf(
-        write((draft) => unsetAt(draft, defaultPath), `Saved: the default profile${ofModel(model)} was removed.`, `model ${shown(model)} has no default profile.`),
+        write((draft) => setDefaultProfile(draft, model, undefined),`Saved: the default profile${ofModel(model)} was removed.`, `model ${shown(model)} has no default profile.`),
       );
     }
     const name = names[chosen];
     return flowOf(
       write(
-        (draft) => setAt(draft, defaultPath, name),
+        (draft) => setDefaultProfile(draft, model, name),
         `Saved: the default profile${ofModel(model)} is now ${shown(name)}.`,
         `the default profile${ofModel(model)} is already ${shown(name)}.`,
       ),
@@ -525,7 +525,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
       report(`Nothing was deleted: ${name} was not confirmed.`, "info");
       return "menu";
     }
-    return flowOf(write((draft) => unsetAt(draft, ["models", model]), `Deleted ${name}.`, `${name} was not in the file.`));
+    return flowOf(write((draft) => deleteModelEntry(draft, model), `Deleted ${name}.`, `${name} was not in the file.`));
   }
 
   for (let round = 0; round < MAX_MENU_ROUNDS; round += 1) {

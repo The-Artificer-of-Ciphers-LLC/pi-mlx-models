@@ -260,10 +260,10 @@ test("createProfile: adds an empty profile and leaves the input, the other keys 
   const before = JSON.stringify(tree);
   const made = createProfile(tree, "org/a", "new");
   assert.equal(JSON.stringify(tree), before);
-  assert.deepEqual(getAt(made, ["models", "org/a", "profiles", "new"]), {});
+  assert.deepEqual(plain(getAt(made, ["models", "org/a", "profiles", "new"])), {});
   assert.deepEqual(profileNames(made, "org/a"), ["fast", "new", "slow"]);
-  assert.deepEqual(getAt(made, ["models", "org/a", "profiles", "fast"]), { sampling: { temperature: 0.2 } });
-  assert.deepEqual(getAt(createProfile(tree, "org/new", "p"), ["models", "org/new", "profiles", "p"]), {});
+  assert.deepEqual(plain(getAt(made, ["models", "org/a", "profiles", "fast"])), { sampling: { temperature: 0.2 } });
+  assert.deepEqual(plain(getAt(createProfile(tree, "org/new", "p"), ["models", "org/new", "profiles", "p"])), {});
 });
 
 test("deleteProfile: removes the profile, and clears defaultProfile only when it named that profile", () => {
