@@ -122,6 +122,7 @@ Every setting is in the [configuration reference](https://github.com/The-Artific
 
 - [Commands](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/commands.md), including the presets
 - [Configuration](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/configuration.md): files, settings, flags, environment variables and precedence
+- [Glossary](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/GLOSSARY.md): the terms used for settings, model entries and profiles
 
 **Explanation**
 
