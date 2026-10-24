@@ -77,6 +77,157 @@ test("configmenu sets a general setting: the key is written, the notice names it
   s.assertScriptsUsed();
 });
 
+/** The select dialogs a session showed, as their titles without the carried "Last result" lines; a key's action menu is "<key action>". */
+const selectTitles = (s: { prompts: Array<{ kind: string; title: string }> }): string[] =>
+  s.prompts
+    .filter((prompt) => prompt.kind === "select")
+    .map((prompt) => prompt.title.split("\n\n").pop() ?? "")
+    .map((title) => (title.includes("Current value:") ? "<key action>" : title));
+
+const TWO_ENTRIES = {
+  models: {
+    "org/a": { defaultProfile: "fast", profiles: { fast: {}, slow: {} } },
+    "org/b": { profiles: { fast: {} } },
+  },
+};
+
+test("configmenu stays on the key list after a save: the list shows the new value, the result is above its title, and Esc then goes up one level", async (t) => {
+  const s = session(t, { file: {}, select: [MENU.general, "server.port", ACTION.set, undefined, MENU.done], input: ["8081"] });
+  await s.run();
+  assert.deepEqual(s.json(), { server: { port: 8081 } });
+  assert.deepEqual(selectTitles(s), [MENU_TITLE, MENU.general, "<key action>", MENU.general, MENU_TITLE]);
+  const selects = s.prompts.filter((prompt) => prompt.kind === "select");
+  assert.match(selects[3].title, /^Last result: Saved server\.port\./);
+  assert.ok(selects[3].options?.includes("server.port = 8081"), JSON.stringify(selects[3].options));
+  assert.equal(selects[4].title, MENU_TITLE);
+  s.assertScriptsUsed();
+});
+
+test("configmenu stays on the key list after a refused or declined edit, and after Back from a key's action menu", async (t) => {
+  const refused = session(t, { file: {}, select: [MENU.general, "server.port", ACTION.set, undefined, MENU.done], input: ["70000"] });
+  await refused.run();
+  assert.deepEqual(selectTitles(refused), [MENU_TITLE, MENU.general, "<key action>", MENU.general, MENU_TITLE]);
+  refused.assertScriptsUsed();
+
+  const declined = session(t, { file: {}, confirm: false, select: [MENU.general, "autoStart", "true", undefined, MENU.done] });
+  await declined.run();
+  assert.deepEqual(selectTitles(declined), [MENU_TITLE, MENU.general, "<key action>", MENU.general, MENU_TITLE]);
+  declined.assertScriptsUsed();
+
+  const back = session(t, { file: {}, select: [MENU.general, "server.port", ACTION.back, undefined, MENU.done] });
+  await back.run();
+  assert.deepEqual(selectTitles(back), [MENU_TITLE, MENU.general, "<key action>", MENU.general, MENU_TITLE]);
+  back.assertScriptsUsed();
+});
+
+test("configmenu walks back one level per Esc from the keys of a profile, and a save keeps the profile's key list on screen", async (t) => {
+  const s = session(t, {
+    file: { models: { "org/a": { profiles: { fast: {} } } } },
+    select: [MENU.profiles, "1. org/a", "1. fast", PROFILE_ACTION.edit, "sampling.temperature", ACTION.set, undefined, undefined, undefined, undefined, MENU.done],
+    input: ["0.3"],
+  });
+  await s.run();
+  assert.deepEqual(s.json(), { models: { "org/a": { profiles: { fast: { sampling: { temperature: 0.3 } } } } } });
+  const keys = "Keys of profile fast of model org/a";
+  assert.deepEqual(selectTitles(s), [
+    MENU_TITLE,
+    "Choose the model whose profile to add, edit or delete",
+    "Profiles of model org/a",
+    "Profile fast of model org/a",
+    keys,
+    "<key action>",
+    keys,
+    "Profile fast of model org/a",
+    "Profiles of model org/a",
+    "Choose the model whose profile to add, edit or delete",
+    MENU_TITLE,
+  ]);
+  s.assertScriptsUsed();
+});
+
+test("configmenu edits the options of one model in place: choose the model once, edit several keys, Esc goes back to the model list", async (t) => {
+  const s = session(t, {
+    file: { models: { "org/a": {} } },
+    select: [MENU.modelEntry, "1. org/a", "adapterPath", ACTION.set, "draftModel", ACTION.set, undefined, undefined, MENU.done],
+    input: ["/adapters/x", "org/draft"],
+  });
+  await s.run();
+  assert.deepEqual(s.json(), { models: { "org/a": { adapterPath: "/adapters/x", draftModel: "org/draft" } } });
+  const keys = "Options of model org/a";
+  assert.deepEqual(selectTitles(s), [MENU_TITLE, "Choose the model whose options to edit", keys, "<key action>", keys, "<key action>", keys, "Choose the model whose options to edit", MENU_TITLE]);
+  s.assertScriptsUsed();
+});
+
+test("configmenu goes to the profile list after a profile is deleted, and stays on the profile's menu when the delete is declined", async (t) => {
+  const deleted = session(t, { file: TWO_ENTRIES, confirm: true, select: [MENU.profiles, "1. org/a", "1. fast", PROFILE_ACTION.delete, undefined, undefined, MENU.done] });
+  await deleted.run();
+  assert.deepEqual(profilesOf(deleted.json(), "org/a"), ["slow"]);
+  assert.deepEqual(selectTitles(deleted), [
+    MENU_TITLE,
+    "Choose the model whose profile to add, edit or delete",
+    "Profiles of model org/a",
+    "Profile fast of model org/a",
+    "Profiles of model org/a",
+    "Choose the model whose profile to add, edit or delete",
+    MENU_TITLE,
+  ]);
+  deleted.assertScriptsUsed();
+
+  const declined = session(t, { file: TWO_ENTRIES, confirm: false, select: [MENU.profiles, "1. org/a", "1. fast", PROFILE_ACTION.delete, undefined, undefined, undefined, MENU.done] });
+  await declined.run();
+  assert.deepEqual(profilesOf(declined.json(), "org/a"), ["fast", "slow"]);
+  assert.deepEqual(selectTitles(declined), [
+    MENU_TITLE,
+    "Choose the model whose profile to add, edit or delete",
+    "Profiles of model org/a",
+    "Profile fast of model org/a",
+    "Profile fast of model org/a",
+    "Profiles of model org/a",
+    "Choose the model whose profile to add, edit or delete",
+    MENU_TITLE,
+  ]);
+  declined.assertScriptsUsed();
+});
+
+test("configmenu returns to the model list after the default profile is set, so another model can follow", async (t) => {
+  const s = session(t, { file: TWO_ENTRIES, select: [MENU.defaultProfile, "1. org/a", "slow", "2. org/b", "fast", undefined, MENU.done] });
+  await s.run();
+  const tree = s.json() as { models: Record<string, { defaultProfile?: string }> };
+  assert.equal(tree.models["org/a"].defaultProfile, "slow");
+  assert.equal(tree.models["org/b"].defaultProfile, "fast");
+  const chooser = "Choose the model whose default profile to set";
+  assert.deepEqual(selectTitles(s), [MENU_TITLE, chooser, "Default profile of model org/a", chooser, "Default profile of model org/b", chooser, MENU_TITLE]);
+  s.assertScriptsUsed();
+});
+
+test("configmenu returns to the entry list after an entry is deleted, to the top menu when none is left, and to the list when the delete is declined", async (t) => {
+  const chooser = "Choose the model entry to delete";
+  const two = session(t, { file: TWO_ENTRIES, confirm: true, select: [MENU.deleteEntry, "1. org/a", undefined, MENU.done] });
+  await two.run();
+  assert.deepEqual(Object.keys((two.json() as { models: object }).models), ["org/b"]);
+  assert.deepEqual(selectTitles(two), [MENU_TITLE, chooser, chooser, MENU_TITLE]);
+  two.assertScriptsUsed();
+
+  const last = session(t, { file: { models: { "org/a": {} } }, confirm: true, select: [MENU.deleteEntry, "1. org/a", MENU.done] });
+  await last.run();
+  assert.deepEqual(last.json(), { models: {} });
+  assert.deepEqual(selectTitles(last), [MENU_TITLE, chooser, MENU_TITLE]);
+  assert.ok(last.notes.some((note) => note.message.startsWith("Deleted model entry")), JSON.stringify(last.notes));
+  last.assertScriptsUsed();
+
+  const declined = session(t, { file: TWO_ENTRIES, confirm: false, select: [MENU.deleteEntry, "1. org/a", undefined, MENU.done] });
+  await declined.run();
+  assert.deepEqual(Object.keys((declined.json() as { models: object }).models), ["org/a", "org/b"]);
+  assert.deepEqual(selectTitles(declined), [MENU_TITLE, chooser, chooser, MENU_TITLE]);
+  declined.assertScriptsUsed();
+});
+
+/** The profile names of one model entry in a parsed config. */
+function profilesOf(tree: unknown, model: string): string[] {
+  const entry = (tree as { models: Record<string, { profiles?: object }> }).models[model];
+  return Object.keys(entry.profiles ?? {}).sort();
+}
+
 test("configmenu points to /mlx-restart only when a server of this session is running, and never restarts anything", async (t) => {
   const running = session(t, { file: {}, serverRunning: true, select: [MENU.general, "server.port", ACTION.set, MENU.done], input: ["8082"] });
   await running.run();
