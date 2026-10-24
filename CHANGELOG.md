@@ -4,6 +4,10 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 ## Unreleased
 
+### Added
+
+- **Glossary.** [GLOSSARY.md](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/GLOSSARY.md) defines the global file, project file, model block, preset, model key, model entry, profile and default profile.
+
 ## 0.3.0 - 2026-10-18
 
 ### Added

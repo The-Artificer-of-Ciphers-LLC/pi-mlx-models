@@ -1,6 +1,6 @@
 # How to edit the configuration from inside pi
 
-Change the global config file with the `/mlx-config` menu instead of editing JSON by hand. It writes `<agent dir>/pi-mlx-models/config.json` only; project files stay hand-edited. The menu entries are listed in the [commands reference](../reference/commands.md#mlx-config) and the settings in the [configuration reference](../reference/configuration.md#settings).
+Change the global config file with the `/mlx-config` menu instead of editing JSON by hand. It writes `<agent dir>/pi-mlx-models/config.json` only; project files stay hand-edited. The menu entries are listed in the [commands reference](../reference/commands.md#mlx-config) and the settings in the [configuration reference](../reference/configuration.md#settings). Words such as model entry and profile are defined in the [glossary](../../GLOSSARY.md).
 
 ## Open the menu
 
