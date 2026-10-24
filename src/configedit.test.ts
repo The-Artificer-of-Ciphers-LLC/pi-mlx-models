@@ -8,6 +8,10 @@ import {
   type ConfigTree,
   confirmationFor,
   convertInput,
+  createProfile,
+  defaultProfileOf,
+  deleteModelEntry,
+  deleteProfile,
   editConfig,
   editableKeys,
   getAt,
@@ -18,6 +22,7 @@ import {
   renderConfig,
   segmentsFor,
   setAt,
+  setDefaultProfile,
   unsetAt,
   validateModelKey,
   validateProfileName,
@@ -239,6 +244,54 @@ test("segmentsFor: where each scope writes a row", () => {
   assert.deepEqual(segmentsFor("global", rowOf("autoStart")), ["autoStart"]);
   assert.deepEqual(segmentsFor("modelEntry", rowOf("model.adapterPath"), target), ["models", "org/model", "adapterPath"]);
   assert.deepEqual(segmentsFor("modelBlock", rowOf("model.adapterPath")), ["model", "adapterPath"]);
+});
+
+/** A tree with one model entry that holds options, two profiles and a default profile. */
+const entryTree = (): ConfigTree => ({
+  server: { port: 8080 },
+  models: {
+    "org/a": { adapterPath: "/x", defaultProfile: "fast", profiles: { fast: { sampling: { temperature: 0.2 } }, slow: {} } },
+    "org/b": { profiles: { fast: {} } },
+  },
+});
+
+test("createProfile: adds an empty profile and leaves the input, the other keys and an existing profile alone", () => {
+  const tree = entryTree();
+  const before = JSON.stringify(tree);
+  const made = createProfile(tree, "org/a", "new");
+  assert.equal(JSON.stringify(tree), before);
+  assert.deepEqual(getAt(made, ["models", "org/a", "profiles", "new"]), {});
+  assert.deepEqual(profileNames(made, "org/a"), ["fast", "new", "slow"]);
+  assert.deepEqual(getAt(made, ["models", "org/a", "profiles", "fast"]), { sampling: { temperature: 0.2 } });
+  assert.deepEqual(getAt(createProfile(tree, "org/new", "p"), ["models", "org/new", "profiles", "p"]), {});
+});
+
+test("deleteProfile: removes the profile, and clears defaultProfile only when it named that profile", () => {
+  const tree = entryTree();
+  const gone = deleteProfile(tree, "org/a", "fast");
+  assert.deepEqual(profileNames(gone, "org/a"), ["slow"]);
+  assert.equal(defaultProfileOf(gone, "org/a"), undefined);
+  assert.equal(getAt(gone, ["models", "org/a", "adapterPath"]), "/x");
+  const other = deleteProfile(tree, "org/a", "slow");
+  assert.deepEqual(profileNames(other, "org/a"), ["fast"]);
+  assert.equal(defaultProfileOf(other, "org/a"), "fast");
+  assert.deepEqual(profileNames(gone, "org/b"), ["fast"]);
+  assert.equal(JSON.stringify(deleteProfile(tree, "org/a", "missing")), JSON.stringify(tree));
+});
+
+test("setDefaultProfile: sets the name, or clears it with undefined", () => {
+  const tree = entryTree();
+  assert.equal(defaultProfileOf(setDefaultProfile(tree, "org/a", "slow"), "org/a"), "slow");
+  assert.equal(defaultProfileOf(setDefaultProfile(tree, "org/a", undefined), "org/a"), undefined);
+  assert.equal(defaultProfileOf(tree, "org/b"), undefined);
+});
+
+test("deleteModelEntry: removes one entry and nothing else", () => {
+  const tree = entryTree();
+  const gone = deleteModelEntry(tree, "org/a");
+  assert.deepEqual(modelKeys(gone), ["org/b"]);
+  assert.deepEqual(getAt(gone, ["server", "port"]), 8080);
+  assert.deepEqual(modelKeys(tree), ["org/a", "org/b"]);
 });
 
 /** The converted value of a text the row accepts. */
