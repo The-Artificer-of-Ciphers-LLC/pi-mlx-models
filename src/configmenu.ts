@@ -101,20 +101,40 @@ function shownValue(value: unknown): string {
   }
 }
 
-/** The result of one flow: go back to the top menu, or end the menu (the file cannot be used). */
-type Flow = "menu" | "end";
+/**
+ * What a screen says when it is done: show it again (`stay`), go up one level (`up`), or end the menu because the file cannot
+ * be used (`end`). Esc and Back mean `up`; an action that was saved, refused or declined means `stay`, so the user is still
+ * where they were.
+ */
+type Step = "stay" | "up" | "end";
 
 /** What a write came to: it changed the file, it changed nothing, it was refused, or the file cannot be used. */
 type Written = "saved" | "unchanged" | "refused" | "end";
 
-/** A write whose outcome ends the flow: only a file that cannot be used ends the whole menu. */
-const flowOf = (written: Written): Flow => (written === "end" ? "end" : "menu");
+/** The step after a write: the user stays where they were; only a file that cannot be used ends the whole menu. */
+const stepOf = (written: Written): Step => (written === "end" ? "end" : "stay");
+
+/** What a parent screen does once a screen below it has gone up: show itself again, or end the menu with it. */
+const below = (exit: "up" | "end"): Step => (exit === "end" ? "end" : "stay");
 
 export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   const { path } = options;
 
   const dialogs = createDialogs(options.ui);
   const { report, pick, pickWithResult } = dialogs;
+
+  /** The screens shown so far; the whole menu shows at most MAX_MENU_ROUNDS, so a UI that always gives the same answer ends it. */
+  let screensShown = 0;
+
+  /** Show a screen again for as long as it says `stay`; `up` and `end` are passed on to the screen above. */
+  async function until(screen: () => Promise<Step>): Promise<"up" | "end"> {
+    for (;;) {
+      if (screensShown >= MAX_MENU_ROUNDS) return "end";
+      screensShown += 1;
+      const step = await screen();
+      if (step !== "stay") return step;
+    }
+  }
 
   // Without an interactive UI nothing can be asked, so the menu only prints the config and says why it stops (D-23).
   if (!options.hasUI) {
@@ -149,13 +169,16 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     return "saved";
   }
 
-  /** Choose one key of a scope, then set it, change it or remove it. `suffix` says whose key it is, for notices. */
-  async function editKey(scope: ConfigScope, target: { model?: string; profile?: string }, title: string, suffix: string): Promise<Flow> {
+  /**
+   * The keys of a scope with their values: choose one, then set it, change it or remove it. The list is shown again after
+   * every outcome, so several keys can be changed in a row; Esc goes up. `suffix` says whose key it is, for notices.
+   */
+  async function keyListScreen(scope: ConfigScope, target: { model?: string; profile?: string }, title: string, suffix: string): Promise<Step> {
     const keys = editableKeys(scope);
     const tree = currentTree();
     const lines = keys.map((key) => `${key.label} = ${shownValue(getAt(tree, segmentsFor(scope, key.row, target)))}`);
-    const chosen = await pick(title, lines);
-    if (chosen === undefined) return "menu";
+    const chosen = await pickWithResult(title, lines);
+    if (chosen === undefined) return "up";
     const key = keys[chosen];
     const segments: Segments = segmentsFor(scope, key.row, target);
     const current = getAt(tree, segments);
@@ -167,22 +190,22 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     if (key.row.kind === "bool") {
       const answers = ["true", "false", ...(isSet ? [ACTION.remove] : []), ACTION.back];
       const answer = await pick(heading, answers);
-      if (answer === undefined || answers[answer] === ACTION.back) return "menu";
+      if (answer === undefined || answers[answer] === ACTION.back) return "stay";
       if (answers[answer] === ACTION.remove) remove = true;
       else value = answers[answer] === "true";
     } else {
       const answers: string[] = [ACTION.set, ...(isSet ? [ACTION.remove] : []), ACTION.back];
       const answer = await pick(heading, answers);
-      if (answer === undefined || answers[answer] === ACTION.back) return "menu";
+      if (answer === undefined || answers[answer] === ACTION.back) return "stay";
       if (answers[answer] === ACTION.remove) {
         remove = true;
       } else {
         const typed = await dialogs.input(heading, isSet ? shownValue(current) : undefined);
-        if (typed === undefined) return "menu";
+        if (typed === undefined) return "stay";
         const converted = convertInput(key.row, typed);
         if (!converted.ok) {
           report(`Not saved: ${converted.message}.`, "error");
-          return "menu";
+          return "stay";
         }
         value = converted.value;
       }
@@ -193,10 +216,10 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
       const needed = confirmationFor(key.row, value);
       if (needed !== undefined && !(await dialogs.confirm(needed.title, needed.message))) {
         report(`Nothing was saved: ${name} was not confirmed.`, "info");
-        return "menu";
+        return "stay";
       }
     }
-    return flowOf(
+    return stepOf(
       write(
         (draft) => (remove ? unsetAt(draft, segments) : setAt(draft, segments, value)),
         remove ? `Saved: ${name} was removed from the file.` : `Saved ${name}.`,
@@ -208,19 +231,22 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   /** One menu line per name, numbered so two names that look alike once cleaned stay different lines. */
   const numbered = (names: string[]): string[] => names.map((name, index) => `${index + 1}. ${shown(name)}`);
 
-  /** Choose a model key of the file by position, or with `allowNew` type a new one. Undefined when dismissed or refused. */
-  async function chooseModel(title: string, allowNew: boolean): Promise<string | undefined> {
+  /**
+   * The model list: choose a model key of the file by position, or with `allowNew` type a new one. Esc on the list is `up`;
+   * a typed key that is dismissed, refused or not confirmed leaves the user on the list (`stay`).
+   */
+  async function chooseModel(title: string, allowNew: boolean): Promise<{ model: string } | { step: Step }> {
     const keys = modelKeys(currentTree());
-    const chosen = await pick(title, [...numbered(keys), ...(allowNew ? [NEW_ENTRY] : [])]);
-    if (chosen === undefined) return undefined;
-    if (chosen < keys.length) return keys[chosen];
+    const chosen = await pickWithResult(title, [...numbered(keys), ...(allowNew ? [NEW_ENTRY] : [])]);
+    if (chosen === undefined) return { step: "up" };
+    if (chosen < keys.length) return { model: keys[chosen] };
     const presets = MODEL_PRESETS.map((preset) => preset.key).join(", ");
     const typed = await dialogs.input(`Model key: a preset key (${presets}) or a Hugging Face model id such as org/name`, "qwen3_4b");
-    if (typed === undefined) return undefined;
+    if (typed === undefined) return { step: "stay" };
     const checked = validateModelKey(typed);
     if (!checked.ok) {
       report(`Not added: ${checked.message}.`, "error");
-      return undefined;
+      return { step: "stay" };
     }
     // Only a key that would create a new entry is asked about: a key already in the file adds nothing.
     if (!keys.includes(checked.value) && !isPlausibleModelKey(checked.value)) {
@@ -233,10 +259,10 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
       );
       if (!confirmed) {
         report(`Nothing was added: the model key ${shown(checked.value)} was not confirmed.`, "info");
-        return undefined;
+        return { step: "stay" };
       }
     }
-    return checked.value;
+    return { model: checked.value };
   }
 
   /**
@@ -267,14 +293,16 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     return index < 0 ? shown(model) : `${index + 1} of ${keys.length} (${shown(model)})`;
   }
 
-  async function modelEntryFlow(): Promise<Flow> {
-    const model = await chooseModel("Choose the model whose options to edit", true);
-    if (model === undefined) return "menu";
-    return editKey("modelEntry", { model }, `Options${ofModel(model)}`, ofModel(model));
+  /** The options of one model: pick the model, then edit its keys until Esc brings the user back to the model list. */
+  async function modelEntryScreen(): Promise<Step> {
+    const choice = await chooseModel("Choose the model whose options to edit", true);
+    if (!("model" in choice)) return choice.step;
+    const { model } = choice;
+    return below(await until(() => keyListScreen("modelEntry", { model }, `Options${ofModel(model)}`, ofModel(model))));
   }
 
   /** Delete a profile after a confirmation; a default profile that named it is cleared in the same write. */
-  async function deleteProfileFlow(model: string, profile: string): Promise<Flow> {
+  async function deleteProfileFlow(model: string, profile: string): Promise<Step> {
     const clears = defaultProfileOf(currentTree(), model) === profile;
     const name = `profile ${shown(profile)} of model entry ${entryPlace(model)}`;
     const confirmed = await dialogs.confirm(
@@ -283,34 +311,41 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     );
     if (!confirmed) {
       report(`Nothing was deleted: ${name} was not confirmed.`, "info");
-      return "menu";
+      return "stay";
     }
-    return flowOf(
-      write(
-        (draft) => deleteProfile(draft, model, profile),
-        `Deleted ${name}.${clears ? " It was the default profile, so defaultProfile was cleared too." : ""}`,
-        `${name} was not in the file.`,
-      ),
+    const written = write(
+      (draft) => deleteProfile(draft, model, profile),
+      `Deleted ${name}.${clears ? " It was the default profile, so defaultProfile was cleared too." : ""}`,
+      `${name} was not in the file.`,
     );
+    // The profile is gone either way, so its menu has nothing left to show: go up to the profile list. A refused write keeps it.
+    return written === "refused" ? "stay" : written === "end" ? "end" : "up";
   }
 
-  async function profilesFlow(): Promise<Flow> {
-    const model = await chooseModel("Choose the model whose profile to add, edit or delete", true);
-    if (model === undefined) return "menu";
+  /** The profiles of one model: pick the model, then work on its profiles until Esc brings the user back to the model list. */
+  async function profilesScreen(): Promise<Step> {
+    const choice = await chooseModel("Choose the model whose profile to add, edit or delete", true);
+    if (!("model" in choice)) return choice.step;
+    const { model } = choice;
+    return below(await until(() => profileListScreen(model)));
+  }
+
+  /** The profile list of one model: pick a profile or add one, then work on it until Esc brings the user back to the list. */
+  async function profileListScreen(model: string): Promise<Step> {
     const names = profileNames(currentTree(), model);
-    const chosen = await pick(`Profiles${ofModel(model)}`, [...numbered(names), NEW_PROFILE]);
-    if (chosen === undefined) return "menu";
+    const chosen = await pickWithResult(`Profiles${ofModel(model)}`, [...numbered(names), NEW_PROFILE]);
+    if (chosen === undefined) return "up";
 
     let profile: string;
     if (chosen < names.length) {
       profile = names[chosen];
     } else {
       const typed = await dialogs.input(`Name of the new profile${ofModel(model)} (letters, digits, dot, dash or underscore)`, "fast");
-      if (typed === undefined) return "menu";
+      if (typed === undefined) return "stay";
       const checked = validateProfileName(typed);
       if (!checked.ok) {
         report(`Not added: ${checked.message}.`, "error");
-        return "menu";
+        return "stay";
       }
       profile = checked.value;
       if (names.includes(profile)) {
@@ -323,46 +358,52 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
           // The empty profile is written before the action menu opens, so Back leaves it in the file.
           " The profile is already saved and stays in the file if you choose Back.",
         );
-        if (created !== "saved") return flowOf(created);
+        if (created !== "saved") return stepOf(created);
       }
     }
-
-    const actions: string[] = [PROFILE_ACTION.edit, PROFILE_ACTION.delete, PROFILE_ACTION.back];
-    const action = await pickWithResult(`Profile ${shown(profile)}${ofModel(model)}`, actions);
-    if (action === undefined) return "menu";
-    if (actions[action] === PROFILE_ACTION.edit) {
-      return editKey("profile", { model, profile }, `Keys of profile ${shown(profile)}${ofModel(model)}`, ofProfile(model, profile));
-    }
-    if (actions[action] === PROFILE_ACTION.delete) return deleteProfileFlow(model, profile);
-    return "menu";
+    return below(await until(() => profileScreen(model, profile)));
   }
 
-  async function defaultProfileFlow(): Promise<Flow> {
+  /** The menu of one profile: edit its keys, delete it, or go back to the profile list. */
+  async function profileScreen(model: string, profile: string): Promise<Step> {
+    const actions: string[] = [PROFILE_ACTION.edit, PROFILE_ACTION.delete, PROFILE_ACTION.back];
+    const action = await pickWithResult(`Profile ${shown(profile)}${ofModel(model)}`, actions);
+    if (action === undefined || actions[action] === PROFILE_ACTION.back) return "up";
+    if (actions[action] === PROFILE_ACTION.edit) {
+      const title = `Keys of profile ${shown(profile)}${ofModel(model)}`;
+      return below(await until(() => keyListScreen("profile", { model, profile }, title, ofProfile(model, profile))));
+    }
+    return deleteProfileFlow(model, profile);
+  }
+
+  /** The default profile: pick the model, then its profile. The model list is shown again after each, so another model can follow. */
+  async function defaultProfileScreen(): Promise<Step> {
     if (modelKeys(currentTree()).length === 0) {
       // A file that cannot be read has no models to list; say so the way a write would, and stop.
-      if (readLayerFile(path).state === "unusable") return flowOf(write((draft) => draft, "", ""));
+      if (readLayerFile(path).state === "unusable") return stepOf(write((draft) => draft, "", ""));
       report("The config file lists no models yet: add options or a profile for a model first.", "info");
-      return "menu";
+      return "up";
     }
-    const model = await chooseModel("Choose the model whose default profile to set", false);
-    if (model === undefined) return "menu";
+    const choice = await chooseModel("Choose the model whose default profile to set", false);
+    if (!("model" in choice)) return choice.step;
+    const { model } = choice;
     const tree = currentTree();
     const names = profileNames(tree, model);
     if (names.length === 0) {
       report(`Model ${shown(model)} has no profiles: add a profile first.`, "info");
-      return "menu";
+      return "stay";
     }
     const current = defaultProfileOf(tree, model);
     const lines = numbered(names).map((line, index) => (names[index] === current ? `${line} (current default)` : line));
     const chosen = await pick(`Default profile${ofModel(model)}`, [...lines, NO_DEFAULT]);
-    if (chosen === undefined) return "menu";
+    if (chosen === undefined) return "stay";
     if (chosen >= names.length) {
-      return flowOf(
-        write((draft) => setDefaultProfile(draft, model, undefined),`Saved: the default profile${ofModel(model)} was removed.`, `model ${shown(model)} has no default profile.`),
+      return stepOf(
+        write((draft) => setDefaultProfile(draft, model, undefined), `Saved: the default profile${ofModel(model)} was removed.`, `model ${shown(model)} has no default profile.`),
       );
     }
     const name = names[chosen];
-    return flowOf(
+    return stepOf(
       write(
         (draft) => setDefaultProfile(draft, model, name),
         `Saved: the default profile${ofModel(model)} is now ${shown(name)}.`,
@@ -391,57 +432,58 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
   }
 
   /** Delete a whole model entry after a confirmation that names what is lost; nothing else in the file is touched. */
-  async function deleteEntryFlow(): Promise<Flow> {
-    if (modelKeys(currentTree()).length === 0) {
-      // A file that cannot be read has no entries to list; say so the way a write would, and stop.
-      if (readLayerFile(path).state === "unusable") return flowOf(write((draft) => draft, "", ""));
-      report("The config file lists no model entries: there is nothing to delete.", "info");
-      return "menu";
-    }
-    const model = await chooseModel("Choose the model entry to delete", false);
-    if (model === undefined) return "menu";
-    const name = `model entry ${entryPlace(model)}`;
-    const confirmed = await dialogs.confirm(
-      `Delete ${name}?`,
-      `${lostByEntry(model)} Other model entries and settings are not touched. Yes deletes it. No or Esc cancels.`,
-    );
-    if (!confirmed) {
-      report(`Nothing was deleted: ${name} was not confirmed.`, "info");
-      return "menu";
-    }
-    return flowOf(write((draft) => deleteModelEntry(draft, model), `Deleted ${name}.`, `${name} was not in the file.`));
+  async function deleteEntryFlow(): Promise<"up" | "end"> {
+    let deleted = false;
+    return until(async () => {
+      if (modelKeys(currentTree()).length === 0) {
+        // The last entry was just deleted: the result is already on screen, so there is nothing more to say.
+        if (deleted) return "up";
+        // A file that cannot be read has no entries to list; say so the way a write would, and stop.
+        if (readLayerFile(path).state === "unusable") return stepOf(write((draft) => draft, "", ""));
+        report("The config file lists no model entries: there is nothing to delete.", "info");
+        return "up";
+      }
+      const choice = await chooseModel("Choose the model entry to delete", false);
+      if (!("model" in choice)) return choice.step;
+      const { model } = choice;
+      const name = `model entry ${entryPlace(model)}`;
+      const confirmed = await dialogs.confirm(
+        `Delete ${name}?`,
+        `${lostByEntry(model)} Other model entries and settings are not touched. Yes deletes it. No or Esc cancels.`,
+      );
+      if (!confirmed) {
+        report(`Nothing was deleted: ${name} was not confirmed.`, "info");
+        return "stay";
+      }
+      const written = write((draft) => deleteModelEntry(draft, model), `Deleted ${name}.`, `${name} was not in the file.`);
+      if (written === "saved" || written === "unchanged") deleted = true;
+      return stepOf(written);
+    });
   }
 
-  for (let round = 0; round < MAX_MENU_ROUNDS; round += 1) {
+  // The top menu is the first screen: Done or Esc leaves, and every other entry opens a screen that Esc comes back from.
+  await until(async () => {
     const entries = [MENU.view, MENU.general, MENU.modelBlock, MENU.modelEntry, MENU.profiles, MENU.defaultProfile, MENU.deleteEntry, MENU.done];
     const chosen = await pickWithResult(MENU_TITLE, entries);
-    if (chosen === undefined || entries[chosen] === MENU.done) return;
-    let flow: Flow = "menu";
+    if (chosen === undefined || entries[chosen] === MENU.done) return "up";
     switch (entries[chosen]) {
       case MENU.view:
         dialogs.notify(renderConfig(readLayerFile(path), path), "info");
-        break;
+        return "stay";
       case MENU.general:
-        flow = await editKey("global", {}, MENU.general, "");
-        break;
+        return below(await until(() => keyListScreen("global", {}, MENU.general, "")));
       case MENU.modelBlock:
-        flow = await editKey("modelBlock", {}, MENU.modelBlock, "");
-        break;
+        return below(await until(() => keyListScreen("modelBlock", {}, MENU.modelBlock, "")));
       case MENU.modelEntry:
-        flow = await modelEntryFlow();
-        break;
+        return below(await until(modelEntryScreen));
       case MENU.profiles:
-        flow = await profilesFlow();
-        break;
+        return below(await until(profilesScreen));
       case MENU.defaultProfile:
-        flow = await defaultProfileFlow();
-        break;
+        return below(await until(defaultProfileScreen));
       case MENU.deleteEntry:
-        flow = await deleteEntryFlow();
-        break;
+        return below(await deleteEntryFlow());
       default:
-        break;
+        return "stay";
     }
-    if (flow === "end") return;
-  }
+  });
 }

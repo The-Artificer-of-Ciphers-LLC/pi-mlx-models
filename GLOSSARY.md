@@ -39,3 +39,17 @@ _Avoid_: preset (a preset is a model, not a settings set), mode
 **Default profile**:
 The profile a model entry names for `/mlx-start` to use when no profile is given.
 _Avoid_: active profile
+
+### The /mlx-config menu
+
+**Screen**:
+One menu or list of /mlx-config shown at a time. Esc or Back goes up one level; an action leaves you on the screen you were on.
+_Avoid_: page, view, dialog
+
+**Key list**:
+The screen that lists the keys of one place in the config file (general, the model block, a model entry or a profile) with their values.
+_Avoid_: settings page
+
+**Model list**:
+The screen that lists the model entries of the file, where a model is chosen before its options, profiles or default profile are edited.
+_Avoid_: model picker (that is the `/mlx-start` selector)

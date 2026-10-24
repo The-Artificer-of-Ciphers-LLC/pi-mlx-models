@@ -7,7 +7,7 @@ import { confirmationFor, renderConfig, setAt } from "./configedit.js";
 import { ACTION, CARRY_MAX_CHARS, CARRY_MAX_LINES, type ConfigMenuUi, MENU, MENU_TITLE, NEW_ENTRY, NEW_PROFILE, NO_DEFAULT, PROFILE_ACTION, carriedCopy, runConfigMenu } from "./configmenu.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { PROFILE_NAME_SHORT_RULE, SETTINGS, prepareSettings, readLayerFile } from "./settings.js";
-import { makeCtx, scriptInput, scriptSelect } from "./testkit.js";
+import { makeCtx, scriptInput, scriptSelect, scriptTopSelect } from "./testkit.js";
 
 /** A fresh directory under the system temp directory, removed when the test ends. */
 function tempDir(t: { after(fn: () => void): void }): string {
@@ -37,7 +37,7 @@ function session(t: { after(fn: () => void): void }, options: SessionOptions = {
   const dir = tempDir(t);
   const path = options.nested === true ? join(dir, "data", "config.json") : join(dir, "config.json");
   if (options.file !== undefined) writeFileSync(path, typeof options.file === "string" ? options.file : pretty(options.file));
-  const select = scriptSelect(...(options.select ?? []));
+  const select = scriptTopSelect(...(options.select ?? []));
   const input = scriptInput(...(options.input ?? []));
   const kit = makeCtx(select, { input, confirm: options.confirm, hasUI: options.hasUI });
   const ui: ConfigMenuUi = { ...kit.ctx.ui, ...options.ui };
@@ -99,7 +99,8 @@ test("configmenu stays on the key list after a save: the list shows the new valu
   const selects = s.prompts.filter((prompt) => prompt.kind === "select");
   assert.match(selects[3].title, /^Last result: Saved server\.port\./);
   assert.ok(selects[3].options?.includes("server.port = 8081"), JSON.stringify(selects[3].options));
-  assert.equal(selects[4].title, MENU_TITLE);
+  // The key list was dismissed, so it may never have been seen: the result is put back for the menu above it (WR-03).
+  assert.match(selects[4].title, /^Last result: Saved server\.port\..*\n\nMLX config$/s);
   s.assertScriptsUsed();
 });
 
@@ -611,7 +612,7 @@ test("configmenu delete a model entry: the empty entry left by deleting its last
   assert.match(saved[0].message, /next \/mlx-start/);
   // The last model list is the one MENU.modelEntry opened after the delete; the first was opened before it.
   const lists = s.prompts.filter((prompt) => prompt.kind === "select" && prompt.options?.includes(NEW_ENTRY));
-  assert.equal(lists.length, 2, "the profile flow's list and the model entry flow's list; the delete flow's list has no new entry");
+  assert.equal(lists.length, 3, "the profile flow's list, shown again on the way up, and the model entry flow's list; the delete flow's list has no new entry");
   assert.deepEqual(lists[lists.length - 1].options, [NEW_ENTRY]);
   s.assertScriptsUsed();
 });
@@ -952,7 +953,8 @@ test("configmenu carries the last result: a saved notice is still notified and i
   assert.ok(menus[1].title.includes(`${saved[0].message}\n\n${MENU_TITLE}`), "a blank line separates the notice from the menu title");
   assert.deepEqual(
     s.prompts.map((prompt) => prompt.kind),
-    ["select", "select", "select", "input", "select"],
+    // The top menu, the key list, the key's action menu, the typed value, the key list again, and the top menu after Esc.
+    ["select", "select", "select", "input", "select", "select"],
   );
   s.assertScriptsUsed();
 });

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
+import { MENU, MENU_TITLE } from "./configmenu.js";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
@@ -238,6 +239,26 @@ export function scriptSelect(...steps: Array<string | number | undefined>) {
     return found;
   };
   return Object.assign(answer, { errors, remaining: (): number => steps.length - next });
+}
+
+const TOP_ENTRIES = new Set<string>(Object.values(MENU));
+
+/**
+ * `scriptSelect`, except that a step naming an entry of the top menu is kept while any other menu is open, and that menu is
+ * answered with Esc. A script can then say "go on to this entry of the top menu" from wherever the last action left the user,
+ * without counting the Esc of each level; a test that is about where the user is left asserts the titles instead.
+ */
+export function scriptTopSelect(...steps: Array<string | number | undefined>) {
+  const script = scriptSelect(...steps);
+  let next = 0;
+  const answer = (options: string[], title?: string): string | undefined => {
+    const step = steps[next];
+    const plainTitle = title?.split("\n\n").pop() ?? MENU_TITLE;
+    if (typeof step === "string" && TOP_ENTRIES.has(step) && plainTitle !== MENU_TITLE) return undefined;
+    if (next < steps.length) next += 1;
+    return script(options, title);
+  };
+  return Object.assign(answer, { errors: script.errors, remaining: script.remaining });
 }
 
 /** An input callback that answers from a script, one text per call; undefined is a dismissal and an exhausted script answers undefined. */
