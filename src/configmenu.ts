@@ -24,8 +24,8 @@ import {
   validateModelKey,
   validateProfileName,
 } from "./configedit.js";
-import { type ConfigMenuUi, createDialogs } from "./configdialogs.js";
-import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
+import { type ConfigMenuUi, createDialogs, shown } from "./configdialogs.js";
+import { type ModelNames, modelNames, numbered } from "./modelnames.js";
 import { MODEL_PRESETS } from "./presets.js";
 import { readLayerFile } from "./settings.js";
 
@@ -85,12 +85,6 @@ export interface ConfigMenuOptions {
 
 /** A bound on the rounds of the top menu, so a UI that always gives the same answer cannot keep the command running forever. */
 const MAX_MENU_ROUNDS = 500;
-/** The longest name or value a notice or a menu line shows, in characters. */
-const SHOWN_MAX = 80;
-
-/** Text from the file or from the user as a notice or menu line shows it: cleaned, then credentials hidden, then clipped. */
-const shown = (text: string, max = SHOWN_MAX): string => clipDiagnostic(redactCredentials(cleanLabel(text)), max, "start");
-
 /** A config value as a menu line shows it. */
 function shownValue(value: unknown): string {
   if (value === undefined) return "(not set)";
@@ -131,6 +125,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     for (;;) {
       if (screensShown >= MAX_MENU_ROUNDS) return "end";
       screensShown += 1;
+      namesSnapshot = undefined;
       const step = await screen();
       if (step !== "stay") return step;
     }
@@ -155,6 +150,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
    */
   function write(change: (draft: ConfigTree) => ConfigTree, saved: string, unchanged: string, after = ""): Written {
     const outcome: EditOutcome = editConfig(path, change);
+    namesSnapshot = undefined;
     if (!outcome.ok) {
       report(`Not saved: ${outcome.message}`, "error");
       return outcome.kind === "unreadable" ? "end" : "refused";
@@ -228,9 +224,6 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     );
   }
 
-  /** One menu line per name, numbered so two names that look alike once cleaned stay different lines. */
-  const numbered = (names: string[]): string[] => names.map((name, index) => `${index + 1}. ${shown(name)}`);
-
   /**
    * The model list: choose a model key of the file by position, or with `allowNew` type a new one. Esc on the list is `up`;
    * a typed key that is dismissed, refused or not confirmed leaves the user on the list (`stay`).
@@ -265,33 +258,14 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
     return { model: checked.value };
   }
 
-  /**
-   * A model as a notice or title names it: the cleaned, clipped key, and "(entry N of M)" after it only when another key of
-   * the file shows the same text, so nothing changes for a key that is unique (WR-02c). A key not in the file yet is placed
-   * where the sorted list will put it once it is written.
-   */
-  function modelLabel(model: string): string {
-    const text = shown(model);
-    const keys = modelKeys(currentTree());
-    if (!keys.some((other) => other !== model && shown(other) === text)) return text;
-    const all = keys.includes(model) ? keys : [...keys, model].sort();
-    return `${text} (entry ${all.indexOf(model) + 1} of ${all.length})`;
-  }
+  /** The names of the model entries as the file lists them now: read once, and again after every screen and every write. */
+  let namesSnapshot: ModelNames | undefined;
+  const modelNamesNow = (): ModelNames => (namesSnapshot ??= modelNames(modelKeys(currentTree())));
 
   /** The words after a key name that say whose key it is. */
-  const ofModel = (model: string): string => ` of model ${modelLabel(model)}`;
+  const ofModel = (model: string): string => ` of model ${modelNamesNow().label(model)}`;
   const ofProfile = (model: string, profile: string): string => ` of profile ${shown(profile)}${ofModel(model)}`;
-
-  /**
-   * A model entry as the menu numbers it, "3 of 5 (key)", for the questions that cannot be undone: two keys that look alike
-   * once cleaned and clipped give the same `shown` text, but never the same place (WR-02, WR-02b). A key that is no longer
-   * in the file has no place and is named by its text.
-   */
-  function entryPlace(model: string): string {
-    const keys = modelKeys(currentTree());
-    const index = keys.indexOf(model);
-    return index < 0 ? shown(model) : `${index + 1} of ${keys.length} (${shown(model)})`;
-  }
+  const entryPlace = (model: string): string => modelNamesNow().place(model);
 
   /** The options of one model: pick the model, then edit its keys until Esc brings the user back to the model list. */
   async function modelEntryScreen(): Promise<Step> {
