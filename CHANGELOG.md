@@ -4,6 +4,10 @@ All notable changes to `@taoc/pi-mlx-models` are listed here. Releases before 0.
 
 ## Unreleased
 
+### Changed
+
+- **`/mlx-config` stays where you are.** A save, a refused edit or a declined confirmation no longer sends you back to the top menu: the key list is shown again with the new value, and Esc or Back goes up one level. Deleting a profile returns to its profile list, and setting a default profile or deleting a model entry returns to the model list. See the [commands reference](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/docs/reference/commands.md#mlx-config).
+
 ### Added
 
 - **Glossary.** [GLOSSARY.md](https://github.com/The-Artificer-of-Ciphers-LLC/pi-mlx-models/blob/main/GLOSSARY.md) defines the global file, project file, model block, preset, model key, model entry, profile and default profile.

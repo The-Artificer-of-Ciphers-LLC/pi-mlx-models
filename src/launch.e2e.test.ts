@@ -24,6 +24,7 @@ import {
   readRequests,
   scriptInput,
   scriptSelect,
+  scriptTopSelect,
   stubArgs,
   writeHfCache,
   type CtxOptions,
@@ -1831,7 +1832,7 @@ test("mlx-restart e2e: with nothing running a fresh instance starts the remember
 
 test("mlx-config e2e: a setting edited through the menu is what the next /mlx-start sends to a real server", { timeout: 30_000 }, async (t) => {
   const port = await freePort();
-  const select = scriptSelect(MENU.modelBlock, "model.sampling.temperature", ACTION.set, MENU.done);
+  const select = scriptTopSelect(MENU.modelBlock, "model.sampling.temperature", ACTION.set, MENU.done);
   const input = scriptInput("0.3");
   const h = await harness(t, {}, { input }, ALL_SUPPORTED, { select });
   h.writeConfig({ server: { port } });
@@ -1864,7 +1865,7 @@ test("mlx-config e2e: a setting edited through the menu is what the next /mlx-st
 
 test("mlx-config e2e: a profile added in the menu is usable by the next /mlx-start --profile", { timeout: 30_000 }, async (t) => {
   const port = await freePort();
-  const select = scriptSelect(MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.edit, "sampling.temperature", ACTION.set, MENU.done);
+  const select = scriptTopSelect(MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.edit, "sampling.temperature", ACTION.set, MENU.done);
   const input = scriptInput("qwen3_4b", "fast", "0.2");
   const h = await harness(t, {}, { input }, ALL_SUPPORTED, { select });
   h.writeConfig({ server: { port } });
@@ -1989,7 +1990,7 @@ test("auto-start e2e: with the option off, opening pi does nothing at all", { ti
 test("daily-driver loop: configure in the menu, start, status, edit, restart, stop, then /mlx-last from a reopened pi", { timeout: 60_000 }, async (t) => {
   const port = await freePort();
   // One script for both /mlx-config sessions: the first adds the model entry and the profile, the second changes one value of it.
-  const select = scriptSelect(
+  const select = scriptTopSelect(
     MENU.profiles, NEW_ENTRY, NEW_PROFILE, PROFILE_ACTION.edit, "sampling.temperature", ACTION.set, MENU.done,
     MENU.profiles, 0, 0, PROFILE_ACTION.edit, "sampling.temperature", ACTION.set, MENU.done,
   );

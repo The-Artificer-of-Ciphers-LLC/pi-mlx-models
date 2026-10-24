@@ -14,7 +14,7 @@ import { SETTINGS, initFlagSpecs } from "./settings.js";
 import type { LaunchSpec, MlxServer, ServerEvent } from "./server.js";
 import type { ModelConfigRead, ReadModelConfig } from "./modelinfo.js";
 import type { HealthProbe, ProbeHealth } from "./status.js";
-import { makeCtx, makeFakeModelConfig, makeFakePi, makeFakeRegistry, scriptInput, scriptSelect, type CtxOptions } from "./testkit.js";
+import { makeCtx, makeFakeModelConfig, makeFakePi, makeFakeRegistry, scriptInput, scriptSelect, scriptTopSelect, type CtxOptions } from "./testkit.js";
 
 type ProviderCall = { name: string; config: any };
 type Note = { message: string; type: string };
@@ -5523,7 +5523,7 @@ async function configSetup(
   const settings = options.settings ?? freshSettings({});
   if (options.raw !== undefined) writeFileSync(settings.globalConfigPath, options.raw);
   else if (options.global !== undefined) writeGlobal(settings, options.global);
-  const select = scriptSelect(...(options.steps ?? []));
+  const select = scriptTopSelect(...(options.steps ?? []));
   const input = scriptInput(...(options.texts ?? []));
   const h = await setup({ ...options.setup, settings, select, ctx: { ...options.setup?.ctx, input } });
   return { h, settings, select, input };

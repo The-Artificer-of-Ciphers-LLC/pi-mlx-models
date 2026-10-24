@@ -5,7 +5,8 @@ Change the global config file with the `/mlx-config` menu instead of editing JSO
 ## Open the menu
 
 1. Type `/mlx-config`. The menu is titled `MLX config`.
-2. Choose an entry with the arrow keys and Enter. After every action you return to this menu. Choose **Done** (or press Esc) to leave.
+2. Choose an entry with the arrow keys and Enter. Choose **Done** (or press Esc on this menu) to leave.
+3. Press Esc or choose **Back** to go up one level. A save leaves you where you were, so you can change the next key without opening the menu again; the levels are listed in the [commands reference](../reference/commands.md#mlx-config).
 
 The result of each action is repeated at the top of the next menu as `Last result:`, so it stays readable on a short terminal.
 
@@ -16,7 +17,7 @@ Choose **View the current config**. It prints the keys set in the global file, t
 ## Change or remove a server or general setting
 
 1. Choose **Edit a general or server setting**.
-2. Choose the key. Each line shows its current value, or `(not set)`.
+2. Choose the key. Each line shows its current value, or `(not set)`. After you save, the list is shown again with the new value; press Esc when you are done.
 3. For a true/false key, choose `true` or `false`. For any other key, choose **Set a value** and type the value:
    - a list: items separated by commas (`http://localhost:3000, http://localhost:5173`), or a JSON array
    - an object: JSON, for example `{"enable_thinking": false}`
@@ -49,19 +50,19 @@ To change a key of an existing profile, pick the model, pick the profile, then *
 ## Delete a profile
 
 1. Choose **Add, edit or delete a profile**, pick the model and the profile.
-2. Choose **Delete this profile** and answer **Yes**. If it was the model's default profile, the default is cleared in the same write.
+2. Choose **Delete this profile** and answer **Yes**. If it was the model's default profile, the default is cleared in the same write. You return to the model's profile list; **No** or Esc leaves you on the profile's menu.
 
 ## Choose a model's default profile
 
 1. Choose **Choose a model's default profile**.
-2. Pick the model, then the profile. Choose **(no default profile)** to clear it.
+2. Pick the model, then the profile. Choose **(no default profile)** to clear it. The list of models is shown again, so you can set the default of another model.
 
 The model needs at least one profile first.
 
 ## Delete a model entry
 
 1. Choose **Delete a model entry** and pick the entry.
-2. Read the list of what goes with it (options, profiles, default profile) and answer **Yes**.
+2. Read the list of what goes with it (options, profiles, default profile) and answer **Yes**. The list of entries is shown again for the next delete.
 
 ## Make the change take effect
 
