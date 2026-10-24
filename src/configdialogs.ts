@@ -1,4 +1,4 @@
-import { clipDiagnostic } from "./diagnostic.js";
+import { cleanLabel, clipDiagnostic, redactCredentials } from "./diagnostic.js";
 
 /**
  * The dialogs of /mlx-config: pi's `ctx.ui` made safe to call, and the last result carried into the title of the next menu.
@@ -14,6 +14,12 @@ export interface ConfigMenuUi {
 }
 
 type NoticeType = "info" | "warning" | "error";
+
+/** The longest name or value a notice or a menu line shows, in characters. */
+const SHOWN_MAX = 80;
+
+/** Text from the file or from the user as a notice or menu line shows it: cleaned, then credentials hidden, then clipped. */
+export const shown = (text: string, max = SHOWN_MAX): string => clipDiagnostic(redactCredentials(cleanLabel(text)), max, "start");
 
 /** The most lines of a result the next menu title carries, so a long refusal cannot make the menu taller than the screen. */
 export const CARRY_MAX_LINES = 6;

@@ -34,11 +34,11 @@ test("label: keys that show the same text get their place in the sorted list", (
 });
 
 test("label: a key that is not in the list yet is placed where the sorted list will put it once it is written", () => {
-  const names = modelNames(["m-1", "m-3"].map((key) => `${key}\u0007`));
-  assert.match(names.label("m-2 "), /^m-2/);
   const look = modelNames(["b\u0007", "d\u0007"]);
-  // "b " shows the same text as "b\u0007" once cleaned: the new key sorts first, so it is entry 1 of 3.
-  assert.match(look.label("b "), /\(entry 1 of 3\)$/);
+  // "b " shows the same text as "b\u0007" once cleaned; the control character sorts before a space, so the new key is entry 2 of 3.
+  assert.equal(look.label("b "), "b (entry 2 of 3)");
+  assert.equal(look.label("b\u0007"), "b");
+  assert.equal(look.label("c"), "c");
 });
 
 test("place: the entry's number in the list and its text, and the text alone when the key is not in the list", () => {
